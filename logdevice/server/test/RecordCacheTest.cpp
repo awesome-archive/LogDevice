@@ -114,16 +114,14 @@ class DummySequencer {
 
 // for simplicity, payload of the record is a fixed 8 bytes storing the
 // lsn value of the record
-std::shared_ptr<PayloadHolder> createPayload(lsn_t lsn) {
-  lsn_t* payload_flat = (lsn_t*)malloc(sizeof(lsn_t));
-  *payload_flat = lsn;
-  return std::make_shared<PayloadHolder>(payload_flat, sizeof(lsn_t));
+PayloadHolder createPayload(lsn_t lsn) {
+  return PayloadHolder::copyBuffer(static_cast<void*>(&lsn), sizeof(lsn));
 }
 
-std::shared_ptr<PayloadHolder> createPayload(size_t size, char fill) {
+PayloadHolder createPayload(size_t size, char fill) {
   void* payload_flat = malloc(size);
   memset(payload_flat, fill, size);
-  return std::make_shared<PayloadHolder>(payload_flat, size);
+  return PayloadHolder::takeOwnership(payload_flat, size);
 }
 
 // convenient function for putting a record in the cache
@@ -137,13 +135,11 @@ int putRecord(Cache* c,
               uint32_t wave_or_recovery_epoch = uint32_t(1),
               copyset_t copyset = copyset_t({N0, N1, N2}),
               OffsetMap offsets_within_epoch = OffsetMap()) {
-  std::shared_ptr<PayloadHolder> ph = nullptr;
-  Payload pl;
+  PayloadHolder ph;
   if ((flags & STORE_Header::HOLE) || (flags & STORE_Header::AMEND)) {
     // no payload for hole plug of amends
   } else {
     ph = createPayload(lsn);
-    pl = ph->getPayload();
   }
   // use timestamp as the same as lsn
   uint64_t timestamp = lsn;
@@ -156,7 +152,6 @@ int putRecord(Cache* c,
                       flags,
                       // putRecord() can destroy keys, so make copy.
                       KeysType(keys),
-                      Slice(pl),
                       ph,
                       std::move(offsets_within_epoch));
 }
@@ -179,11 +174,10 @@ void verifyEntry(const Entry& entry,
   ASSERT_EQ(lsn, entry.timestamp);
   ASSERT_EQ(flags, entry.flags);
   if (entry.flags & STORE_Header::HOLE) {
-    ASSERT_EQ(nullptr, entry.payload_raw.data);
-    ASSERT_EQ(0, entry.payload_raw.size);
+    ASSERT_EQ(0, entry.payload.size());
   } else {
-    ASSERT_EQ(sizeof(lsn_t), entry.payload_raw.size);
-    ASSERT_EQ(lsn, *((lsn_t*)entry.payload_raw.data));
+    ASSERT_EQ(sizeof(lsn_t), entry.payload.size());
+    ASSERT_EQ(lsn, *((lsn_t*)entry.payload.getPayload().data()));
   }
 
   ASSERT_EQ(entry.keys, keys);
@@ -811,9 +805,6 @@ TEST_F(EpochRecordCacheTest, EntrySequencing) {
   auto payload1 = createPayload(payload_len, 0);
   auto payload2 = createPayload(payload_len, 0);
   auto payload_short = createPayload(payload_len_short, 1);
-  Slice slice1 = Slice(payload1->getPayload());
-  Slice slice2 = Slice(payload2->getPayload());
-  Slice slice_short = Slice(payload_short->getPayload());
 
   // Serialize OffsetMap
   uint32_t flags = STORE_Header::OFFSET_MAP;
@@ -828,7 +819,6 @@ TEST_F(EpochRecordCacheTest, EntrySequencing) {
                                                  copyset,
                                                  OffsetMap({{BYTE_OFFSET, 15}}),
                                                  KeysType{},
-                                                 slice1,
                                                  payload1),
                                        Entry::Disposer(deps_.get()));
   auto entry2 = std::shared_ptr<Entry>(new Entry(0,
@@ -839,7 +829,6 @@ TEST_F(EpochRecordCacheTest, EntrySequencing) {
                                                  copyset,
                                                  OffsetMap({{BYTE_OFFSET, 15}}),
                                                  KeysType{},
-                                                 slice2,
                                                  payload2),
                                        Entry::Disposer(deps_.get()));
   int entry1_serial_len = entry1->toLinearBuffer(buf1.get(), buflen);
@@ -860,7 +849,6 @@ TEST_F(EpochRecordCacheTest, EntrySequencing) {
                                             copyset,
                                             OffsetMap({{BYTE_OFFSET, 15}}),
                                             KeysType{},
-                                            slice_short,
                                             payload_short),
                                   Entry::Disposer(deps_.get()));
   entry2_serial_len = entry2->toLinearBuffer(buf2.get(), buflen);
@@ -887,10 +875,10 @@ TEST_F(EpochRecordCacheTest, EntrySequencing) {
                          entry2->copyset.end(),
                          reconstructed_entry->copyset.begin()));
   ASSERT_EQ(entry2->keys, reconstructed_entry->keys);
-  ASSERT_EQ(entry2->payload_raw.size, reconstructed_entry->payload_raw.size);
-  ASSERT_EQ(memcmp(entry2->payload_raw.data,
-                   reconstructed_entry->payload_raw.data,
-                   entry2->payload_raw.size),
+  ASSERT_EQ(entry2->payload.size(), reconstructed_entry->payload.size());
+  ASSERT_EQ(memcmp(entry2->payload.getPayload().data(),
+                   reconstructed_entry->payload.getPayload().data(),
+                   entry2->payload.size()),
             0);
 
   // Compare the serializations, expect equality
@@ -1502,11 +1490,11 @@ class MockRecordCacheDependencies : public RecordCacheDependencies {
                                 bool soft) const override {
     const NodeID nid(0, 1);
     if (soft) {
-      return test_->initial_soft_seal_epoch_.hasValue()
+      return test_->initial_soft_seal_epoch_.has_value()
           ? Seal(test_->initial_soft_seal_epoch_.value(), nid)
           : folly::Optional<Seal>();
     }
-    return test_->initial_seal_epoch_.hasValue()
+    return test_->initial_seal_epoch_.has_value()
         ? Seal(test_->initial_seal_epoch_.value(), nid)
         : folly::Optional<Seal>();
   }
@@ -1515,7 +1503,7 @@ class MockRecordCacheDependencies : public RecordCacheDependencies {
                             shard_index_t /*shard*/,
                             lsn_t* highest_lsn) const override {
     EXPECT_EQ(LOG_ID, log_id);
-    if (test_->highest_lsn_.hasValue()) {
+    if (test_->highest_lsn_.has_value()) {
       *highest_lsn = test_->highest_lsn_.value();
       return 0;
     }
@@ -1604,8 +1592,8 @@ TEST_F(RecordCacheTest, EmptyCacheWithNonAuthoritativeEpoch2) {
   epoch_cache_capacity_ = 10;
   highest_lsn_ = lsn(8, 7);
   // seal and soft seal not available at the time
-  initial_seal_epoch_.clear();
-  initial_soft_seal_epoch_.clear();
+  initial_seal_epoch_.reset();
+  initial_soft_seal_epoch_.reset();
   create();
   cache_->updateLastNonAuthoritativeEpoch(LOG_ID);
 

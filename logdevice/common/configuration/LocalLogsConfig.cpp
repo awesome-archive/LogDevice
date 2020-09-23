@@ -17,20 +17,13 @@
 #include "logdevice/include/Err.h"
 
 using facebook::logdevice::logsconfig::LogGroupNode;
+using facebook::logdevice::logsconfig::LogGroupNodePtr;
 
 namespace facebook { namespace logdevice { namespace configuration {
 
-/**
- * @param alternative_logs_config   an alternative log configuration fetcher,
- *                                  in case log data isn't included in the
- *                                  main config file. If null, log config
- *                                  will be read from the file specified in
- *                                  "include_log_config".
- */
 std::shared_ptr<LocalLogsConfig>
 LocalLogsConfig::fromJson(const std::string& jsonPiece,
                           const ServerConfig& server_config,
-                          LoadFileCallback loadFileCallback,
                           const ConfigParserOptions& options) {
   auto parsed = parser::parseJson(jsonPiece);
   // Make sure the parsed string is actually an object
@@ -39,20 +32,18 @@ LocalLogsConfig::fromJson(const std::string& jsonPiece,
     err = E::INVALID_CONFIG;
     return nullptr;
   }
-  return fromJson(parsed, server_config, loadFileCallback, options);
+  return fromJson(parsed, server_config, options);
 }
 
 std::shared_ptr<LocalLogsConfig>
 LocalLogsConfig::fromJson(const folly::dynamic& parsed,
                           const ServerConfig& server_config,
-                          LoadFileCallback loadFileCallback,
                           const ConfigParserOptions& options) {
   auto local_logs_config = std::make_shared<LocalLogsConfig>();
   const auto& ns_delimiter = server_config.getNamespaceDelimiter();
   bool success = parser::parseLogs(parsed,
                                    local_logs_config,
                                    server_config.getSecurityConfig(),
-                                   loadFileCallback,
                                    ns_delimiter,
                                    options);
 
@@ -103,8 +94,7 @@ bool LocalLogsConfig::logExists(logid_t id) const {
       internal_logs_.logExists(data_log_id);
 }
 
-std::shared_ptr<LogGroupNode>
-LocalLogsConfig::getLogGroupByIDShared(logid_t id) const {
+LogGroupNodePtr LocalLogsConfig::getLogGroupByIDShared(logid_t id) const {
   // LogGroupNode can be both a normal or an internal log
   const logsconfig::LogGroupInDirectory* res =
       config_tree_->getLogGroupByID(id);
@@ -117,7 +107,7 @@ LocalLogsConfig::getLogGroupByIDShared(logid_t id) const {
 
 void LocalLogsConfig::getLogGroupByIDAsync(
     logid_t id,
-    std::function<void(std::shared_ptr<LogGroupNode>)> cb) const {
+    std::function<void(LogGroupNodePtr)> cb) const {
   // since LocalLogsConfig does everything locally and without locking,
   // we can just call the callback immediately from here.
   cb(getLogGroupByIDShared(id));
@@ -126,8 +116,7 @@ void LocalLogsConfig::getLogGroupByIDAsync(
 void LocalLogsConfig::getLogRangeByNameAsync(
     std::string name,
     std::function<void(Status, logid_range_t)> cb) const {
-  std::shared_ptr<logsconfig::LogGroupNode> result =
-      config_tree_->findLogGroup(name);
+  auto result = config_tree_->findLogGroup(name);
   if (result == nullptr) {
     cb(E::NOTFOUND, std::make_pair(LOGID_INVALID, LOGID_INVALID));
     return;
@@ -135,13 +124,13 @@ void LocalLogsConfig::getLogRangeByNameAsync(
   cb(E::OK, result->range());
 }
 
-std::shared_ptr<logsconfig::LogGroupNode>
+logsconfig::LogGroupNodePtr
 LocalLogsConfig::getLogGroupByName(std::string name) const {
   logid_range_t res;
   return config_tree_->findLogGroup(name);
 }
 
-std::shared_ptr<logsconfig::LogGroupNode>
+logsconfig::LogGroupNodePtr
 LocalLogsConfig::getLogGroup(const std::string& path) const {
   return config_tree_->findLogGroup(path);
 }
@@ -180,11 +169,10 @@ void LocalLogsConfig::getLogRangesByNamespaceAsync(
   cb((res.empty() ? E::NOTFOUND : E::OK), res);
 }
 
-std::shared_ptr<logsconfig::LogGroupNode>
-LocalLogsConfig::insert(DirectoryNode* parent,
-                        const logid_range_t& logid_interval,
-                        const std::string& name,
-                        LogAttributes attrs) {
+LogGroupNodePtr LocalLogsConfig::insert(DirectoryNode* parent,
+                                        const logid_range_t& logid_interval,
+                                        const std::string& name,
+                                        LogAttributes attrs) {
   ld_check(config_tree_ != nullptr);
 
   was_modified_in_place_.store(true);
@@ -252,10 +240,9 @@ bool LocalLogsConfig::erase(const std::string& path) {
   return true;
 }
 
-std::shared_ptr<logsconfig::LogGroupNode>
-LocalLogsConfig::insert(logid_t::raw_type logid,
-                        const std::string& name,
-                        LogAttributes attrs) {
+logsconfig::LogGroupNodePtr LocalLogsConfig::insert(logid_t::raw_type logid,
+                                                    const std::string& name,
+                                                    LogAttributes attrs) {
   ld_check(config_tree_ != nullptr);
   was_modified_in_place_.store(true);
   std::string failure_reason;
@@ -273,7 +260,7 @@ LocalLogsConfig::insert(logid_t::raw_type logid,
   return ret;
 }
 
-std::shared_ptr<logsconfig::LogGroupNode> LocalLogsConfig::insert(
+logsconfig::LogGroupNodePtr LocalLogsConfig::insert(
     const boost::icl::right_open_interval<logid_t::raw_type>& logid_interval,
     const std::string& name,
     LogAttributes attrs) {
@@ -296,12 +283,18 @@ std::shared_ptr<logsconfig::LogGroupNode> LocalLogsConfig::insert(
   return added_group;
 }
 
-bool LocalLogsConfig::isValid(const ServerConfig& server_config) const {
-  return parser::validateNodeCount(server_config, this);
-}
-
 size_t LocalLogsConfig::size() const {
   return config_tree_->size() + internal_logs_.size();
+}
+
+Status LocalLogsConfig::getLogReplicationProperty(logid_t log,
+                                                  ReplicationProperty& rp_out) {
+  auto log_group = getLogGroupByIDShared(log);
+  if (log_group) {
+    rp_out = log_group->getReplicationProperty();
+    return E::OK;
+  }
+  return E::NOTFOUND;
 }
 
 ReplicationProperty LocalLogsConfig::getNarrowestReplication() {

@@ -17,8 +17,13 @@ NodeUpdateBuilder& NodeUpdateBuilder::setNodeIndex(node_index_t idx) {
   return *this;
 }
 
-NodeUpdateBuilder& NodeUpdateBuilder::setDataAddress(Sockaddr addr) {
-  data_address_ = std::move(addr);
+NodeUpdateBuilder& NodeUpdateBuilder::setVersion(uint64_t version) {
+  version_ = version;
+  return *this;
+}
+
+NodeUpdateBuilder& NodeUpdateBuilder::setDefaultDataAddress(Sockaddr addr) {
+  default_data_address_ = std::move(addr);
   return *this;
 }
 
@@ -37,6 +42,21 @@ NodeUpdateBuilder& NodeUpdateBuilder::setAdminAddress(Sockaddr addr) {
   return *this;
 }
 
+NodeUpdateBuilder& NodeUpdateBuilder::setServerToServerAddress(Sockaddr addr) {
+  server_to_server_address_ = std::move(addr);
+  return *this;
+}
+
+NodeUpdateBuilder& NodeUpdateBuilder::setServerThriftApiAddress(Sockaddr addr) {
+  server_thrift_api_address_ = std::move(addr);
+  return *this;
+}
+
+NodeUpdateBuilder& NodeUpdateBuilder::setClientThriftApiAddress(Sockaddr addr) {
+  client_thrift_api_address_ = std::move(addr);
+  return *this;
+}
+
 NodeUpdateBuilder& NodeUpdateBuilder::setLocation(NodeLocation loc) {
   location_ = std::move(loc);
   return *this;
@@ -44,6 +64,13 @@ NodeUpdateBuilder& NodeUpdateBuilder::setLocation(NodeLocation loc) {
 
 NodeUpdateBuilder& NodeUpdateBuilder::setName(std::string name) {
   name_ = std::move(name);
+  return *this;
+}
+
+NodeUpdateBuilder& NodeUpdateBuilder::setAddressForNetworkPriority(
+    NodeServiceDiscovery::ClientNetworkPriority priority,
+    Sockaddr sock_addr) {
+  addresses_per_priority_[priority] = std::move(sock_addr);
   return *this;
 }
 
@@ -72,18 +99,24 @@ NodeUpdateBuilder& NodeUpdateBuilder::setSequencerWeight(double weight) {
   return *this;
 }
 
+NodeUpdateBuilder& NodeUpdateBuilder::setTag(std::string key,
+                                             std::string value) {
+  tags_[std::move(key)] = std::move(value);
+  return *this;
+}
+
 NodeUpdateBuilder::Result NodeUpdateBuilder::validate() const {
-  if (!node_index_.hasValue()) {
+  if (!node_index_.has_value()) {
     return Result{
         Status::INVALID_PARAM, "Mandatory field 'node_index' is missing"};
   }
 
-  if (!data_address_.hasValue()) {
-    return Result{
-        Status::INVALID_PARAM, "Mandatory field 'data_address' is missing"};
+  if (!default_data_address_.has_value()) {
+    return Result{Status::INVALID_PARAM,
+                  "Mandatory field 'default_client_data_address' is missing"};
   }
 
-  if (!name_.hasValue()) {
+  if (!name_.has_value()) {
     return Result{Status::INVALID_PARAM, "Mandatory field 'name' is missing"};
   }
 
@@ -92,18 +125,18 @@ NodeUpdateBuilder::Result NodeUpdateBuilder::validate() const {
   }
 
   if (hasRole(roles_, NodeRole::SEQUENCER)) {
-    if (!sequencer_weight_.hasValue()) {
+    if (!sequencer_weight_.has_value()) {
       return Result{Status::INVALID_PARAM,
                     "Sequencer node without field 'sequencer_weight'"};
     }
   }
 
   if (hasRole(roles_, NodeRole::STORAGE)) {
-    if (!storage_capacity_.hasValue()) {
+    if (!storage_capacity_.has_value()) {
       return Result{Status::INVALID_PARAM,
                     "Storage node without field 'storage_capacity'"};
     }
-    if (!num_shards_.hasValue()) {
+    if (!num_shards_.has_value()) {
       return Result{
           Status::INVALID_PARAM, "Storage node without field 'num_shards'"};
     }
@@ -117,23 +150,34 @@ NodeUpdateBuilder::buildNodeServiceDiscovery() {
   auto sd = std::make_unique<NodeServiceDiscovery>();
 
   sd->name = std::move(name_).value();
-  sd->address = std::move(data_address_).value();
+  sd->version = version_.value();
+  sd->default_client_data_address = std::move(default_data_address_).value();
   sd->gossip_address = std::move(gossip_address_);
   sd->ssl_address = std::move(ssl_address_);
   sd->admin_address = std::move(admin_address_);
+  sd->server_to_server_address = std::move(server_to_server_address_);
+  sd->server_thrift_api_address = std::move(server_thrift_api_address_);
+  sd->client_thrift_api_address = std::move(client_thrift_api_address_);
+  sd->addresses_per_priority = std::move(addresses_per_priority_);
   sd->location = std::move(location_);
   sd->roles = roles_;
+  sd->tags = std::move(tags_);
 
   return sd;
 }
 
-std::unique_ptr<StorageNodeAttribute>
-NodeUpdateBuilder::buildStorageAttributes() {
-  // TODO(mbassem): Check initial exclude_from_nodesets.
+std::unique_ptr<StorageNodeAttribute> NodeUpdateBuilder::buildStorageAttributes(
+    folly::Optional<node_gen_t> current_gen) {
   auto attr = std::make_unique<StorageNodeAttribute>();
   attr->capacity = storage_capacity_.value();
   attr->num_shards = num_shards_.value();
-  attr->generation = 1;
+  // Generation 1 is special as it bypasses rebuilding if it's a new node.
+  // In the NCM world, the new node check relies on the storage state instead,
+  // and using generation 1 here will bypass this check and may lead to silent
+  // under replication. So generations in the NCM world *must* have a value > 1,
+  // in preparation to completely deprecate it.
+  // Check the logic in RebuildingMarkerChecker for more info.
+  attr->generation = current_gen.value_or(2);
   attr->exclude_from_nodesets = false;
   return attr;
 }
@@ -164,6 +208,8 @@ NodeUpdateBuilder::Result NodeUpdateBuilder::buildAddNodeUpdate(
   }
 
   auto node_idx = node_index_.value();
+  // If the version was omitted on daemon startup, use 0.
+  version_ = version_.value_or(0);
 
   // Service Discovery Update
   createIfNull(update.service_discovery_update)
@@ -205,7 +251,7 @@ NodeUpdateBuilder::Result NodeUpdateBuilder::buildAddNodeUpdate(
     createIfNull(update.storage_config_update->attributes_update)
         ->addNode(node_idx,
                   {StorageAttributeConfig::UpdateType::PROVISION,
-                   buildStorageAttributes()});
+                   buildStorageAttributes(folly::none)});
   }
 
   return {Status::OK, ""};
@@ -219,12 +265,24 @@ NodeUpdateBuilder::Result NodeUpdateBuilder::buildUpdateNodeUpdate(
     return validation_result;
   }
 
-  ld_assert(node_index_.hasValue());
+  ld_assert(node_index_.has_value());
   auto node_idx = node_index_.value();
 
   auto current_svc = nodes_configuration.getNodeServiceDiscovery(node_idx);
   if (current_svc == nullptr) {
     return {E::NOTINCONFIG, folly::sformat("N{} is not in config", node_idx)};
+  }
+
+  // If the version was omitted on daemon startup, read it from the current
+  // nodes configuration.
+  version_ = version_.value_or(current_svc->version);
+
+  if (version_.value() < current_svc->version) {
+    return {E::INVALID_PARAM,
+            folly::sformat("The version can't be decreased. Current value: {}, "
+                           "update request: {}",
+                           current_svc->version,
+                           version_.value())};
   }
 
   // Roles should be immutable
@@ -276,7 +334,7 @@ NodeUpdateBuilder::Result NodeUpdateBuilder::buildUpdateNodeUpdate(
   if (hasRole(roles_, NodeRole::STORAGE)) {
     const auto& storage_attrs = nodes_configuration.getStorageAttributes();
     auto curr_attrs = storage_attrs->getNodeAttributesPtr(node_idx);
-    auto new_attrs = buildStorageAttributes();
+    auto new_attrs = buildStorageAttributes(curr_attrs->generation);
     if (*curr_attrs != *new_attrs) {
       createIfNull(update.storage_config_update);
       createIfNull(update.storage_config_update->attributes_update)

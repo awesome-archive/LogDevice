@@ -12,6 +12,8 @@
 #define STAT_DEFINE(...)
 #endif
 
+// MS we took to shutdown server
+STAT_DEFINE(shutdown_time_ms, SUM)
 // Total number of read requests
 STAT_DEFINE(read_requests, SUM)
 // Number of read requests that got kicked to storage threads
@@ -147,8 +149,6 @@ STAT_DEFINE(catchup_queue_push_immediate, SUM)
 // Number of streams inserted to CatchupQueue to be processed when it's
 // ready to read newly released records
 STAT_DEFINE(catchup_queue_push_delayed, SUM)
-// Number of times a CatchupQueue activated its ping timer
-STAT_DEFINE(catchup_queue_ping_timer_activations, SUM)
 
 // Read stream ordering rules violations
 STAT_DEFINE(read_stream_start_violations, SUM)
@@ -236,11 +236,62 @@ STAT_DEFINE(mutation_started, SUM)
 STAT_DEFINE(non_auth_recovery_epochs, SUM)
 // Number of times an EpochRecovery times out during mutation and cleaning.
 STAT_DEFINE(recovery_mutation_and_cleaning_timeouts, SUM)
+// Number of times the EpochRecovery is restarted due to recovery node
+// failure during mutation and cleaning stage.
+STAT_DEFINE(epoch_recovery_restarts_on_node_failure, SUM)
 // Number of times an EpochRecovery successfully finishes
 STAT_DEFINE(epoch_recovery_success, SUM)
 
 // attempts to activate sequencers
 STAT_DEFINE(sequencer_activations, SUM)
+
+// Integration tests often want to wait for all sequencers to become quiescent,
+// i.e. finish all recoveries, matadata log writes, background reactivations,
+// etc, such that the test can be certain that the sequencer is not going to
+// suddenly reactivate itself.
+//
+// Currently the sequencer activation flow is complicated, making quiescence
+// difficult to detect reliably. This stat does that. If this stat is zero, it
+// is guaranteed that the existing sequencers, if not provoked (e.g. by a node
+// going down), won't reactivate or start recovery, will be releasing all
+// written records (even if there's no f-majority of available nodes or metadata
+// logs are unwritable), and will have historical metadata available (even if
+// metadata logs are unreadable). If you do some appends, they'll get
+// consecutive LSNs and readers will see them.
+//
+// Most of the complications come from the fact that the state of sequencer
+// activation/recovery/metadata-log-write/background-reactivation-check is
+// scattered across lots of obscure places: in-flight EpochStore requests,
+// in-flight WriteMetaDataLogRequest-s, Sequencer::state_, in-flight
+// LogRecoveryRequest-s, SequencerBackgroundActivator's queue, in-flight
+// SequencerBackgroundActivatorRequest-s, and more. If there's any of that in
+// flight, we can't be sure that the sequencer won't reactivate soon. This stat
+// herds the cats and counts *all* in-flight stuff associated with sequencer
+// activations. We aggregate everything into a single stat, instead
+// of e.g. polling 'info sequencers' and other commands, to avoid race
+// conditions.
+//
+// Full list of things counted by this stat:
+//  - EpochMetaDataUpdateToNextEpoch epoch store requests created by
+//    AllSequencers,
+//  - LogRecoveryRequest objects,
+//  - Sequencer::EpochSequencers::draining != nullptr,
+//  - GetHistoricalMetaDataRequest in IMMEDIATE mode,
+//  - WriteMetaDataLogRequest,
+//  - StartMetaDataLogRecoveryRequest (the actual metadata log recovery, after
+//    it's started by this request, is covered by LogRecoveryRequest),
+//  - SequencerBackgroundActivatorRequest in flight, for schedule() and
+//    notifyCompletion(),
+//  - SequencerBackgroundActivator::queue_ and budget_
+//  + does *not* count
+//    SequencerBackgroundActivator::LogState::reactivation_delay_timer;
+//    your sequencers may get reactivated ~60s after config update unless
+//    you set sequencer-reactivation-delay-secs to 0.
+//
+// TODO (#54730759): This can probably be simplified a great deal if we get rid
+//                   of the unnecessary sequencer reactivations after metadata
+//                   log writes.
+STAT_DEFINE(sequencer_activity_in_progress, SUM)
 
 // sequencer gets activated with epoch metadata incompatible with the
 // current configuration.
@@ -290,19 +341,10 @@ STAT_DEFINE(sequencer_unavailable_admin_deactivated, SUM)
 // a sequencer node
 STAT_DEFINE(sequencer_unavailable_not_sequencer_node, SUM)
 
-// how many times sequencer activation gets a result of GRACEFUL_SUCCESS
-STAT_DEFINE(graceful_reactivation_result_success, SUM)
 // how many times sequencer activation gets a result of GRACEFUL_DEFERRED
 STAT_DEFINE(graceful_reactivation_result_deferred, SUM)
 // how many graceful reactivation completion procedure is started
 STAT_DEFINE(graceful_reactivation_completion_started, SUM)
-
-// How many times a job is enqueued to check whether a reactivation or
-// epoch metadata update is needed. When the actual reactivation occurs
-// then a different stat is bumped.
-STAT_DEFINE(background_sequencer_reactivation_checks_scheduled, SUM)
-// How many times such check was performed.
-STAT_DEFINE(background_sequencer_reactivation_checks_completed, SUM)
 
 // The check for sequencer reactivation resulted in no operations
 // necessary
@@ -356,13 +398,6 @@ STAT_DEFINE(strict_find_key_try_non_blocking, SUM)
 // but end up doing seeks on disk
 STAT_DEFINE(strict_find_key_would_block, SUM)
 
-// How many times linear search in PartitionedRocksDBStore findTime iterated
-STAT_DEFINE(strict_findtime_linear_search_iterations, SUM)
-// How many times linear search in PartitionedRocksDBStore triggered
-STAT_DEFINE(strict_findtime_linear_search_count, SUM)
-// How many times linear search in PartitionedRocksDBStore findTime timed out
-STAT_DEFINE(strict_findtime_linear_search_timedout, SUM)
-
 // How many times findKey storage task timed out during execution
 STAT_DEFINE(findkey_timedout_during_run, SUM)
 // How many times findKey storage task timed out before execution
@@ -397,10 +432,6 @@ STAT_DEFINE(zookeeper_epoch_store_internal_inconsistency_error, SUM)
 
 // PurgeUncleanEpochs instances created and started
 STAT_DEFINE(purging_started, SUM)
-// PurgeUncleanEpochs instances that started reading
-STAT_DEFINE(purging_reading_started, SUM)
-// PurgeUncleanEpochs instances that finished reading
-STAT_DEFINE(purging_reading_done, SUM)
 // PurgeUncleanEpochs instances that started deleting
 STAT_DEFINE(purging_delete_started, SUM)
 // PurgeUncleanEpochs instances that finished deleting
@@ -424,9 +455,6 @@ STAT_DEFINE(purging_v2_purge_epoch_started, SUM)
 // number of PurgeSingleEpoch state machine completed
 STAT_DEFINE(purging_v2_purge_epoch_completed, SUM)
 
-// number of times PurgeSingleEpoch state machine is completed with purging
-// skipped because all fully authoritative nodes have responded
-STAT_DEFINE(purging_v2_purge_epoch_skipped_all_responded, SUM)
 // number of times PurgeSingleEpoch state machine is completed with the epoch
 // considered empty and purged because all fully authoritative nodes have
 // responded including at least one of them with E::EMPTY
@@ -442,8 +470,6 @@ STAT_DEFINE(purging_v2_delete_by_keys, SUM)
 // number of times purge delete records by first reading the records
 STAT_DEFINE(purging_v2_delete_by_reading_data, SUM)
 
-// Records deleted while purging
-STAT_DEFINE(purging_deleted_records, SUM)
 STAT_DEFINE(purging_task_dropped, SUM)
 // Number of storage tasks queued
 STAT_DEFINE(storage_tasks_queued, SUM)
@@ -592,9 +618,6 @@ STAT_DEFINE(epoch_recovery_metadata_stored, SUM)
 // node running log recovery
 STAT_DEFINE(sealed_reply_failed_to_send, SUM)
 
-// number of zero copied records drained on disposal on their original worker
-STAT_DEFINE(zero_copied_records_drained, SUM)
-
 //// stats for record cache
 STAT_DEFINE(record_cache_store_cached, SUM)
 STAT_DEFINE(record_cache_store_not_cached, SUM)
@@ -687,6 +710,9 @@ STAT_DEFINE(append_rejected_cancelled, SUM)
 // number of rocksdb manual compaction performed
 STAT_DEFINE(manual_compactions, SUM)
 
+// How many times we reloaded the TLS ticket seeds
+STAT_DEFINE(tls_ticket_seeds_reloaded, SUM)
+
 STAT_DEFINE(server_read_streams_created, SUM)
 
 // Total number of records read by LocalLogStoreReader for all read streams.
@@ -701,15 +727,15 @@ STAT_DEFINE(read_streams_block_bytes_read, SUM)
 STAT_DEFINE(read_streams_num_records_filtered, SUM)
 // Total number of bytes filtered by LocalLogStoreReader for all read streams.
 STAT_DEFINE(read_streams_num_bytes_filtered, SUM)
-// Number of records filtered by LocalLogStoreReader for read streams used for
-// rebuilding.
-STAT_DEFINE(read_streams_num_records_filtered_rebuilding, SUM)
-// Number of bytes filtered by LocalLogStoreReader for read streams used for
-// rebuilding.
-STAT_DEFINE(read_streams_num_bytes_filtered_rebuilding, SUM)
-// Number of records filtered by LogRebuilding which required information
-// only available after the full record was read.
-STAT_DEFINE(read_streams_num_records_late_filtered_rebuilding, SUM)
+
+// Number of records filtered out by RebuildingReadStorageTask.
+STAT_DEFINE(rebuilding_num_records_filtered, SUM)
+// Number of bytes filtered out by RebuildingReadStorageTask.
+STAT_DEFINE(rebuilding_num_bytes_filtered, SUM)
+// Number of records filtered out by RebuildingReadStorageTask which required
+// information only available after the full record was read (as opposed to
+// information from the copyset index).
+STAT_DEFINE(rebuilding_num_records_late_filtered, SUM)
 
 // The number of copyset index entries that LocalLogStoreReader read.
 STAT_DEFINE(read_streams_num_csi_entries_read, SUM)
@@ -800,9 +826,6 @@ STAT_DEFINE(data_key_format_migration_merges, SUM)
 
 // Number of calls to LocalLogStoreReader::read()
 STAT_DEFINE(read_streams_num_ops, SUM)
-STAT_DEFINE(read_streams_num_ops_rebuilding, SUM)
-// Number of reads that required doing a seek() on an iterator
-STAT_DEFINE(read_streams_num_ops_requiring_seeks, SUM)
 // Number of times we encounter a transient errors while serving reads
 STAT_DEFINE(read_streams_transient_errors, SUM)
 
@@ -814,6 +837,12 @@ STAT_DEFINE(bytes_queued_during_storage_task, SUM)
 STAT_DEFINE(write_metadata_record_started, SUM)
 // Total number of successfully finished WriteMetaDataRecord state machines
 STAT_DEFINE(write_metadata_record_finished, SUM)
+
+// Total number of failed attempts to write metadata log
+STAT_DEFINE(write_metadata_request_failed, SUM)
+// Total number of failed attempts to update EpochStore after writing metadata
+// entry to log
+STAT_DEFINE(write_metadata_epoch_store_failed, SUM)
 
 // Number of times a partition was created, dropped and compacted
 STAT_DEFINE(partitions_created, SUM)
@@ -938,11 +967,7 @@ STAT_DEFINE(fdatasync_microsec, SUM)
 STAT_DEFINE(rebuilding_store_sent, SUM)
 STAT_DEFINE(rebuilding_amend_sent, SUM)
 STAT_DEFINE(rebuilding_donor_stored_ok, SUM)
-STAT_DEFINE(rebuilding_donor_stored_ms, SUM)
-STAT_DEFINE(rebuilding_donor_store_persisted_ms, SUM)
 STAT_DEFINE(rebuilding_donor_amended_ok, SUM)
-STAT_DEFINE(rebuilding_donor_amended_ms, SUM)
-STAT_DEFINE(rebuilding_donor_amend_persisted_ms, SUM)
 STAT_DEFINE(rebuilding_recipient_stored_ok, SUM)
 STAT_DEFINE(rebuilding_recipient_amended_ok, SUM)
 STAT_DEFINE(rebuilding_malformed_records, SUM)
@@ -953,9 +978,6 @@ STAT_DEFINE(record_rebuilding_amend_in_progress, SUM)
 STAT_DEFINE(record_rebuilding_amend_timeouts, SUM)
 STAT_DEFINE(record_rebuilding_amend_retries, SUM)
 STAT_DEFINE(record_rebuilding_amend_failed, SUM)
-STAT_DEFINE(log_rebuilding_record_durability_timeout, SUM)
-STAT_DEFINE(log_rebuilding_restarted_by_rebuilding_coordinator, SUM)
-STAT_DEFINE(record_rebuilding_timeouts, SUM)
 
 // How many times we've seen an amend pseudorecord without an corresponding
 // full record.
@@ -996,6 +1018,9 @@ STAT_DEFINE(gossips_failed_to_send, SUM)
 // How many times the failure detector failed to send gossip messages to an alive node
 STAT_DEFINE(gossips_failed_to_send_to_alive_nodes, SUM)
 
+// How many times a node didn't process gossips for
+// 'gossip_intervals_without_processing_threshold' intervals.
+STAT_DEFINE(gossips_failed_to_process, SUM)
 
 // Total number of nodes expected to be seen (including self)
 STAT_DEFINE(num_nodes, SUM)
@@ -1017,18 +1042,18 @@ STAT_DEFINE(watchdog_num_delays, SUM)
 // Num workers detected as stalled by watchdog
 STAT_DEFINE(num_stalled_workers, SUM)
 
-// How many times the health monitor has looped.
-// Note: temporary
-STAT_DEFINE(health_monitor_num_loops, SUM)
-// Note: temporary
-STAT_DEFINE(health_monitor_errors, SUM)
-// Note: temporary
-STAT_DEFINE(health_monitor_state_indicator, SUM)
-// Note: temporary
-STAT_DEFINE(health_monitor_overload_indicator, SUM)
+// How many nodes are marked OVERLOADED by the FailureDetector.
+STAT_DEFINE(num_overloaded_nodes, SUM)
 
-// EventLoop delays.
-STAT_DEFINE(event_loop_sched_delay, SUM)
+// How many nodes are marked UNHEALTHY by the FailureDetector.
+STAT_DEFINE(num_unhealthy_nodes, SUM)
+// Effective number of unhealthy nodes, excluding disabled nodes
+STAT_DEFINE(effective_unhealthy_nodes, SUM)
+
+// Increases for every HM loop in which the node is found to be overloaded
+STAT_DEFINE(health_monitor_overloaded, SUM)
+// Increases for every HM loop in which the node is found to be unhealthy
+STAT_DEFINE(health_monitor_unhealthy, SUM)
 
 // Number of records from the event log that EventLogReader has seen so far.
 STAT_DEFINE(num_event_log_records_read, SUM)
@@ -1074,16 +1099,6 @@ STAT_DEFINE(shard_rebuilding_not_triggered_started, SUM)
 // exceeding the trigger queue threshold
 STAT_DEFINE(rebuilding_supervisor_throttled, SUM)
 
-// LogsConfig RSM trimming requests
-STAT_DEFINE(logsconfig_manager_trimming_requests, SUM)
-// LogsConfig RSM snapshotting errors
-STAT_DEFINE(logsconfig_manager_snapshotting_errors, SUM)
-// LogsConfig number of deltas written in LogsConfig state machine
-STAT_DEFINE(logsconfig_manager_delta_written, SUM)
-// How many snapshots has been created
-STAT_DEFINE(logsconfig_manager_snapshot_created, SUM)
-// How many snapshots we have requested
-STAT_DEFINE(logsconfig_manager_snapshot_requested, SUM)
 // LogsConfigManager Request Stats
 STAT_DEFINE(logsconfig_api_requests_received, SUM)
 // Requests that was served successfully, This include legit error responses
@@ -1098,20 +1113,6 @@ STAT_DEFINE(logsconfig_api_reply_payload_size, MAX)
 STAT_DEFINE(logsconfig_api_response_toobig, SUM)
 // Size of the logsconfig snapshot record
 STAT_DEFINE(logsconfig_snapshot_size, MAX)
-
-// Determines whether the nodes configuration diverged from the server config
-// while having the same version. This means that either one of the NCs got
-// corrupted, the ServerConfig -> NC conversion was incorrect or someone changed
-// the NodesConfig section in configerator without bumping the version.
-// The value here is either 0 or 1. 1 Means that they diverged and probably
-// need immediate action.
-STAT_DEFINE(nodes_configuration_server_config_diverged_with_same_version, MAX)
-
-// Determines whether the nodes configuration diverged from the server config or
-// not. This might be ok for short durations while the config propagates and is
-// less severe than
-// nodes_configuration_server_config_diverged_with_same_version.
-STAT_DEFINE(nodes_configuration_server_config_diverged, MAX)
 
 // the amount of boycotts active by a controller
 STAT_DEFINE(boycotts_by_controller_active, SUM)
@@ -1148,6 +1149,9 @@ STAT_DEFINE(acl_cache_misses, SUM)
 // cache hits
 STAT_DEFINE(acl_cache_hits, SUM)
 
+// how many times metadata log has been trimmed
+STAT_DEFINE(metadata_log_trims, SUM)
+
 /*
  * The following stats will not be reset by Stats::reset() and the 'reset'
  * admin command.
@@ -1172,10 +1176,7 @@ STAT_DEFINE(read_storage_tasks_delayed, SUM)
 STAT_DEFINE(recovery_enqueued, SUM)
 
 // Stats for rebuilding
-STAT_DEFINE(num_in_flight_rebuilding_read_storage_tasks, SUM)
 STAT_DEFINE(num_logs_rebuilding, SUM)
-STAT_DEFINE(log_rebuilding_stall_timer_expired, SUM)
-STAT_DEFINE(rebuilding_records_read_from_cache, SUM)
 
 // Number of pending GetSeqStateRequests with UNRELEASED_RECORD context
 STAT_DEFINE(get_seq_state_pending_context_unreleased_record, SUM)
@@ -1199,6 +1200,13 @@ STAT_DEFINE(appenderbuffer_pending_appenders, SUM)
 STAT_DEFINE(num_backlog_connections, SUM)
 // Total number of open connections
 STAT_DEFINE(num_connections, SUM)
+STAT_DEFINE(num_connections_incoming_data, SUM)
+STAT_DEFINE(num_connections_incoming_data_low_priority, SUM)
+STAT_DEFINE(num_connections_incoming_data_high_priority, SUM)
+STAT_DEFINE(num_connections_incoming_data_ssl, SUM)
+STAT_DEFINE(num_connections_incoming_gossip, SUM)
+STAT_DEFINE(num_connections_incoming_server_to_server, SUM)
+
 // Total number of open connections using ssl
 STAT_DEFINE(num_ssl_connections, SUM)
 // Dropped connections due to limit/burst
@@ -1232,7 +1240,7 @@ STAT_DEFINE(flow_groups_run_deadline_exceeded_rt, SUM)
 // intact or marking each shard "unrecoverable" which means "I know the data on
 // this shard will never be restored, allow readers to make progress".
 STAT_DEFINE(rebuilding_waiting_for_recoverable_shards, MAX)
-// Number of storage tasks buffered accross all workers.
+// Number of storage tasks buffered across all workers.
 STAT_DEFINE(storage_task_buffer_size_fast_time_sensitive, SUM)
 STAT_DEFINE(storage_task_buffer_size_fast_stallable, SUM)
 STAT_DEFINE(storage_task_buffer_size_slow, SUM)
@@ -1295,21 +1303,8 @@ STAT_DEFINE(graylist_reset_on_disable, SUM)
 //    cleared for any reason.
 STAT_DEFINE(graylist_reseted, SUM)
 
-// How many times does PrioritizedQueue scan all priorities but not find an
-// element, even though there should be one?
-STAT_DEFINE(prioritized_queue_cant_find_once, SUM)
-STAT_DEFINE(prioritized_queue_cant_find_twice, SUM)
-STAT_DEFINE(prioritized_queue_cant_find_thrice_or_more, SUM)
-STAT_DEFINE(prioritized_queue_cant_find_max, MAX)
-
 // how many time fail to recompute byteoffset during Epoch recovery
 STAT_DEFINE(recompute_byteoffset_failed, SUM)
-
-// stats related to admin command connections
-STAT_DEFINE(command_port_connection_encrypted, SUM)
-STAT_DEFINE(command_port_connection_plain, SUM)
-STAT_DEFINE(command_port_connection_failed_ssl_upgrade, SUM)
-STAT_DEFINE(command_port_connection_failed_ssl_required, SUM)
 
 #endif // DESTROYING_THREAD
 #endif // RESETTING_STATS

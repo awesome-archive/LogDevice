@@ -72,8 +72,9 @@ typedef AdminCommandTable<shard_index_t,              /* Shard */
                           bool,     /* Throttled? */
                           int64_t,  /* milliseconds elapsed since throttled */
                           int64_t,  /* Read shaping - current meter level */
-                          std::string,               /* Client Session ID */
-                          read_stream_id_t::raw_type /* Read stream ID*/
+                          std::string,                /* Client Session ID */
+                          read_stream_id_t::raw_type, /* Read stream ID*/
+                          size_t                      /* send buf occupancy */
                           >
     InfoReadersTable;
 
@@ -85,13 +86,25 @@ typedef AdminCommandTable<std::string, /* State */
                           float,       /* Write (MB) */
                           int,         /* Read-cnt */
                           int,         /* Write-cnt */
+                          float,       /* Throughput */
+                          float,       /* RWND Limited % */
+                          float,       /* SNDBuf Limited % */
                           int,         /* Proto */
                           size_t,      /* Send buf-sz */
-                          uint32_t,    /* Peer Config Version */
                           bool,        /* Is ssl */
                           int          /* FD of the underlying socket */
                           >
     InfoSocketsTable;
+
+typedef AdminCommandTable<
+    node_index_t,             /* Node ID */
+    std::string,              /* State */
+    admin_command_table::LSN, /* logsconfig in memory version */
+    admin_command_table::LSN, /* logsconfig durable version */
+    admin_command_table::LSN, /* eventlog in memory version */
+    admin_command_table::LSN  /* eventlog durable version */
+    >
+    InfoRsmTable;
 
 typedef AdminCommandTable<logid_t,                   /* Log id */
                           int64_t,                   /* Shard */
@@ -108,37 +121,21 @@ typedef AdminCommandTable<logid_t,                   /* Log id */
                           >
     InfoRebuildingChunksTable;
 
-typedef AdminCommandTable<logid_t,                   /* Log id */
-                          int64_t,                   /* Shard */
-                          std::chrono::milliseconds, /* Started */
-                          std::string,               /* Rebuilding set */
-                          admin_command_table::LSN,  /* Version */
-                          admin_command_table::LSN,  /* Until LSN */
-                          std::chrono::milliseconds, /* Max timestamp */
-                          admin_command_table::LSN,  /* Rebuilt up to */
-                          uint64_t,                  /* Num replicated */
-                          uint64_t,                  /* Bytes replicated */
-                          uint64_t, /* RecordRebuilding In flight */
-                          uint64_t, /* Num Stores waiting for flush */
-                          uint64_t, /* Num records waiting for amends to start*/
-                          uint64_t, /* RecordRebuildingAmend In flight */
-                          uint64_t, /* Num Amends waiting for flush*/
-                          std::string /* Last storage task status */
-                          >
+typedef AdminCommandTable<logid_t,                  /* Log id */
+                          int64_t,                  /* Shard */
+                          admin_command_table::LSN, /* Until LSN */
+                          admin_command_table::LSN, /* Rebuilt up to */
+                          uint64_t,                 /* Num replicated */
+                          uint64_t>                 /* Bytes replicated */
     InfoRebuildingLogsTable;
 
 typedef AdminCommandTable<uint32_t,                  /* Shard id */
                           std::string,               /* Rebuilding set */
                           admin_command_table::LSN,  /* Version */
                           std::chrono::milliseconds, /* Global window end */
-                          std::chrono::milliseconds, /* Local window end */
+                          std::chrono::milliseconds, /* Progress timestamp */
                           int64_t,     /* Num logs waiting for plan */
-                          uint64_t,    /* Num logs catching up */
-                          uint64_t,    /* Num logs queued for catchup */
-                          uint64_t,    /* Num logs in restart queue */
                           uint64_t,    /* Total memory used */
-                          bool,        /* Stall timer active */
-                          uint64_t,    /* Num restart timers active */
                           uint64_t,    /* Num active logs */
                           bool,        /* Participating */
                           std::string, /* Time by state */
@@ -173,7 +170,8 @@ typedef AdminCommandTable<int,                       /* Shard */
                           std::string,               /* Append Dirtied By */
                           std::string,               /* Rebuild Dirtied By */
                           bool,                      /* Under Replicated */
-                          uint64_t /* Approx. Obsolete Bytes */
+                          uint64_t, /* Approx. Obsolete Bytes */
+                          bool      /* Copyset Index Enabled */
                           >
     InfoPartitionsTable;
 
@@ -253,7 +251,8 @@ typedef AdminCommandTable<logid_t,                    /* Log id */
                           std::chrono::milliseconds,  /* last_time_stuck */
                           std::string,                /* last_reported_state */
                           std::string,                /* last_tail_info */
-                          std::string                 /* time_lag_record */
+                          std::string,                /* time_lag_record */
+                          std::string                 /* reader_name */
                           >
     InfoClientReadStreamsTable;
 
@@ -474,16 +473,6 @@ typedef AdminCommandTable<logid_t,    /* Log ID */
                           std::string /* Details */
                           >
     IsLogEmptyTable;
-typedef AdminCommandTable<logid_t,    /* Log ID */
-                          Status,     /* Result status V1 */
-                          bool,       /* Empty V1 */
-                          uint32_t,   /* isLogEmpty latency */
-                          Status,     /* Result status V2 */
-                          bool,       /* Empty V2 */
-                          uint32_t,   /* isLogEmptyV2 latency */
-                          std::string /* Details */
-                          >
-    IsLogEmptyVersionComparisonTable;
 
 typedef AdminCommandTable<logid_t,                  /* Log id */
                           epoch_t,                  /* Epoch */

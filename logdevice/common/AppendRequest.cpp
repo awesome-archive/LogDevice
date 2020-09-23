@@ -12,7 +12,6 @@
 
 #include <folly/stats/BucketedTimeSeries.h>
 #include <folly/synchronization/Baton.h>
-#include <opentracing/tracer.h>
 
 #include "logdevice/common/AppendProbeController.h"
 #include "logdevice/common/MetaDataLog.h"
@@ -43,7 +42,7 @@ __thread unsigned AppendRequest::clientThreadId;
 AppendRequest::AppendRequest(ClientBridge* client,
                              logid_t logid,
                              AppendAttributes attrs,
-                             const Payload& payload,
+                             PayloadHolder&& payload,
                              std::chrono::milliseconds timeout,
                              append_callback_t callback,
                              std::unique_ptr<SequencerRouter> router)
@@ -51,8 +50,9 @@ AppendRequest::AppendRequest(ClientBridge* client,
       sender_(std::make_unique<SenderProxy>()),
       client_(client),
       status_(E::UNKNOWN),
+      payload_(std::move(payload)),
       record_(logid,
-              payload,
+              payload_.getPayload(),
               LSN_INVALID,
               std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::system_clock::now().time_since_epoch())),
@@ -62,26 +62,12 @@ AppendRequest::AppendRequest(ClientBridge* client,
       attrs_(std::move(attrs)),
       on_socket_close_(id_),
       router_(std::move(router)),
-      tracer_(client ? client->getTraceLogger() : nullptr),
-      e2e_tracer_(client ? client->getOTTracer() : nullptr) {
+      tracer_(client ? client->getTraceLogger() : nullptr) {
   if (!AppendRequest::clientThreadId) {
     AppendRequest::clientThreadId =
         std::max<unsigned>(1, ++AppendRequest::nextThreadId);
   }
-
-  if (client && client_->shouldE2ETrace()) {
-    setTracingContext();
-  }
-
   setRequestType(SRRequestType::APPEND_REQ_TYPE);
-
-  // if it is decided that e2e tracing is on for this request, then create
-  // the corresponding span
-  if (is_traced_ && e2e_tracer_) {
-    request_span_ = e2e_tracer_->StartSpan("AppendRequest_initiated");
-    request_span_->SetTag("destination_log_id", logid.val_);
-    request_span_->Finish();
-  }
 }
 
 AppendRequest::AppendRequest(AppendRequest&& other) noexcept
@@ -90,26 +76,27 @@ AppendRequest::AppendRequest(AppendRequest&& other) noexcept
       client_(std::move(other.client_)),
       failed_to_post_(std::move(other.failed_to_post_)),
       status_(std::move(other.status_)),
+      payload_(std::move(other.payload_)),
       record_(other.record_.logid,
-              std::move(other.record_.payload),
+              payload_.getPayload(),
               LSN_INVALID,
               std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::system_clock::now().time_since_epoch())),
+      sequencer_node_(std::move(other.sequencer_node_)),
+      sequencer_router_flags_(std::move(other.sequencer_router_flags_)),
       creation_time_(other.creation_time_),
       timeout_(other.timeout_),
       callback_(std::move(other.callback_)),
       attrs_(std::move(other.attrs_)),
       per_request_token_(std::move(other.per_request_token_)),
-      string_payload_(std::move(other.string_payload_)),
       target_worker_(std::move(other.target_worker_)),
       previous_lsn_(std::move(other.previous_lsn_)),
       on_socket_close_(id_),
       router_(std::make_unique<SequencerRouter>(record_.logid, this)),
-      sequencer_node_(std::move(other.sequencer_node_)),
-      sequencer_router_flags_(std::move(other.sequencer_router_flags_)),
       append_probe_controller_(std::move(other.append_probe_controller_)),
       tracer_(std::move(other.tracer_)),
       buffered_writer_blob_flag_(std::move(other.buffered_writer_blob_flag_)),
+      payload_group_flag_(std::move(other.payload_group_flag_)),
       bypass_write_token_check_(std::move(other.bypass_write_token_check_)),
       append_redirected_to_dead_node_(
           std::move(other.append_redirected_to_dead_node_)) {
@@ -145,6 +132,7 @@ AppendRequest::~AppendRequest() {
   if (stats) {
     if (client_status == E::OK) {
       CLIENT_HISTOGRAM_ADD(stats, append_latency, latency_usec);
+      CLIENT_LATENCY_COUNTERS(stats, latency_usec);
     }
 
     // bump stats to track whether REDIRECT_NOT_ALIVE flag is effective
@@ -167,15 +155,21 @@ AppendRequest::~AppendRequest() {
                       previous_lsn_,
                       sequencer_node_);
 
-  // finish the corresponding e2e tracing span
-  if (request_execution_span_) {
-    request_execution_span_->Finish();
-  }
-
   if (is_active_) {
     // Call back only when the request is active. If not, it has been cancelled
     // and no one is expecting the callback.
-    callback_(client_status, record_);
+
+    if (!client_payload_.has_value()) {
+      callback_(client_status, record_);
+    } else {
+      // Make sure to call the callback using the same Payload object as the one
+      // passed to Client::append(), even though we copied it and didn't use the
+      // original for anything.
+      Payload tmp = client_payload_.value();
+      std::swap(record_.payload, tmp);
+      callback_(client_status, record_);
+      std::swap(record_.payload, tmp);
+    }
   }
 }
 
@@ -186,12 +180,6 @@ Request::Execution AppendRequest::execute() {
   // initialize a timer that'll abort this request if more than timeout_
   // milliseconds pass
   setupTimer();
-
-  if (request_span_) {
-    // start span for tracing the execution flow of the append
-    request_execution_span_ = e2e_tracer_->StartSpan(
-        "APPEND_execution", {FollowsFrom(&request_span_->context())});
-  }
 
   // kick off the state machine
   if (bypass_write_token_check_) {
@@ -216,7 +204,7 @@ void AppendRequest::fetchLogConfig() {
   ld_check(client_ != nullptr);
   request_id_t rqid = id_;
   Worker::onThisThread()->getConfig()->getLogGroupByIDAsync(
-      record_.logid, [rqid](std::shared_ptr<LogsConfig::LogGroupNode> logcfg) {
+      record_.logid, [rqid](LogsConfig::LogGroupNodePtr logcfg) {
         // Callback must not bind to `this', need to go through
         // `Worker::runningAppends()' in case the AppendRequest timed out while
         // waiting for the config.
@@ -229,8 +217,7 @@ void AppendRequest::fetchLogConfig() {
       });
 }
 
-void AppendRequest::onLogConfigAvailable(
-    std::shared_ptr<LogsConfig::LogGroupNode> cfg) {
+void AppendRequest::onLogConfigAvailable(LogsConfig::LogGroupNodePtr cfg) {
   if (!cfg) {
     destroyWithStatus(E::NOTFOUND);
     return;
@@ -238,7 +225,7 @@ void AppendRequest::onLogConfigAvailable(
   auto attrs = cfg->attrs();
 
   if ((attrs.writeToken().hasValue() &&
-       attrs.writeToken().value().hasValue()) &&
+       attrs.writeToken().value().has_value()) &&
       !client_->hasWriteToken(attrs.writeToken().value().value()) &&
       (!per_request_token_ ||
        *per_request_token_ != attrs.writeToken().value().value())) {
@@ -290,35 +277,10 @@ void AppendRequest::sendProbe() {
   // message
   on_socket_close_.deactivate();
 
-  std::unique_ptr<opentracing::Span> probe_message_send_span;
-
-  // create span for probe message
-  if (request_execution_span_) {
-    probe_message_send_span = e2e_tracer_->StartSpan(
-        "PROBE_Message_send", {ChildOf(&request_execution_span_->context())});
-    probe_message_send_span->SetTag("log_id", record_.logid.val_);
-  }
-
-  auto set_status_span_tag =
-      [&probe_message_send_span](std::string status) -> void {
-    probe_message_send_span->SetTag("status", status);
-    probe_message_send_span->Finish();
-  };
-
   int rv =
       sender_->sendMessage(std::move(msg), sequencer_node_, &on_socket_close_);
   if (rv != 0) {
     onProbeSendError(err, sequencer_node_);
-
-    if (probe_message_send_span) {
-      probe_message_send_span->SetTag("error", error_name(err));
-      set_status_span_tag("error_sending");
-    }
-
-  } else {
-    if (probe_message_send_span) {
-      set_status_span_tag("success");
-    }
   }
 }
 
@@ -373,44 +335,11 @@ std::unique_ptr<APPEND_Message> AppendRequest::createAppendMessage() {
       append_flags};
 
   return std::make_unique<APPEND_Message>(
-      header,
-      previous_lsn_,
-      // The key and payload may point into user-owned memory or be backed by a
-      // std::string contained in this class.  Do not transfer ownership to
-      // APPEND_Message.
-      attrs_,
-      PayloadHolder(record_.payload, PayloadHolder::UNOWNED),
-      tracing_context_);
+      header, previous_lsn_, attrs_, payload_);
 }
 
 void AppendRequest::sendAppendMessage() {
   const NodeID dest = sequencer_node_;
-
-  // The tracing span associated with this request
-  // Should be instantiated if this request is traced
-  std::unique_ptr<opentracing::Span> append_message_sent_span;
-
-  // If there is a request_span associated with this request, it means that
-  // e2e tracing is on for this request and so we can create tracing spans
-  if (request_execution_span_) {
-    // create tracing span for this append message
-    append_message_sent_span = e2e_tracer_->StartSpan(
-        "APPEND_Message_send", {ChildOf(&request_execution_span_->context())});
-
-    // Add append information to span
-    append_message_sent_span->SetTag("log_id", record_.logid.val_);
-    append_message_sent_span->SetTag("dest_node", dest.toString());
-  }
-
-  // Obtain tracing information
-  if (request_execution_span_) {
-    // inject the request_execution_span_ context to be propagated
-    // we want further spans (on the server side) to be childof this span
-    std::stringstream in_stream;
-
-    e2e_tracer_->Inject(request_execution_span_->context(), in_stream);
-    tracing_context_ = in_stream.str();
-  }
 
   auto msg = createAppendMessage();
 
@@ -422,30 +351,11 @@ void AppendRequest::sendAppendMessage() {
           record_.logid.val_,
           dest.toString().c_str());
 
-  // We want to set the status of the sending operation as tag to the span
-  auto set_status_span_tag =
-      [&append_message_sent_span](std::string status) -> void {
-    append_message_sent_span->SetTag("status", status);
-    append_message_sent_span->Finish();
-  };
-
   int rv = sender_->sendMessage(std::move(msg), dest, &on_socket_close_);
   if (rv != 0) {
     handleMessageSendError(MessageType::APPEND, err, dest);
     // Object may be destroyed, must return
-
-    if (append_message_sent_span) {
-      // There was an error while sending the append message, note this to
-      // corresponding span
-      append_message_sent_span->SetTag("error", error_name(err));
-      set_status_span_tag("error_sending");
-    }
-
     return;
-  }
-
-  if (append_message_sent_span) {
-    set_status_span_tag("sent");
   }
 }
 
@@ -524,24 +434,6 @@ void AppendRequest::onReplyReceived(const APPENDED_Header& reply,
   }
 
   status_ = reply.status;
-
-  auto create_reply_span = [this, from](std::string description) -> void {
-    auto reply_span = e2e_tracer_->StartSpan(
-        description, {ChildOf(&request_execution_span_->context())});
-    reply_span->SetTag("source_node_id", from.asNodeID().toString());
-    reply_span->SetTag("reply_status", error_name(status_));
-    reply_span->Finish();
-  };
-
-  // if we have a tracing span associated to the request,
-  // create tracing span for this APPENDED_message
-  if (request_execution_span_ && (source_type == ReplySource::APPEND)) {
-    create_reply_span("APPENDED_Message_receive");
-  }
-
-  if (request_execution_span_ && (source_type == ReplySource::PROBE)) {
-    create_reply_span("PROBE_Reply_receive");
-  }
 
   switch (status_) {
     case E::OK:
@@ -674,16 +566,6 @@ void AppendRequest::onReplyReceived(const APPENDED_Header& reply,
 }
 
 void AppendRequest::noReply(Status st, const Address& to, bool request_sent) {
-  if (!request_sent && request_execution_span_) {
-    // the request_sent being false means that the append_message was not sent
-    // if we have e2e tracing on for this request then we should add a new span
-    auto append_message_sent_error_span =
-        e2e_tracer_->StartSpan("APPEND_Message_sending_failure",
-                               {ChildOf(&request_execution_span_->context())});
-    append_message_sent_error_span->SetTag("destination", to.toString());
-    append_message_sent_error_span->Finish();
-  }
-
   switch (st) {
     case E::PEER_UNAVAILABLE:
     case E::CANCELLED:
@@ -790,15 +672,6 @@ void AppendRequest::onTimeout() {
                  id_.val_,
                  record_.logid.val_,
                  timeout_.count());
-
-  if (request_execution_span_) {
-    auto append_request_timeout_span =
-        e2e_tracer_->StartSpan("APPEND_Request_timeout",
-                               {ChildOf(&request_execution_span_->context())});
-    append_request_timeout_span->SetTag("dest_log_id", record_.logid.val_);
-    append_request_timeout_span->Finish();
-  }
-
   if (sequencer_node_.isNodeID()) {
     // If the node we sent an APPEND to is not responding (for example, it
     // might be overloaded, or the connection to it broken), let's ask other
@@ -821,7 +694,8 @@ void AppendRequest::onTimeout() {
 }
 
 void AppendRequest::resetServerSocketConnectThrottle(NodeID node_id) {
-  Worker::onThisThread()->sender().resetServerSocketConnectThrottle(node_id);
+  Worker::onThisThread()->sender().resetServerSocketConnectThrottle(
+      node_id.index());
 }
 
 bool AppendRequest::checkPayloadSize(size_t payload_size,
@@ -847,6 +721,9 @@ APPEND_flags_t AppendRequest::getAppendFlags() {
   if (buffered_writer_blob_flag_) {
     append_flags |= APPEND_Header::BUFFERED_WRITER_BLOB;
   }
+  if (payload_group_flag_) {
+    append_flags |= APPEND_Header::PAYLOAD_GROUP;
+  }
   if (sequencer_router_flags_ & SequencerRouter::REDIRECT_CYCLE) {
     // `sequencer_node_' is part of a redirection cycle. Include the NO_REDIRECT
     // flags to break it.
@@ -861,14 +738,11 @@ APPEND_flags_t AppendRequest::getAppendFlags() {
   if (!attrs_.optional_keys.empty()) {
     append_flags |= APPEND_Header::CUSTOM_KEY;
   }
-  if (attrs_.counters.hasValue()) {
+  if (attrs_.counters.has_value()) {
     append_flags |= APPEND_Header::CUSTOM_COUNTERS;
   }
   if (previous_lsn_ != LSN_INVALID) {
     append_flags |= APPEND_Header::LSN_BEFORE_REDIRECT;
-  }
-  if (is_traced_) {
-    append_flags |= APPEND_Header::E2E_TRACING_ON;
   }
   return append_flags;
 }

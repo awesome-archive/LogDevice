@@ -12,10 +12,9 @@
 #include "logdevice/common/LocalLogStoreRecordFormat.h"
 #include "logdevice/common/NodeSetState.h"
 #include "logdevice/common/protocol/STORE_Message.h"
+#include "logdevice/common/test/SenderTestProxy.h"
 #include "logdevice/common/test/TestUtil.h"
-#include "logdevice/server/RecordRebuildingStore.h"
-
-using namespace facebook::logdevice;
+#include "logdevice/server/rebuilding/RecordRebuildingStore.h"
 
 // Shortcuts for writing ShardIDs
 #define N10 ShardID(10, 0)
@@ -80,7 +79,7 @@ const logid_t LOG_ID(8008);
 const lsn_t LSN(123);
 const uint64_t TIMESTAMP(1234567890ul);
 const esn_t LNG(332233);
-const log_rebuilding_id_t REBUILDING_ID(11);
+const chunk_rebuilding_id_t REBUILDING_ID(11);
 const ServerInstanceId
     SERVER_INSTANCE_ID(std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::system_clock::now().time_since_epoch())
@@ -91,8 +90,7 @@ class MockNodeAvailabilityChecker : public NodeAvailabilityChecker {
   NodeStatus checkNode(NodeSetState* nodeset_state,
                        ShardID shard,
                        StoreChainLink* destination_out,
-                       bool ignore_nodeset_state,
-                       bool /*allow_unencrypted_connections*/) const override {
+                       bool ignore_nodeset_state) const override {
     ++const_cast<std::map<ShardID, int>&>(requests_seen)[shard];
     if (!ignore_nodeset_state) {
       const auto now = std::chrono::steady_clock::now();
@@ -124,13 +122,16 @@ class TestRecordRebuildingStore : public RecordRebuildingStore,
                             std::initializer_list<ShardID> rebuilding_set,
                             node_index_t my_node_index,
                             const NodeAvailabilityChecker* node_availability)
-      : RecordRebuildingStore(/*block_id=*/0,
-                              /*shard=*/0,
-                              std::move(record),
-                              this /* owner */,
-                              replication,
-                              nullptr /* scratch_payload_holder */,
-                              node_availability),
+      : RecordRebuildingStore(
+            /*block_id=*/0,
+            /*shard=*/0,
+            record.lsn,
+            folly::IOBuf(folly::IOBuf::COPY_BUFFER,
+                         record.blob.data,
+                         record.blob.size),
+            this /* owner */,
+            replication,
+            node_availability),
         my_node_index_(my_node_index),
         settings_(create_default_settings<Settings>()),
         rebuildingSettings_(create_default_settings<RebuildingSettings>()) {
@@ -240,7 +241,7 @@ class TestRecordRebuildingStore : public RecordRebuildingStore,
   lsn_t getRebuildingVersion() const override {
     return 11;
   }
-  log_rebuilding_id_t getLogRebuildingId() const override {
+  chunk_rebuilding_id_t getChunkRebuildingId() const override {
     return REBUILDING_ID;
   }
   node_index_t getMyNodeIndex() const override {
@@ -404,11 +405,9 @@ class RecordRebuildingStoreTest
     EXPECT_EQ(amend, !!(m->getHeader().flags & STORE_Header::AMEND));
     const PayloadHolder* payload = m->getPayloadHolder();
     if (amend) {
-      ASSERT_EQ(nullptr, payload);
+      ASSERT_EQ(0, payload->size());
     } else {
-      ASSERT_NE(nullptr, payload);
-      ASSERT_NE(
-          nullptr, const_cast<PayloadHolder*>(payload)->getPayload().data());
+      ASSERT_NE(0, payload->size());
     }
   }
 

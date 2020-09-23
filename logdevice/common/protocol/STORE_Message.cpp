@@ -44,18 +44,16 @@ STORE_Message::STORE_Message(const STORE_Header& header,
                              STORE_flags_t flags,
                              STORE_Extra extra,
                              std::map<KeyType, std::string> optional_keys,
-                             std::shared_ptr<PayloadHolder> payload,
-                             bool appender_context,
-                             std::string e2e_tracing_context)
+                             const PayloadHolder& payload,
+                             bool appender_context)
     : Message(MessageType::STORE, calcTrafficClass(header)),
       header_(header),
       extra_(extra),
       appender_context_(appender_context),
-      payload_(std::move(payload)),
+      payload_(payload),
       copyset_(header.copyset_size),
       optional_keys_(std::move(optional_keys)),
-      my_pos_in_copyset_(-1),
-      e2e_tracing_context_(std::move(e2e_tracing_context)) {
+      my_pos_in_copyset_(-1) {
   ld_check(header_.copyset_size > 0);
   ld_check(header_.copyset_size <= COPYSET_SIZE_MAX);
   ld_check(copyset_offset >= 0);
@@ -88,14 +86,12 @@ STORE_Message::STORE_Message(const STORE_Header& header,
 }
 
 STORE_Message::STORE_Message(const STORE_Header& header,
-                             std::shared_ptr<PayloadHolder>&& payload)
+                             const PayloadHolder& payload)
     : Message(MessageType::STORE, calcTrafficClass(header)),
       header_(header),
       payload_(std::move(payload)),
       copyset_(header.copyset_size),
-      my_pos_in_copyset_(-1) {
-  ld_check(payload_);
-}
+      my_pos_in_copyset_(-1) {}
 
 bool STORE_Message::cancelled() const {
   if (appender_context_) {
@@ -121,8 +117,6 @@ void STORE_Message::serialize(ProtocolWriter& writer) const {
     ld_check(header_.flags & STORE_Header::AMEND);
     ld_check(header_.wave > 1);
   }
-
-  ld_check(!payload_ || payload_->valid());
 
   // TODO: Handle protocol mismatch between peers for write stream support.
   STORE_Header proto_supported_header(header_);
@@ -176,27 +170,12 @@ void STORE_Message::serialize(ProtocolWriter& writer) const {
     }
   }
 
-  if (header_.flags & STORE_Header::E2E_TRACING_ON) {
-    ld_check(e2e_tracing_context_.size() < MAX_E2E_TRACING_CONTEXT_SIZE);
-    if (e2e_tracing_context_.size() < MAX_E2E_TRACING_CONTEXT_SIZE) {
-      // only serialize the information when its size reasonable
-      writer.writeLengthPrefixedVector(e2e_tracing_context_);
-    } else {
-      writer.writeLengthPrefixedVector(std::string(""));
-    }
-  }
-
-  if (payload_ && !(header_.flags & STORE_Header::AMEND)) {
-    payload_->serialize(writer);
+  if (!payload_.empty() && !(header_.flags & STORE_Header::AMEND)) {
+    payload_.serialize(writer);
   }
 }
 
 MessageReadResult STORE_Message::deserialize(ProtocolReader& reader) {
-  return deserialize(reader, Worker::settings().max_payload_inline);
-}
-
-MessageReadResult STORE_Message::deserialize(ProtocolReader& reader,
-                                             size_t max_payload_inline) {
   STORE_Header hdr;
   STORE_Extra extra;
 
@@ -264,26 +243,17 @@ MessageReadResult STORE_Message::deserialize(ProtocolReader& reader,
     }
   }
 
-  std::string tracing_context;
-
-  if (hdr.flags & STORE_Header::E2E_TRACING_ON) {
-    reader.readLengthPrefixedVector(&tracing_context);
-  }
-
   const size_t payload_size = reader.bytesRemaining();
-  auto payload = PayloadHolder::deserialize(reader, payload_size);
-
-  auto payload_holder = std::make_shared<PayloadHolder>(std::move(payload));
+  PayloadHolder payload_holder =
+      PayloadHolder::deserialize(reader, payload_size);
 
   return reader.result([&] {
     // No, you can't replace this with make_unique. The constructor is private.
-    std::unique_ptr<STORE_Message> m(
-        new STORE_Message(hdr, std::move(payload_holder)));
+    std::unique_ptr<STORE_Message> m(new STORE_Message(hdr, payload_holder));
     m->copyset_ = std::move(copyset);
     m->block_starting_lsn_ = block_starting_lsn;
     m->extra_ = std::move(extra);
     m->optional_keys_ = std::move(optional_keys);
-    m->e2e_tracing_context_ = std::move(tracing_context);
     return m;
   });
 }
@@ -319,7 +289,7 @@ void STORE_Message::onSentCommon(Status st, const Address& to) const {
   if (!appender) {
     // Appender had received enough STORED replies and retired by
     // the time this STORE was passed to TCP. This can happen if we
-    // sent into an unconnected Socket and the handshake took too long.
+    // sent into an unconnected Connection and the handshake took too long.
     ld_debug("Appender for record %s sent to %s not found",
              header_.rid.toString().c_str(),
              Sender::describeConnection(to).c_str());
@@ -502,6 +472,7 @@ std::string STORE_Message::flagsToString(STORE_flags_t flags) {
   FLAG(EPOCH_BEGIN)
   FLAG(DRAINED)
   FLAG(WRITE_STREAM)
+  FLAG(PAYLOAD_GROUP)
 
 #undef FLAG
 
@@ -537,14 +508,14 @@ STORE_Message::getDebugInfo() const {
     add("rebuilding_version", extra_.rebuilding_version);
     add("rebuilding_wave", extra_.rebuilding_wave);
   }
-  if (extra_.rebuilding_id != LOG_REBUILDING_ID_INVALID) {
+  if (extra_.rebuilding_id != CHUNK_REBUILDING_ID_INVALID) {
     add("rebuilding_id", extra_.rebuilding_id.val());
   }
   add("offsets_within_epoch", extra_.offsets_within_epoch.toString().c_str());
   if (extra_.first_amendable_offset != COPYSET_SIZE_MAX) {
     add("first_amendable_offset", extra_.first_amendable_offset);
   }
-  add("payload_size", payload_ ? payload_->size() : 0);
+  add("payload_size", payload_.size());
   add("copyset", toString(copyset_));
   if (block_starting_lsn_ != LSN_INVALID) {
     add("block_starting_lsn", lsn_to_string(block_starting_lsn_));

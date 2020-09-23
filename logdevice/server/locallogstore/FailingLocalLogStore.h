@@ -97,6 +97,13 @@ class FailingLocalLogStore : public LocalLogStore {
     return -1;
   }
 
+  int traverseLogsMetadata(
+      LogMetadataType,
+      LocalLogStore::TraverseLogsMetadataCallback) override {
+    err = E::LOCAL_LOG_STORE_READ;
+    return -1;
+  }
+
   int readAllLogSnapshotBlobs(LogSnapshotBlobType,
                               LogSnapshotBlobCallback) override {
     err = E::NOTSUPPORTED;
@@ -137,6 +144,20 @@ class FailingLocalLogStore : public LocalLogStore {
                                 LocalLogStore::SealPreemption,
                                 const WriteOptions&) override {
     err = E::LOCAL_LOG_STORE_WRITE;
+    return -1;
+  }
+
+  int getRebuildingRanges(RebuildingRangesMetadata& rrm,
+                          RebuildingRangesVersion& version) override {
+    rrm = RebuildingRangesMetadata();
+    version = RebuildingRangesVersion(0, 0);
+    return 0;
+  }
+
+  int writeRebuildingRanges(RebuildingRangesMetadata&,
+                            RebuildingRangesVersion /*base_version*/,
+                            RebuildingRangesVersion /*new_version*/) override {
+    err = E::NOTSUPPORTED;
     return -1;
   }
 

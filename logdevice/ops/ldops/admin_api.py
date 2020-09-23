@@ -23,6 +23,8 @@ from logdevice.admin.clients import AdminAPI
 from logdevice.admin.cluster_membership.types import (
     AddNodesRequest,
     AddNodesResponse,
+    BumpGenerationRequest,
+    BumpGenerationResponse,
     MarkShardsAsProvisionedRequest,
     MarkShardsAsProvisionedResponse,
     RemoveNodesRequest,
@@ -35,6 +37,8 @@ from logdevice.admin.logtree.types import (
     LogGroupCustomCountersResponse,
     LogGroupThroughputRequest,
     LogGroupThroughputResponse,
+    LogTreeInfo,
+    ReplicationInfo,
 )
 from logdevice.admin.maintenance.types import (
     MaintenanceDefinition,
@@ -135,6 +139,12 @@ async def mark_shards_as_provisioned(
     return await client.markShardsAsProvisioned(req)
 
 
+async def bump_node_generation(
+    client: AdminAPI, req: BumpGenerationRequest
+) -> BumpGenerationResponse:
+    return await client.bumpNodeGeneration(req)
+
+
 async def get_maintenances(
     client: AdminAPI, req: Optional[MaintenancesFilter] = None
 ) -> MaintenanceDefinitionResponse:
@@ -180,6 +190,20 @@ async def check_impact(
     return await client.checkImpact(req or CheckImpactRequest())
 
 
+async def get_log_tree_info(client: AdminAPI) -> LogTreeInfo:
+    """
+    Wrapper for getReplicationInfo() Thrift method
+    """
+    return await client.getLogTreeInfo()
+
+
+async def get_replication_info(client: AdminAPI) -> ReplicationInfo:
+    """
+    Wrapper for getReplicationInfo() Thrift method
+    """
+    return await client.getReplicationInfo()
+
+
 async def get_settings(
     client: AdminAPI, req: Optional[SettingsRequest] = None
 ) -> SettingsResponse:
@@ -194,6 +218,13 @@ async def take_log_tree_snapshot(client: AdminAPI, req: int = 0) -> None:
     Wrapper for takeLogTreeSnapshot() Thrift method
     """
     return await client.takeLogTreeSnapshot(req)
+
+
+async def take_maintenance_log_snapshot(client: AdminAPI, min_version: int = 0) -> None:
+    """
+    Wrapper for takeMaintenanceLogSnapshot()
+    """
+    return await client.takeMaintenanceLogSnapshot(min_version)
 
 
 async def get_log_group_throughput(

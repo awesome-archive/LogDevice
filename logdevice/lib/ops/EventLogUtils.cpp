@@ -44,8 +44,8 @@ int tailEventLog(
 
   ld_check(!ThreadID::isWorker());
 
-  auto event_log =
-      std::make_unique<EventLogStateMachine>(client_settings->getSettings());
+  auto event_log = std::make_unique<EventLogStateMachine>(
+      client_settings->getSettings(), nullptr);
 
   if (stop_at_tail) {
     event_log->stopAtTail();
@@ -163,12 +163,11 @@ int getShardAuthoritativeStatusMap(Client& client,
     return rv;
   }
 
-  // Hold a shared_ptr reference to the current ServerConfig so it cannot
+  // Hold a shared_ptr reference to the current NodesConfiguration so it cannot
   // change while we update the map.
-  std::shared_ptr<ServerConfig> server_config =
-      dynamic_cast<ClientImpl*>(&client)->getConfig()->get()->serverConfig();
-  map = set.toShardStatusMap(
-      *server_config->getNodesConfigurationFromServerConfigSource());
+  auto nodes_cfg =
+      dynamic_cast<ClientImpl*>(&client)->getConfig()->getNodesConfiguration();
+  map = set.toShardStatusMap(*nodes_cfg);
   return 0;
 }
 
@@ -196,6 +195,7 @@ Status trim(Client& client, std::chrono::milliseconds timestamp) {
                                        WorkerType::GENERAL,
                                        RSMType::EVENT_LOG_STATE_MACHINE,
                                        false, /* trim_everthing = false */
+                                       false, /* trim snapshot only */
                                        client_impl->getTimeout(),
                                        client_impl->getTimeout());
 

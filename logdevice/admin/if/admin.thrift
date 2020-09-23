@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (c) 2018-present, Facebook, Inc. and its affiliates.
  * All rights reserved.
  *
@@ -6,7 +6,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 include "common/fb303/if/fb303.thrift"
-include "logdevice/admin/if/common.thrift"
+include "logdevice/common/if/common.thrift"
+include "logdevice/admin/if/admin_commands.thrift"
 include "logdevice/admin/if/cluster_membership.thrift"
 include "logdevice/admin/if/exceptions.thrift"
 include "logdevice/admin/if/logtree.thrift"
@@ -16,6 +17,7 @@ include "logdevice/admin/if/safety.thrift"
 include "logdevice/admin/if/settings.thrift"
 
 namespace cpp2 facebook.logdevice.thrift
+namespace go logdevice.admin.if.admin
 namespace py3 logdevice
 namespace php LogDevice
 namespace wiki Thriftdoc.LogDevice.AdminAPI
@@ -39,8 +41,8 @@ service AdminAPI extends fb303.FacebookService {
    * available state even if the node is not fully ready. In this case we will
    * not throw NodeNotReady exception but we will return partial data.
    */
-   nodes.NodesStateResponse getNodesState(1: nodes.NodesStateRequest request) throws
-      (1: exceptions.NodeNotReady notready) (cpp.coroutine);
+   nodes.NodesStateResponse getNodesState(1: nodes.NodesStateRequest request)
+       throws (1: exceptions.NodeNotReady notready) (cpp.coroutine);
 
   /**
    * Add new nodes to the cluster. The request should contain the spec of each
@@ -126,6 +128,37 @@ service AdminAPI extends fb303.FacebookService {
        3: exceptions.NodesConfigurationManagerError ncm_error,
        4: exceptions.NotSupported not_supported) (cpp.coroutine);
 
+
+  /**
+   * Bump the generation of the nodes matching a list of node filters.
+   * This is a temporary API until generations are completely deprecated.
+   */
+  cluster_membership.BumpGenerationResponse bumpNodeGeneration(1:
+      cluster_membership.BumpGenerationRequest request) throws
+      (1: exceptions.NodeNotReady notready,
+       2: exceptions.InvalidRequest invalid_request,
+       3: exceptions.NodesConfigurationManagerError ncm_error,
+       4: exceptions.NotSupported not_supported) (cpp.coroutine);
+
+  /**
+   * In a newly bootstrapped cluster, this call is needed to finalize the
+   * bootstrapping and allow the cluster to be used. This call will:
+   *   1- Enable sequencing on all the nodes that have sequencer role.
+   *   2- Transition storage nodes that are done provisioning into ReadWrite.
+   *   3- Create the initial metadata nodeset according to the passed
+   *      replication property.
+   *   4- Mark the NodesConfiguration as bootstrapped.
+   *
+   * Calls to this function are idempotent: if it is already bootstrapped, it
+   * will do nothing but return a valid response with the current nodes
+   * configuration version. Calls will fail if there are not enough provisioned
+   * storage nodes to satisfy the requested replication property.
+   */
+  cluster_membership.BootstrapClusterResponse bootstrapCluster(1:
+      cluster_membership.BootstrapClusterRequest request) throws
+      (1: exceptions.OperationError error,
+       2: exceptions.NodesConfigurationManagerError ncm_error) (cpp.coroutine);
+
   /**
    * Lists the maintenance by group-ids. This returns maintenances from the
    * state stored in the server which may include maintenances that were not
@@ -208,20 +241,41 @@ service AdminAPI extends fb303.FacebookService {
    * more shards or not. That operation does and exhaustive test on all the
    * configured logs.
    */
-  safety.CheckImpactResponse checkImpact(1: safety.CheckImpactRequest request) throws
-      (1: exceptions.NodeNotReady notready,
+  safety.CheckImpactResponse checkImpact(1: safety.CheckImpactRequest request)
+      throws (
+       1: exceptions.NodeNotReady notready,
        2: exceptions.OperationError error,
        3: exceptions.InvalidRequest invalid_request,
        4: exceptions.NotSupported notsupported) (cpp.coroutine);
 
   // *** LogTree specific APIs
-  logtree.LogTreeInfo getLogTreeInfo() (cpp.corotuine);
+  logtree.LogTreeInfo getLogTreeInfo() (cpp.coroutine);
   logtree.ReplicationInfo getReplicationInfo() (cpp.coroutine);
 
   /**
    * Get information about all or some of the settings
    */
-  settings.SettingsResponse getSettings(1: settings.SettingsRequest request) (cpp.coroutine);
+  settings.SettingsResponse getSettings(1: settings.SettingsRequest request)
+  (cpp.coroutine);
+
+  /**
+   * Apply a temporary override setting.
+   * An InvalidRequest is thrown if the setting name is unknown of if the TTL is
+   * non-positive. An OperationError is thrown if a TTL could not be set.
+   * Note: this will only run on a single node and not affect the entire
+   * cluster.
+   */
+  void applySettingOverride(
+      1: settings.ApplySettingOverrideRequest request) throws
+      (1: exceptions.InvalidRequest invalid_request,
+       2: exceptions.OperationError operation_error)
+      (cpp.coroutine);
+
+  /**
+   * Remove a temporary override setting
+   */
+  void removeSettingOverride(1: settings.RemoveSettingOverrideRequest request)
+      (cpp.coroutine);
 
   /**
    * Force the server to take new snapshot of the LogsTree state in memory. The
@@ -237,10 +291,24 @@ service AdminAPI extends fb303.FacebookService {
        3: exceptions.NotSupported notsupported) (cpp.coroutine);
 
   /**
+   * Force the server to take new snapshot of the Maintenance state in memory.
+   * The argument to this is `min_version` which means that the snapshot should
+   * only be taken if the server is running with this Maintenance version
+   * (or newer) server will throw StaleVersion exception if that server has
+   * older version.
+   * If the argument is not supplied or (0) then the server will take a snapshot
+   * of whatever version it currently has.
+   */
+  void takeMaintenanceLogSnapshot(1: common.unsigned64 min_version) throws
+      (1: exceptions.StaleVersion stale,
+       2: exceptions.NodeNotReady notready,
+       3: exceptions.NotSupported notsupported) (cpp.coroutine);
+
+  /**
    * Get Log Group Throughput
    */
   logtree.LogGroupThroughputResponse getLogGroupThroughput(
-                                1: logtree.LogGroupThroughputRequest request) (cpp.coroutine);
+    1: logtree.LogGroupThroughputRequest request) (cpp.coroutine);
 
   /**
    * Get Log Group custom counters
@@ -249,4 +317,27 @@ service AdminAPI extends fb303.FacebookService {
     1: logtree.LogGroupCustomCountersRequest request) throws
     (1: exceptions.NotSupported notsupported,
      2: exceptions.InvalidRequest invalid_request) (cpp.coroutine);
+
+  /**
+   * Executes the text based admin command passed in the request. This API is
+   * meant as a replacement for the command port.
+   *
+   * NOTE: To perserve backward compatibility with the toolings that used the
+   *       legacy commmand port, the response always ends with "END\r\n".
+   */
+  admin_commands.AdminCommandResponse executeAdminCommand(
+    1: admin_commands.AdminCommandRequest request) throws
+    (1: exceptions.NotSupported notsupported) (cpp.coroutine);
+
+
+  /**
+   * Returns the configured cluster name.
+   */
+  string getClusterName();
+
+  /**
+   * Generates a JSON dump of the loaded configuration file on the server. This
+   * will not include the logs config, only server config.
+   */
+  string dumpServerConfigJson();
 }

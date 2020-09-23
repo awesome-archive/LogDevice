@@ -51,10 +51,13 @@ class LogsConfigManager {
  public:
   LogsConfigManager(UpdateableSettings<Settings> updateable_settings,
                     std::shared_ptr<UpdateableConfig> updateable_config,
+                    std::unique_ptr<RSMSnapshotStore> snapshot_store,
                     WorkerType lcm_worker_type_,
                     bool is_writable);
 
-  static bool createAndAttach(Processor& processor, bool is_writable);
+  static bool createAndAttach(Processor& processor,
+                              std::unique_ptr<RSMSnapshotStore> snapshot_store,
+                              bool is_writable);
   /**
    * Starts the underlying ReplicatedStateMachine and subscribes to its updates
    */
@@ -90,14 +93,6 @@ class LogsConfigManager {
   }
 
   /**
-   * Returns true if the test-only settings test_hold_logsconfig_in_starting is
-   * true.
-   */
-  bool testRequestsHoldInStartingState() const {
-    return Worker::settings().test_hold_logsconfig_in_starting;
-  }
-
-  /**
    * Returns the WorkerType that LogsConfigManager should be working on
    */
   static WorkerType workerType(Processor* processor) {
@@ -129,6 +124,13 @@ class LogsConfigManager {
   void onSettingsUpdated();
 
   /**
+   * Callback that gets called when the ServerConfig is updated. Must be called
+   * on the same worker on which this manager is running as a new
+   * LocalLogsConfig may be published
+   */
+  void onServerConfigUpdated();
+
+  /**
    * Decides on which worker the LogsConfigManager and LogsConfigStateMachine
    * should bind to.
    */
@@ -150,6 +152,7 @@ class LogsConfigManager {
   UpdateableSettings<Settings> settings_;
   std::shared_ptr<UpdateableConfig> updateable_config_;
   std::unique_ptr<LogsConfigStateMachine> state_machine_;
+  std::unique_ptr<RSMSnapshotStore> snapshot_store_;
   std::unique_ptr<LogsConfigStateMachine::SubscriptionHandle>
       config_updates_handle_;
   WorkerType lcm_worker_type_;
@@ -166,7 +169,7 @@ class LogsConfigManager {
  * A Request for creating the LogsConfigManager, This does not mean that it will
  * always start the underlying RSM and start publishing new LogsConfig. It will
  * be listening on UpdateableSettings changes for this. If the
- * enable-logsconfig-manager setting is already enabled, It will be start the
+ * enable-logsconfig-manager setting is already enabled, It will start the
  * RSM immediately.
  */
 class StartLogsConfigManagerRequest : public Request {

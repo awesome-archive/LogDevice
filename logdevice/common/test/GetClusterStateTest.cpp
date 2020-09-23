@@ -18,35 +18,36 @@ namespace facebook { namespace logdevice {
 
 class MockGetClusterStateRequest : public GetClusterStateRequest {
  public:
-  MockGetClusterStateRequest(Settings settings,
-                             std::shared_ptr<ServerConfig> config,
-                             ClusterState* cluster_state,
-                             get_cs_callback_t cb,
-                             folly::Optional<NodeID> dest = folly::none)
+  MockGetClusterStateRequest(
+      Settings settings,
+      std::shared_ptr<const NodesConfiguration> nodes_config,
+      ClusterState* cluster_state,
+      get_cs_callback_t cb,
+      folly::Optional<NodeID> dest = folly::none)
       : GetClusterStateRequest(settings.get_cluster_state_timeout,
                                settings.get_cluster_state_wave_timeout,
                                cb,
                                dest),
         settings_(settings),
-        config_(config),
+        nodes_config_(nodes_config),
         cluster_state_(cluster_state) {}
 
  protected:
   void initTimers() override {}
   void activateWaveTimer() override {}
+  void activateDeferredErrorTimer() override {}
 
   std::shared_ptr<const configuration::nodes::NodesConfiguration>
   getNodesConfiguration() const override {
-    return config_->getNodesConfigurationFromServerConfigSource();
+    return nodes_config_;
   }
 
   ClusterState* getClusterState() const override {
     return cluster_state_;
   }
 
-  bool sendTo(NodeID to) override {
+  void sendTo(NodeID to) override {
     recipients_.push_back(to);
-    return false;
   }
 
   const Settings& getSettings() const override {
@@ -59,7 +60,7 @@ class MockGetClusterStateRequest : public GetClusterStateRequest {
  public:
   std::vector<NodeID> recipients_;
   Settings settings_;
-  std::shared_ptr<ServerConfig> config_;
+  std::shared_ptr<const NodesConfiguration> nodes_config_;
   ClusterState* cluster_state_;
 };
 
@@ -76,20 +77,26 @@ class GetClusterStateTest : public ::testing::Test {
          std::chrono::milliseconds wave_timeout = std::chrono::seconds(1)) {
     callback_called_ = false;
     auto cb = [&](Status st,
-                  std::vector<uint8_t> nodes_state,
-                  std::vector<node_index_t> boycotted_nodes) {
+                  std::vector<std::pair<node_index_t, uint16_t>> nodes_state,
+                  std::vector<node_index_t> boycotted_nodes,
+                  std::vector<std::pair<node_index_t, uint16_t>> nodes_status) {
       ASSERT_FALSE(callback_called_);
       callback_called_ = true;
       status_ = st;
       nodes_state_ = nodes_state;
       boycotted_nodes_ = boycotted_nodes;
+      nodes_status_ = nodes_status;
     };
 
     Settings settings = create_default_settings<Settings>();
     settings.get_cluster_state_timeout = timeout;
     settings.get_cluster_state_wave_timeout = wave_timeout;
     return std::make_unique<MockGetClusterStateRequest>(
-        settings, config_->serverConfig(), cluster_state_.get(), cb, dest);
+        settings,
+        config_->getNodesConfiguration(),
+        cluster_state_.get(),
+        cb,
+        dest);
   }
 
   void checkStatus(Status st) {
@@ -107,8 +114,9 @@ class GetClusterStateTest : public ::testing::Test {
 
   bool callback_called_{false};
   Status status_;
-  std::vector<uint8_t> nodes_state_;
+  std::vector<std::pair<node_index_t, uint16_t>> nodes_state_;
   std::vector<node_index_t> boycotted_nodes_;
+  std::vector<std::pair<node_index_t, uint16_t>> nodes_status_;
 };
 
 TEST_F(GetClusterStateTest, SendToExplicitDest) {
@@ -121,7 +129,11 @@ TEST_F(GetClusterStateTest, SendToExplicitDest) {
   ASSERT_EQ(req->recipients_.size(), 1);
   ASSERT_EQ(req->recipients_[0], dest);
 
-  ASSERT_TRUE(req->onReply(Address(dest), E::OK, {0, 0, 0, 0}, {}));
+  ASSERT_TRUE(req->onReply(Address(dest),
+                           E::OK,
+                           {{0, 0}, {1, 0}, {2, 0}, {3, 0}},
+                           {},
+                           {{0, 0}, {1, 0}, {2, 0}, {3, 0}}));
   checkStatus(E::OK);
 }
 
@@ -139,7 +151,11 @@ TEST_F(GetClusterStateTest, SendToExplicitDestFailed) {
     // trigger a new wave.
     req->recipients_.clear();
 
-    ASSERT_TRUE(req->onReply(Address(dest), e, {0, 0, 0, 0}, {}));
+    ASSERT_TRUE(req->onReply(Address(dest),
+                             e,
+                             {{0, 0}, {1, 0}, {2, 0}, {3, 0}},
+                             {},
+                             {{0, 0}, {1, 0}, {2, 0}, {3, 0}}));
     ASSERT_TRUE(req->recipients_.empty());
     checkStatus(e);
   }
@@ -183,7 +199,11 @@ TEST_F(GetClusterStateTest, Simple) {
   ASSERT_EQ(req->recipients_.size(), 2);
   auto dest = req->recipients_[0];
 
-  ASSERT_TRUE(req->onReply(Address(dest), E::OK, {0, 0, 0, 0}, {}));
+  ASSERT_TRUE(req->onReply(Address(dest),
+                           E::OK,
+                           {{0, 0}, {1, 0}, {2, 0}, {3, 0}},
+                           {},
+                           {{0, 0}, {1, 0}, {2, 0}, {3, 0}}));
   checkStatus(E::OK);
 }
 
@@ -229,19 +249,31 @@ TEST_F(GetClusterStateTest, FirstWaveFailed) {
   ASSERT_EQ(req->recipients_.size(), 2);
   auto dest = req->recipients_[0];
 
-  ASSERT_FALSE(req->onReply(Address(dest), E::FAILED, {0, 0, 0, 0}, {}));
+  ASSERT_FALSE(req->onReply(Address(dest),
+                            E::FAILED,
+                            {{0, 0}, {1, 0}, {2, 0}, {3, 0}},
+                            {},
+                            {{0, 0}, {1, 0}, {2, 0}, {3, 0}}));
   checkNotDone();
   ASSERT_EQ(req->recipients_.size(), 2);
 
   dest = req->recipients_[1];
-  ASSERT_FALSE(req->onReply(Address(dest), E::FAILED, {0, 0, 0, 0}, {}));
+  ASSERT_FALSE(req->onReply(Address(dest),
+                            E::FAILED,
+                            {{0, 0}, {1, 0}, {2, 0}, {3, 0}},
+                            {},
+                            {{0, 0}, {1, 0}, {2, 0}, {3, 0}}));
   checkNotDone();
 
   // it should send another wave
   ASSERT_EQ(req->recipients_.size(), 4);
 
   dest = req->recipients_[2];
-  ASSERT_TRUE(req->onReply(Address(dest), E::OK, {0, 0, 0, 0}, {}));
+  ASSERT_TRUE(req->onReply(Address(dest),
+                           E::OK,
+                           {{0, 0}, {1, 0}, {2, 0}, {3, 0}},
+                           {},
+                           {{0, 0}, {1, 0}, {2, 0}, {3, 0}}));
 
   checkStatus(E::OK);
 }

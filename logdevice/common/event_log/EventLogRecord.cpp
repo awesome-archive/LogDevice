@@ -122,6 +122,7 @@ constexpr SHARD_NEEDS_REBUILD_flags_t
     SHARD_NEEDS_REBUILD_Header::CONDITIONAL_ON_VERSION;
 constexpr SHARD_NEEDS_REBUILD_flags_t
     SHARD_NEEDS_REBUILD_Header::FILTER_RELOCATE_SHARDS;
+constexpr SHARD_NEEDS_REBUILD_flags_t SHARD_NEEDS_REBUILD_Header::FORCE_RESTORE;
 
 std::string SHARD_NEEDS_REBUILD_Header::describe() const {
   std::vector<std::string> flags_str;
@@ -137,6 +138,7 @@ std::string SHARD_NEEDS_REBUILD_Header::describe() const {
   FLAG(FORCE_RESTART);
   FLAG(CONDITIONAL_ON_VERSION);
   FLAG(FILTER_RELOCATE_SHARDS);
+  FLAG(FORCE_RESTORE);
 #undef FLAG
 
   if (remaining_flags) {
@@ -335,6 +337,7 @@ std::string SHARD_DONOR_PROGRESS_Header::describe() const {
   res += ", shardIdx=" + folly::to<std::string>(shardIdx);
   res += ", timestamp=" + folly::to<std::string>(nextTimestamp);
   res += ", version=" + lsn_to_string(version);
+  res += ", flags=" + folly::to<std::string>(flags);
   res += ")";
   return res;
 }

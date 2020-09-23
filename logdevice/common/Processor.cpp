@@ -27,19 +27,18 @@
 #include "logdevice/common/EventLoopTaskQueue.h"
 #include "logdevice/common/HashBasedSequencerLocator.h"
 #include "logdevice/common/MetaDataLogWriter.h"
-#include "logdevice/common/NodesConfigurationPublisher.h"
 #include "logdevice/common/NoopTraceLogger.h"
 #include "logdevice/common/PermissionChecker.h"
 #include "logdevice/common/ReadStreamDebugInfoSamplingConfig.h"
 #include "logdevice/common/Request.h"
+#include "logdevice/common/SSLSessionCache.h"
 #include "logdevice/common/SecurityInformation.h"
 #include "logdevice/common/SequencerBatching.h"
 #include "logdevice/common/SequencerLocator.h"
+#include "logdevice/common/TLSCredMonitor.h"
 #include "logdevice/common/Thread.h"
 #include "logdevice/common/TraceLogger.h"
-#include "logdevice/common/TrafficShaper.h"
 #include "logdevice/common/UpdateableSecurityInfo.h"
-#include "logdevice/common/WatchDogThread.h"
 #include "logdevice/common/WheelTimer.h"
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/WorkerLoadBalancing.h"
@@ -49,8 +48,10 @@
 #include "logdevice/common/plugin/CommonBuiltinPlugins.h"
 #include "logdevice/common/plugin/SequencerLocatorFactory.h"
 #include "logdevice/common/plugin/StaticPluginLoader.h"
+#include "logdevice/common/plugin/ThriftClientFactoryPlugin.h"
 #include "logdevice/common/stats/ServerHistograms.h"
 #include "logdevice/common/stats/Stats.h"
+#include "logdevice/common/thrift/ThriftRouter.h"
 #include "logdevice/common/types_internal.h"
 #include "logdevice/include/Err.h"
 
@@ -105,7 +106,12 @@ class ProcessorImpl {
                 : settings->incoming_messages_max_bytes_limit),
         background_init_flag_(),
         background_queue_(),
-        nc_publisher_(processor->config_, settings, std::move(trace_logger)) {}
+        read_stream_debug_info_sampling_config_(
+            processor->getPluginRegistry(),
+            settings->all_read_streams_debug_config_path),
+        ssl_session_cache_(processor->stats_) {
+    dbg::externalLoggerLogLevel = settings->external_loglevel;
+  }
 
   ~ProcessorImpl() {
     for (auto& workers : all_workers_) {
@@ -127,18 +133,18 @@ class ProcessorImpl {
   std::vector<std::unique_ptr<BackgroundThread>> background_threads_;
   // An empty function means "exit the thread."
   folly::MPMCQueue<folly::Function<void()>> background_queue_;
-  NodesConfigurationPublisher nc_publisher_;
   std::vector<std::unique_ptr<EventLoop>> ev_loops_;
   std::unique_ptr<AllSequencers> allSequencers_;
   std::array<workers_t, static_cast<size_t>(WorkerType::MAX)> all_workers_;
-  std::unique_ptr<ReadStreamDebugInfoSamplingConfig>
-      read_stream_debug_info_sampling_config_;
+  ReadStreamDebugInfoSamplingConfig read_stream_debug_info_sampling_config_;
+
   // If anything depends on worker make sure that it is deleted in the
   // destructor above.
+  SSLSessionCache ssl_session_cache_;
 };
 
 namespace {
-void settingsUpdated(const UpdateableSettings<Settings>& settings) {
+void applySettings(const UpdateableSettings<Settings>& settings) {
   bool ch = settings->abort_on_failed_check;
   bool ca = settings->abort_on_failed_catch;
   if (dbg::abortOnFailedCheck.exchange(ch) != ch) {
@@ -147,6 +153,8 @@ void settingsUpdated(const UpdateableSettings<Settings>& settings) {
   if (dbg::abortOnFailedCatch.exchange(ca) != ca) {
     ld_info("abort-on-failed-catch is %s", ca ? "on" : "off");
   }
+
+  dbg::externalLoggerLogLevel = settings->external_loglevel;
 }
 
 std::unique_ptr<SequencerLocator>
@@ -161,6 +169,15 @@ get_sequencer_locator(std::shared_ptr<PluginRegistry> plugin_registry,
   }
 }
 
+std::unique_ptr<ThriftClientFactory>
+createThriftClientFactory(std::shared_ptr<PluginRegistry> plugin_registry,
+                          std::shared_ptr<UpdateableConfig> config) {
+  auto plugin = plugin_registry->getSinglePlugin<ThriftClientFactoryPlugin>(
+      PluginType::THRIFT_CLIENT_FACTORY);
+  ld_check(plugin);
+  return (*plugin)(std::move(config));
+}
+
 } // namespace
 
 Processor::Processor(std::shared_ptr<UpdateableConfig> updateable_config,
@@ -172,10 +189,12 @@ Processor::Processor(std::shared_ptr<UpdateableConfig> updateable_config,
                      std::string csid,
                      std::string name,
                      folly::Optional<NodeID> my_node_id)
-    : health_monitor_(std::make_unique<HealthMonitor>()),
+    : RequestExecutor(this),
       config_(std::move(updateable_config)),
       settings_(settings),
       plugin_registry_(std::move(plugin_registry)),
+      thrift_client_factory_(
+          createThriftClientFactory(plugin_registry_, config_)),
       stats_(stats),
       impl_(new ProcessorImpl(this, settings, trace_logger)),
       sequencer_locator_(get_sequencer_locator(plugin_registry_, config_)),
@@ -187,10 +206,7 @@ Processor::Processor(std::shared_ptr<UpdateableConfig> updateable_config,
       csid_(std::move(csid)),
       trace_logger_(trace_logger),
       name_(name),
-      my_node_id_(std::move(my_node_id)) {
-  settingsUpdateHandle_ = settings_.callAndSubscribeToUpdates(
-      std::bind(settingsUpdated, settings_));
-}
+      my_node_id_(std::move(my_node_id)) {}
 
 void Processor::init() {
   auto local_settings = settings_.get();
@@ -220,8 +236,8 @@ void Processor::init() {
       *getNodesConfiguration()->getServiceDiscovery());
 
   // might be used by the Workers' subcomponents so init before them.
-  security_info_ =
-      std::make_unique<UpdateableSecurityInfo>(this, settings_->server);
+  security_info_ = std::make_unique<UpdateableSecurityInfo>(
+      config_->updateableServerConfig(), plugin_registry_, settings_->server);
 
   for (int i = 0; i < numOfWorkerTypes(); i++) {
     WorkerType worker_type = workerTypeByIndex(i);
@@ -231,48 +247,40 @@ void Processor::init() {
         "Initialized %d workers of type %s", count, workerTypeStr(worker_type));
     impl_->all_workers_[i] = std::move(worker_pool);
   }
-
   impl_->allSequencers_ =
       std::make_unique<AllSequencers>(this, config_, settings_);
+  // in the context of clients, the processor triggers a cluster state refresh
+  // so that appends can be routed to nodes that are alive from the start
+  if (!settings_->server && settings_->enable_initial_get_cluster_state) {
+    cluster_state_->refreshClusterStateAsync();
+  }
+  applySettings(settings_);
+  settingsUpdateHandle_ = settings_.subscribeToUpdates(
+      std::bind(&Processor::onSettingsUpdated, this));
+
+  initTLSCredMonitor();
+
+  thrift_router_ = std::make_unique<NcmThriftRouter>(
+      thrift_client_factory_.get(),
+      settings_,
+      config_->updateableNodesConfiguration());
 
   if (settings_->server) {
-    traffic_shaper_ = std::make_unique<TrafficShaper>(this, stats_);
-
-    if (getWorkerCount(WorkerType::GENERAL) != 0) {
-      watchdog_thread_ =
-          std::make_unique<WatchDogThread>(this,
-                                           settings_->watchdog_poll_interval_ms,
-                                           settings_->watchdog_bt_ratelimit);
-    }
-
-    // Now that workers are running, we can initialize SequencerBatching
-    // (which waits for all workers to process a Request).  It would be nice
-    // to do this lazily only when sequencer batching is actually on, however
-    // because it needs to talk to all workers and wait for replies, it would
-    // be suspect to deadlocks.
-    sequencer_batching_.reset(new SequencerBatching(this));
-  } else {
-    // in the context of clients, the processor triggers a cluster state refresh
-    // so that appends can be routed to nodes that are alive from the start
-    if (settings_->enable_initial_get_cluster_state) {
-      cluster_state_->refreshClusterStateAsync();
-    }
+    // Remaining necessary steps are implemented in ServerProcessor::init().
+    return;
   }
-
-  impl_->read_stream_debug_info_sampling_config_ =
-      std::make_unique<ReadStreamDebugInfoSamplingConfig>(
-          getPluginRegistry(), settings()->all_read_streams_debug_config_path);
 
   initialized_.store(true, std::memory_order_relaxed);
 }
 
-bool Processor::isReadStreamDebugInfoSamplingAllowed(
-    const std::string& csid) const {
-  if (!settings()->enable_all_read_streams_debug) {
-    return false;
+void Processor::startRunning() {
+  for (std::unique_ptr<EventLoop>& loop : impl_->ev_loops_) {
+    loop->startRunning();
   }
-  return impl_->read_stream_debug_info_sampling_config_
-      ->isReadStreamDebugInfoSamplingAllowed(csid);
+}
+
+ThriftRouter* Processor::getThriftRouter() const {
+  return thrift_router_.get();
 }
 
 workers_t Processor::createWorkerPool(WorkerType type, size_t count) {
@@ -295,8 +303,8 @@ workers_t Processor::createWorkerPool(WorkerType type, size_t count) {
               local_settings->hi_requests_per_iteration,
               local_settings->mid_requests_per_iteration,
               local_settings->lo_requests_per_iteration),
-          local_settings->use_legacy_eventbase ? EvBase::LEGACY_EVENTBASE
-                                               : EvBase::FOLLY_EVENTBASE));
+          EvBase::FOLLY_EVENTBASE,
+          /* start_running */ false));
       auto executor = folly::getKeepAliveToken(loops.back().get());
       worker.reset(createWorker(std::move(executor), worker_id_t(i), type));
     } catch (ConstructorFailed&) {
@@ -312,25 +320,29 @@ workers_t Processor::createWorkerPool(WorkerType type, size_t count) {
 // Testing Constructor
 Processor::Processor(std::shared_ptr<UpdateableConfig> updateable_config,
                      UpdateableSettings<Settings> settings,
+                     folly::Optional<NodeID> my_node_id,
                      bool fake_storage_node,
                      int /*max_logs*/,
                      StatsHolder* stats)
-    : health_monitor_(std::make_unique<HealthMonitor>()),
+    : RequestExecutor(this),
       config_(std::move(updateable_config)),
       fake_storage_node_(fake_storage_node),
       settings_(settings),
       plugin_registry_(std::make_shared<PluginRegistry>(
           createAugmentedCommonBuiltinPluginVector<StaticPluginLoader>())),
+      thrift_client_factory_(
+          createThriftClientFactory(plugin_registry_, config_)),
       stats_(stats),
       impl_(new ProcessorImpl(this,
                               settings,
                               std::make_shared<NoopTraceLogger>(config_))),
       conn_budget_incoming_(settings_.get()->max_incoming_connections),
-      conn_budget_external_(settings_.get()->max_external_connections) {
+      conn_budget_external_(settings_.get()->max_external_connections),
+      my_node_id_(std::move(my_node_id)) {
   ld_check(settings.get());
   num_general_workers_ = settings_->num_workers;
-  security_info_ =
-      std::make_unique<UpdateableSecurityInfo>(this, settings_->server);
+  security_info_ = std::make_unique<UpdateableSecurityInfo>(
+      config_->updateableServerConfig(), plugin_registry_, settings_->server);
 }
 
 Processor::~Processor() {
@@ -426,6 +438,16 @@ int Processor::postImpl(std::unique_ptr<Request>& rq,
                         WorkerType worker_type,
                         int target_thread,
                         bool force) {
+  if (isShuttingDown()) {
+    if (!force || !allow_post_during_shutdown_.load()) {
+      err = E::SHUTDOWN;
+      return -1;
+    }
+  }
+
+  if (target_thread == -1) {
+    target_thread = getTargetThreadForRequest(rq);
+  }
   int nworkers = getWorkerCount(worker_type);
 
   if (folly::kIsDebug) {
@@ -442,43 +464,6 @@ int Processor::postImpl(std::unique_ptr<Request>& rq,
   }
   auto& w = getWorker(worker_id_t(target_thread), worker_type);
   return postToWorker(rq, w, worker_type, worker_id_t(target_thread), force);
-}
-
-int Processor::postRequest(std::unique_ptr<Request>& rq,
-                           WorkerType worker_type,
-                           int target_thread) {
-  if (shutting_down_.load()) {
-    err = E::SHUTDOWN;
-    return -1;
-  }
-  return postImpl(rq, worker_type, target_thread, /* force */ false);
-}
-
-int Processor::postRequest(std::unique_ptr<Request>& rq) {
-  return postRequest(
-      rq, rq->getWorkerTypeAffinity(), getTargetThreadForRequest(rq));
-}
-
-int Processor::blockingRequestImpl(std::unique_ptr<Request>& rq, bool force) {
-  Semaphore sem;
-  rq->setClientBlockedSemaphore(&sem);
-
-  int rv = force ? postImportant(rq) : postRequest(rq);
-  if (rv != 0) {
-    rq->setClientBlockedSemaphore(nullptr);
-    return rv;
-  }
-
-  // Block until the Request has completed
-  sem.wait();
-  return 0;
-}
-
-int Processor::blockingRequest(std::unique_ptr<Request>& rq) {
-  return blockingRequestImpl(rq, false);
-}
-int Processor::blockingRequestImportant(std::unique_ptr<Request>& rq) {
-  return blockingRequestImpl(rq, true);
 }
 
 bool Processor::isDataMissingFromShard(uint32_t shard_idx) {
@@ -513,16 +498,6 @@ Processor::getNodesConfiguration() const {
   return config_->getNodesConfiguration();
 }
 
-std::shared_ptr<const configuration::nodes::NodesConfiguration>
-Processor::getNodesConfigurationFromNCMSource() const {
-  return config_->getNodesConfigurationFromNCMSource();
-}
-
-std::shared_ptr<const configuration::nodes::NodesConfiguration>
-Processor::getNodesConfigurationFromServerConfigSource() const {
-  return config_->getNodesConfigurationFromServerConfigSource();
-}
-
 configuration::nodes::NodesConfigurationManager*
 Processor::getNodesConfigurationManager() {
   return ncm_.get();
@@ -554,16 +529,8 @@ void Processor::shutdown() {
   }
 
   // First get the pthread_t for all running worker threads
-  std::vector<std::thread*> event_threads;
+  std::vector<PThread*> event_threads;
   event_threads.reserve(getAllWorkersCount());
-
-  if (traffic_shaper_) {
-    traffic_shaper_->shutdown();
-  }
-
-  if (watchdog_thread_) {
-    watchdog_thread_->shutdown();
-  }
 
   if (impl_->allSequencers_) {
     impl_->allSequencers_->shutdown();
@@ -575,9 +542,16 @@ void Processor::shutdown() {
 
   // Shutdown wheeltimer so that before shutting down executor threads.
   impl_->wheel_timer_.shutdown();
-
   // Processor will now stop allowing any requests to workers.
   allow_post_during_shutdown_.store(false);
+  // Shutdown all socket on the worker thread before we break the eventloops.
+  for (auto& workers : impl_->all_workers_) {
+    for (auto& worker : workers) {
+      WorkerContextScopeGuard g(worker.get());
+      worker->shutdownSender().wait();
+    }
+  }
+
   // Tell all Workers to shut down and terminate their threads. This
   // also alters WorkerHandles so that further attempts to post
   // requests through them fail with E::SHUTDOWN.
@@ -621,6 +595,26 @@ void Processor::waitForWorkers(size_t nworkers) {
   }
 }
 
+std::map<logid_t, lsn_t> Processor::getAllRSMVersions() {
+  folly::SharedMutex::ReadHolder rlock(rsm_versions_mutex_);
+  return rsm_versions_; // returns a copy
+}
+
+std::map<logid_t, lsn_t> Processor::getAllDurableRSMVersions() {
+  folly::SharedMutex::ReadHolder rlock(rsm_versions_mutex_);
+  return rsm_durable_versions_; // returns a copy
+}
+
+void Processor::setRSMVersion(logid_t rsm_type, lsn_t ver) {
+  folly::SharedMutex::WriteHolder wrlock(rsm_versions_mutex_);
+  rsm_versions_[rsm_type] = ver;
+}
+
+void Processor::setDurableRSMVersion(logid_t rsm_type, lsn_t ver) {
+  folly::SharedMutex::WriteHolder wrlock(rsm_versions_mutex_);
+  rsm_durable_versions_[rsm_type] = ver;
+}
+
 worker_id_t Processor::selectWorkerLoadAware() {
   return impl_->worker_load_balancing_.selectWorker();
 }
@@ -630,21 +624,6 @@ void Processor::reportLoad(worker_id_t idx,
                            WorkerType worker_type) {
   ld_check(worker_type == WorkerType::GENERAL);
   impl_->worker_load_balancing_.reportLoad(idx, load);
-}
-
-int Processor::postImportant(std::unique_ptr<Request>& rq) {
-  return postImportant(
-      rq, rq->getWorkerTypeAffinity(), getTargetThreadForRequest(rq));
-}
-
-int Processor::postImportant(std::unique_ptr<Request>& rq,
-                             WorkerType worker_type,
-                             int target_thread) {
-  if (shutting_down_.load() && !allow_post_during_shutdown_) {
-    err = E::SHUTDOWN;
-    return -1;
-  }
-  return postImpl(rq, worker_type, target_thread, /* force */ true);
 }
 
 SequencerBatching& Processor::sequencerBatching() {
@@ -680,7 +659,7 @@ ClientIdxAllocator& Processor::clientIdxAllocator() const {
 }
 
 bool Processor::hasMyNodeID() const {
-  return my_node_id_.hasValue();
+  return my_node_id_.has_value();
 }
 
 NodeID Processor::getMyNodeID() const {
@@ -790,6 +769,25 @@ void Processor::setSequencerBatching(
 
 ResourceBudget::Token Processor::getIncomingMessageToken(size_t payload_size) {
   return impl_->incoming_message_budget_.acquireToken(payload_size);
+}
+
+SSLSessionCache& Processor::sslSessionCache() const {
+  return impl_->ssl_session_cache_;
+}
+
+void Processor::onSettingsUpdated() {
+  impl_->allSequencers_->onSettingsUpdated();
+  applySettings(settings_);
+}
+
+void Processor::initTLSCredMonitor() {
+  auto settings = settings_.get();
+  tls_cred_monitor_ = std::make_unique<TLSCredMonitor>(
+      this,
+      settings->ssl_cert_refresh_interval,
+      std::set<std::string>{settings->ssl_cert_path,
+                            settings->ssl_key_path,
+                            settings->ssl_ca_path});
 }
 
 }} // namespace facebook::logdevice

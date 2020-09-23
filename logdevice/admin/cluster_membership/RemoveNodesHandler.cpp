@@ -13,10 +13,10 @@
 #include "logdevice/common/membership/StorageStateTransitions.h"
 #include "logdevice/common/types_internal.h"
 
+using namespace facebook::logdevice::configuration::nodes;
+
 namespace facebook { namespace logdevice { namespace admin {
 namespace cluster_membership {
-
-using namespace facebook::logdevice::configuration::nodes;
 
 folly::Expected<RemoveNodesHandler::Result,
                 thrift::ClusterMembershipOperationFailed>
@@ -24,12 +24,12 @@ RemoveNodesHandler::buildNodesConfigurationUpdates(
     const std::vector<thrift::NodesFilter>& filters,
     const NodesConfiguration& nodes_configuration,
     const ClusterState& cluster_state) const {
-  auto node_idxs = findNodes(filters, nodes_configuration);
+  auto node_idxs = allMatchingNodesFromFilters(nodes_configuration, filters);
 
   auto not_met =
       checkPreconditions(node_idxs, nodes_configuration, cluster_state);
 
-  if (not_met.hasValue()) {
+  if (not_met.has_value()) {
     return folly::makeUnexpected(std::move(not_met).value());
   }
 
@@ -43,21 +43,6 @@ RemoveNodesHandler::buildNodesConfigurationUpdates(
 
   return RemoveNodesHandler::Result{
       std::move(to_be_removed), std::move(update)};
-}
-
-std::vector<node_index_t> RemoveNodesHandler::findNodes(
-    const std::vector<thrift::NodesFilter>& filters,
-    const NodesConfiguration& nodes_configuration) const {
-  std::unordered_set<node_index_t> nodes;
-
-  for (const auto& filter : filters) {
-    forFilteredNodes(nodes_configuration, &filter, [&nodes](node_index_t idx) {
-      nodes.emplace(idx);
-    });
-  }
-
-  return {std::make_move_iterator(nodes.begin()),
-          std::make_move_iterator(nodes.end())};
 }
 
 namespace {
@@ -74,7 +59,9 @@ check_is_disabled(const NodesConfiguration& nodes_configuration,
         nodes_configuration.getStorageMembership()->getShardStates(idx);
     for (const auto& state : states) {
       storage_disabled &=
-          state.second.storage_state == membership::StorageState::NONE;
+          (state.second.storage_state == membership::StorageState::NONE ||
+           state.second.storage_state ==
+               membership::StorageState::PROVISIONING);
     }
   }
 
@@ -94,7 +81,10 @@ check_is_disabled(const NodesConfiguration& nodes_configuration,
 
 folly::Optional<thrift::ClusterMembershipFailedNode>
 check_is_dead(const ClusterState& cluster_state, node_index_t idx) {
-  auto node_state = cluster_state.getNodeState(idx);
+  // The default here is FULLY_STARTED to avoid removing a node that's actually
+  // ALIVE but we don't know about it yet.
+  auto node_state =
+      cluster_state.getNodeState(idx, ClusterState::NodeState::FULLY_STARTED);
   if (node_state == ClusterState::NodeState::DEAD) {
     return folly::none;
   }
@@ -116,18 +106,18 @@ RemoveNodesHandler::checkPreconditions(
     const ClusterState& cluster_state) const {
   thrift::ClusterMembershipOperationFailed failure;
   for (const auto& idx : node_idxs) {
-    if (auto fail = check_is_dead(cluster_state, idx); fail.hasValue()) {
-      failure.failed_nodes.push_back(std::move(fail).value());
+    if (auto fail = check_is_dead(cluster_state, idx); fail.has_value()) {
+      failure.failed_nodes_ref()->push_back(std::move(fail).value());
       continue;
     }
 
     if (auto fail = check_is_disabled(nodes_configuration, idx);
-        fail.hasValue()) {
-      failure.failed_nodes.push_back(std::move(fail).value());
+        fail.has_value()) {
+      failure.failed_nodes_ref()->push_back(std::move(fail).value());
       continue;
     }
   }
-  if (failure.failed_nodes.empty()) {
+  if (failure.failed_nodes_ref()->empty()) {
     return folly::none;
   }
   return failure;

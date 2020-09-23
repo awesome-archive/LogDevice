@@ -14,12 +14,6 @@ from dataclasses import dataclass
 from typing import AbstractSet, Counter, Mapping, Optional, Tuple
 
 from ldops.types.socket_address import SocketAddress
-from logdevice.admin.common.types import (
-    LocationScope,
-    NodeID,
-    Role,
-    SocketAddressFamily,
-)
 from logdevice.admin.maintenance.types import MaintenanceDefinition
 from logdevice.admin.nodes.types import (
     MaintenanceStatus,
@@ -32,9 +26,9 @@ from logdevice.admin.nodes.types import (
     ShardDataHealth,
     ShardOperationalState,
     ShardState,
-    ShardStorageState,
     StorageConfig,
 )
+from logdevice.common.types import LocationScope, NodeID, Role, SocketAddressFamily
 from logdevice.membership.Membership.types import MetaDataStorageState, StorageState
 
 
@@ -74,8 +68,6 @@ class NodeView:
             assert da.path is not None
             return SocketAddress(
                 address_family=da.address_family,
-                # pyre-fixme[6]: Expected `_PathLike[AnyStr]` for 1st param but got
-                #  `Optional[str]`.
                 path=os.path.join(os.path.dirname(da.path), "socket_admin"),
             )
         elif da.address_family == SocketAddressFamily.INET:
@@ -84,7 +76,7 @@ class NodeView:
                 address_family=da.address_family, address=da.address, port=6440
             )
         else:
-            assert False, "unreachable"  # pragma: nocover
+            raise AssertionError("unreachable")  # pragma: nocover
 
     @property
     def node_id(self) -> NodeID:
@@ -159,20 +151,18 @@ class NodeView:
             return None
 
     @property
-    def num_shards(self) -> Optional[int]:
+    def num_shards(self) -> int:
         if self.storage_config is not None:
             # pyre-fixme[16]: `Optional` has no attribute `num_shards`.
             return self.storage_config.num_shards
         else:
-            return None
+            return 0
 
     @property
     def shard_states(self) -> Tuple[ShardState, ...]:
         if self.node_state.shard_states is None:
             return ()
         else:
-            # pyre-fixme[6]: Expected `Iterable[_T_co]` for 1st param but got
-            #  `Optional[Sequence[ShardState]]`.
             return tuple(self.node_state.shard_states)
 
     @property
@@ -182,14 +172,6 @@ class NodeView:
     @property
     def shards_data_health_count(self) -> Counter[ShardDataHealth]:
         return collections.Counter(self.shards_data_health)
-
-    @property
-    def shards_current_storage_state(self) -> Tuple[ShardStorageState, ...]:
-        return tuple(s.current_storage_state for s in self.shard_states)
-
-    @property
-    def shards_current_storage_state_count(self) -> Counter[ShardStorageState]:
-        return collections.Counter(self.shards_current_storage_state)
 
     @property
     def shards_current_operational_state(self) -> Tuple[ShardOperationalState, ...]:
@@ -210,9 +192,7 @@ class NodeView:
     @property
     def shards_maintenance_status(self) -> Tuple[Optional[MaintenanceStatus], ...]:
         return tuple(
-            # pyre-fixme[16]: `Optional` has no attribute `status`.
-            s.maintenance.status if s.maintenance else None
-            for s in self.shard_states
+            s.maintenance.status if s.maintenance else None for s in self.shard_states
         )
 
     @property
@@ -228,3 +208,7 @@ class NodeView:
     @property
     def shards_metadata_state_count(self) -> Counter[MetaDataStorageState]:
         return collections.Counter(self.shards_metadata_state)
+
+    @property
+    def tags(self) -> Mapping[str, str]:
+        return self.node_config.tags

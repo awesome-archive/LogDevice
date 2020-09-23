@@ -1,9 +1,7 @@
-# Copyright (c) 2019-present, Facebook, Inc.
-# All rights reserved.
+# Copyright (c) Facebook, Inc. and its affiliates.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree. An additional grant
-# of patent rights can be found in the PATENTS file in the same directory.
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
 
 from __future__ import absolute_import, division, print_function, unicode_literals
 
@@ -44,7 +42,11 @@ def get_linux_type():
         name = re.sub("linux", "", name)
         name = name.strip()
 
-    return "linux", name, os_vars.get("VERSION_ID").lower()
+    version_id = os_vars.get("VERSION_ID")
+    if version_id:
+        version_id = version_id.lower()
+
+    return "linux", name, version_id
 
 
 class HostType(object):
@@ -84,6 +86,15 @@ class HostType(object):
             self.distro or "none",
             self.distrovers or "none",
         )
+
+    def get_package_manager(self):
+        if not self.is_linux():
+            return None
+        if self.distro in ("fedora", "centos"):
+            return "rpm"
+        if self.distro in ("debian", "ubuntu"):
+            return "deb"
+        return None
 
     @staticmethod
     def from_tuple_string(s):

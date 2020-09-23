@@ -8,118 +8,168 @@
 
 #include "logdevice/common/UpdateableSecurityInfo.h"
 
-#include "logdevice/common/PrincipalParser.h"
+#include "logdevice/common/SSLPrincipalParser.h"
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/configuration/Configuration.h"
 #include "logdevice/common/configuration/UpdateableConfig.h"
 #include "logdevice/common/plugin/PermissionCheckerFactory.h"
 #include "logdevice/common/plugin/PluginRegistry.h"
-#include "logdevice/common/plugin/PrincipalParserFactory.h"
+#include "logdevice/common/plugin/SSLPrincipalParserFactory.h"
 
 namespace facebook { namespace logdevice {
 
-UpdateableSecurityInfo::UpdateableSecurityInfo(Processor* processor,
-                                               bool server)
-    : processor_(processor), server_(server) {
-  config_update_sub_ =
-      processor->config_->updateableServerConfig()->subscribeToUpdates(
-          std::bind(&UpdateableSecurityInfo::onConfigUpdate, this));
-  // make sure that we have things configured
-  onConfigUpdate();
+UpdateableSecurityInfo::UpdateableSecurityInfo(
+    std::shared_ptr<UpdateableServerConfig> server_config,
+    std::shared_ptr<PluginRegistry> plugin_registry,
+    bool server)
+    : server_config_(std::move(server_config)),
+      plugin_registry_(std::move(plugin_registry)),
+      server_(server) {
+  config_update_sub_ = server_config_->callAndSubscribeToUpdates(
+      std::bind(&UpdateableSecurityInfo::onConfigUpdate, this));
 };
+
+bool UpdateableSecurityInfo::SecurityInfo::isAuthenticationEnabled() const {
+  return auth_type != AuthenticationType::NONE;
+}
 
 void UpdateableSecurityInfo::shutdown() {
   config_update_sub_.unsubscribe();
 }
 
 void UpdateableSecurityInfo::onConfigUpdate() {
-  UpdateableSecurityInfo* security_info = this;
   ld_debug("UpdateableSecurityInfo::onConfigUpdate");
-  auto processor = security_info->processor_;
-  auto server_config = processor->config_->get()->serverConfig();
-  auto plugin_registry = processor->getPluginRegistry();
 
-  auto principal_parser_ptr = security_info->principal_parser_.get();
-  AuthenticationType auth_type_cur;
-  if (principal_parser_ptr) {
-    auth_type_cur = principal_parser_ptr->getAuthenticationType();
-  } else {
-    auth_type_cur = AuthenticationType::NONE;
+  std::shared_ptr<const SecurityInfo> current_info = current_.get();
+
+  bool first_update = current_info == nullptr;
+  if (first_update) {
+    current_info = std::make_shared<SecurityInfo>();
   }
+
+  // nullptr if unchanged
+  std::shared_ptr<SecurityInfo> new_info_ptr;
+
+  // Creates if nullptr.
+  auto new_info = [&] {
+    if (new_info_ptr == nullptr) {
+      // Copy on first access.
+      new_info_ptr = std::make_shared<SecurityInfo>(*current_info);
+    }
+    return new_info_ptr;
+  };
+
+  std::shared_ptr<ServerConfig> server_config = server_config_->get();
+  auto& securityConfig = server_config->getSecurityConfig();
+
+  bool has_ssl_parser_plugin = current_info->principal_parser != nullptr;
+
+  if (first_update) {
+    auto pp_plugin =
+        plugin_registry_->getSinglePlugin<SSLPrincipalParserFactory>(
+            PluginType::PRINCIPAL_PARSER_FACTORY);
+    new_info()->principal_parser = pp_plugin ? (*pp_plugin)() : nullptr;
+    has_ssl_parser_plugin = true;
+  }
+
+  if (!has_ssl_parser_plugin &&
+      server_config->getAuthenticationType() == AuthenticationType::SSL) {
+    ld_critical("The cluster is configured to use SSL but no SSL principal "
+                "parser pluing found. All connections to the server will most "
+                "likely failed with E::ACCESS.");
+  }
+
+  AuthenticationType auth_type_cur = current_info->auth_type;
   if (auth_type_cur != server_config->getAuthenticationType()) {
-    ld_info("PrincipalParser is changed");
-    auto pp_plugin = plugin_registry->getSinglePlugin<PrincipalParserFactory>(
-        PluginType::PRINCIPAL_PARSER_FACTORY);
-    std::shared_ptr<PrincipalParser> principal_parser = pp_plugin
-        ? (*pp_plugin)(server_config->getAuthenticationType())
-        : nullptr;
-    security_info->principal_parser_.update(principal_parser);
+    if (!first_update) {
+      ld_info("AuthenticationType changed");
+    }
+    new_info()->auth_type = server_config->getAuthenticationType();
   }
 
-  auto permission_checker_ptr = security_info->permission_checker_.get();
   PermissionCheckerType permission_checker_type_cur;
-  if (permission_checker_ptr) {
+  if (current_info->permission_checker) {
     permission_checker_type_cur =
-        permission_checker_ptr->getPermissionCheckerType();
+        current_info->permission_checker->getPermissionCheckerType();
   } else {
     permission_checker_type_cur = PermissionCheckerType::NONE;
   }
 
   PermissionCheckerType permission_checker_type_new;
-  if (security_info->server_) {
-    permission_checker_type_new = server_config->getPermissionCheckerType();
+  if (server_) {
+    permission_checker_type_new = securityConfig.permissionCheckingEnabled()
+        ? server_config->getPermissionCheckerType()
+        : PermissionCheckerType::NONE;
   } else {
     permission_checker_type_new = PermissionCheckerType::NONE;
   }
 
-  auto& securityConfig = server_config->getSecurityConfig();
   bool updateAclCache = true;
   // If we enabled/disabled the ACL cache, or changed any of its properties,
   // we must recreate the permission checker to reflect the changes.
-  if (permission_checker_ptr) {
+  if (current_info->permission_checker) {
     updateAclCache = (securityConfig.enableAclCache !=
-                      permission_checker_ptr->cacheEnabled());
-    if (permission_checker_ptr->cacheEnabled()) {
-      updateAclCache =
-          (updateAclCache ||
-           securityConfig.aclCacheMaxSize !=
-               permission_checker_ptr->cacheSize() ||
-           securityConfig.aclCacheTtl != permission_checker_ptr->cacheTtl());
+                      current_info->permission_checker->cacheEnabled());
+    if (current_info->permission_checker->cacheEnabled()) {
+      updateAclCache |= securityConfig.aclCacheMaxSize !=
+              current_info->permission_checker->cacheSize() ||
+          securityConfig.aclCacheTtl !=
+              current_info->permission_checker->cacheTtl();
     }
   }
 
   if (permission_checker_type_cur != permission_checker_type_new ||
       updateAclCache) {
-    ld_info("PermissionChecker is changed");
+    if (!first_update) {
+      ld_info("PermissionChecker is changed");
+    }
 
-    auto pc_plugin = plugin_registry->getSinglePlugin<PermissionCheckerFactory>(
-        PluginType::PERMISSION_CHECKER_FACTORY);
-    std::shared_ptr<PermissionChecker> permission_checker = pc_plugin
-        ? (*pc_plugin)(permission_checker_type_new, securityConfig)
-        : nullptr;
-
-    security_info->permission_checker_.update(permission_checker);
+    if (permission_checker_type_new == PermissionCheckerType::NONE) {
+      new_info()->permission_checker = nullptr;
+    } else {
+      auto pc_plugin =
+          plugin_registry_->getSinglePlugin<PermissionCheckerFactory>(
+              PluginType::PERMISSION_CHECKER_FACTORY);
+      new_info()->permission_checker = pc_plugin
+          ? (*pc_plugin)(permission_checker_type_new, securityConfig)
+          : nullptr;
+    }
   }
 
-  security_info->cluster_node_identity_ = securityConfig.clusterNodeIdentity;
-  security_info->dumpSecurityInfo();
+  if (current_info->cluster_node_identity !=
+      securityConfig.clusterNodeIdentity) {
+    new_info()->cluster_node_identity = securityConfig.clusterNodeIdentity;
+  }
+  if (current_info->enforce_cluster_node_identity !=
+      securityConfig.enforceClusterNodeIdentity) {
+    new_info()->enforce_cluster_node_identity =
+        securityConfig.enforceClusterNodeIdentity;
+  }
+
+  if (new_info_ptr != nullptr) {
+    // Something changed. Publish the update.
+    current_.update(new_info_ptr);
+  }
+
+  if (new_info_ptr != nullptr || first_update) {
+    dumpSecurityInfo();
+  }
 }
 
 void UpdateableSecurityInfo::dumpSecurityInfo() const {
-  auto principal_parser = principal_parser_.get();
-  ld_debug("Authentication Enabled: %d", principal_parser != nullptr);
+  std::shared_ptr<const SecurityInfo> info = current_.get();
 
-  if (principal_parser) {
-    auto server_config = processor_->config_->get()->serverConfig();
+  ld_debug("Authentication enabled: %d", info->isAuthenticationEnabled());
+
+  if (info->isAuthenticationEnabled()) {
+    auto server_config = server_config_->get();
     ld_debug("Allow Unauthenticated: %d",
              server_config->getSecurityConfig().allowUnauthenticated);
     ld_debug("Authentication Type: %s",
-             AuthenticationTypeTranslator::toString(
-                 principal_parser->getAuthenticationType())
-                 .c_str());
+             AuthenticationTypeTranslator::toString(info->auth_type).c_str());
   }
 
-  auto permission_checker = permission_checker_.get();
+  auto permission_checker = info->permission_checker;
 
   ld_debug("Permission Checking Enabled: %d", permission_checker != nullptr);
   if (permission_checker) {
@@ -128,20 +178,6 @@ void UpdateableSecurityInfo::dumpSecurityInfo() const {
                  permission_checker->getPermissionCheckerType())
                  .c_str());
   }
-}
-
-std::shared_ptr<PermissionChecker>
-UpdateableSecurityInfo::getPermissionChecker() {
-  auto cfg = processor_->config_->get();
-  if (cfg->serverConfig()->getSecurityConfig().permissionCheckingEnabled()) {
-    return permission_checker_.get();
-  } else {
-    return nullptr;
-  }
-}
-
-std::shared_ptr<PrincipalParser> UpdateableSecurityInfo::getPrincipalParser() {
-  return principal_parser_.get();
 }
 
 }} // namespace facebook::logdevice

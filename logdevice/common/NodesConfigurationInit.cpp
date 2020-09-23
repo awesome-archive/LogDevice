@@ -27,7 +27,8 @@ namespace facebook { namespace logdevice {
 bool NodesConfigurationInit::init(
     std::shared_ptr<UpdateableNodesConfiguration> nodes_configuration_config,
     std::shared_ptr<PluginRegistry> plugin_registry,
-    const std::string& server_seed_str) {
+    const std::string& server_seed_str,
+    std::shared_ptr<ServerConfig> current_server_config) {
   ld_info("Trying to fetch the NodesConfiguration using the server seed: %s",
           server_seed_str.c_str());
   std::vector<std::string> host_list;
@@ -41,12 +42,14 @@ bool NodesConfigurationInit::init(
         "There are no seed servers to bootstrap the nodes configuration from");
     return false;
   }
-  auto bootstrapping_config = buildBootstrappingServerConfig(host_list);
+  auto bootstrapping_config = buildBootstrappingServerConfig(
+      host_list, std::move(current_server_config));
   if (bootstrapping_config == nullptr) {
     ld_error("Failed to build a bootstrapping server config for the processor");
     return false;
   }
-  auto processor = buildBootstrappingProcessor(std::move(bootstrapping_config));
+  auto processor = buildBootstrappingProcessor(
+      std::move(bootstrapping_config), plugin_registry);
 
   // This call is blocking.
   auto rv = getConfigWithRetryingAndTimeout(
@@ -129,57 +132,67 @@ bool NodesConfigurationInit::parseAndFetchHostList(
 
 std::shared_ptr<UpdateableConfig>
 NodesConfigurationInit::buildBootstrappingServerConfig(
-    const std::vector<std::string>& host_list) const {
-  // clang-format off
-  folly::dynamic json = folly::dynamic::object
-    ("cluster", "config_source")
-    ("nodes", folly::dynamic::array())
-    ("metadata_logs", folly::dynamic::object
-      ("nodeset", folly::dynamic::array(0))
-      ("replication_factor", 1));
+    const std::vector<std::string>& host_list,
+    std::shared_ptr<ServerConfig> current_server_config) const {
+  using namespace configuration::nodes;
+  using Priority = NodeServiceDiscovery::ClientNetworkPriority;
+  ld_check(!host_list.empty());
 
-  // TODO T44484704: use NC for seed hosts in NodesConfigurationInit
-  // bootstrapping
+  NodesConfiguration::Update update;
+  update.service_discovery_update =
+      std::make_unique<ServiceDiscoveryConfig::Update>();
+
   for (size_t index = 0; index < host_list.size(); index++) {
-    json["nodes"].push_back(folly::dynamic::object
-      ("node_id", index)
-      ("name", folly::sformat("server-{}", index))
-      ("host", host_list[index])
-      ("roles", folly::dynamic::array("sequencer"))
-      ("generation", 1));
-  }
-  // clang-format on
+    auto maybe_address = Sockaddr::fromString(host_list[index]);
+    if (!maybe_address.has_value()) {
+      ld_error("Invalid bootstrapping address: %s", host_list[index].c_str());
+      return nullptr;
+    }
 
-  auto server_config = ServerConfig::fromJson(std::move(json));
-  ld_check(server_config);
+    auto sd = std::make_unique<NodeServiceDiscovery>();
+
+    sd->name = folly::sformat("server-{}", index);
+    sd->default_client_data_address = maybe_address.value();
+    sd->ssl_address = maybe_address.value();
+    sd->roles.set(static_cast<uint8_t>(NodeRole::SEQUENCER));
+    sd->addresses_per_priority = {{Priority::LOW, maybe_address.value()},
+                                  {Priority::MEDIUM, maybe_address.value()},
+                                  {Priority::HIGH, maybe_address.value()}};
+
+    update.service_discovery_update->addNode(
+        index, {ServiceDiscoveryConfig::UpdateType::PROVISION, std::move(sd)});
+  }
+
+  auto nodes_config = NodesConfiguration().applyUpdate(update);
+  ld_check(nodes_config);
+
   auto config = std::make_shared<UpdateableConfig>();
-  config->updateableServerConfig()->update(std::move(server_config));
+  config->updateableServerConfig()->update(std::move(current_server_config));
+  config->updateableNodesConfiguration()->update(nodes_config);
   return config;
 }
 
 std::shared_ptr<Processor> NodesConfigurationInit::buildBootstrappingProcessor(
-    std::shared_ptr<UpdateableConfig> config) const {
-  Settings settings = create_default_settings<Settings>();
+    std::shared_ptr<UpdateableConfig> config,
+    std::shared_ptr<PluginRegistry> plugin_registry) const {
+  // Reuse the clients setting and override some of the values in there.
+  Settings settings = *settings_.get();
   settings.num_workers = 1;
   settings.bootstrapping = true;
 
-  // Given that we don't have the cluster name at this point.
-  settings.include_cluster_name_on_handshake = false;
   settings.include_destination_on_handshake = false;
   settings.enable_config_synchronization = false;
   injectExtraSettings(settings);
 
-  auto plugin_registry = std::make_shared<PluginRegistry>(
-      createAugmentedCommonBuiltinPluginVector<>());
-
   auto trace_logger = std::make_shared<NoopTraceLogger>(config);
+
   // TODO T44484704: use NC for seed hosts in NodesConfigurationInit
   // bootstrapping
   return Processor::create(std::move(config),
                            trace_logger,
                            UpdateableSettings<Settings>(settings),
                            /*stats*/ nullptr,
-                           plugin_registry,
+                           std::move(plugin_registry),
                            /*credentials*/ "",
                            "ld:cfg-src");
 }

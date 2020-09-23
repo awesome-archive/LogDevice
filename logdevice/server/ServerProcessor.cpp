@@ -10,7 +10,7 @@
 #include "logdevice/common/UpdateableSecurityInfo.h"
 #include "logdevice/common/stats/Stats.h"
 #include "logdevice/server/FailureDetector.h"
-#include "logdevice/server/ServerHealthMonitor.h"
+#include "logdevice/server/ServerTLSCredMonitor.h"
 #include "logdevice/server/storage/PurgeCoordinator.h"
 #include "logdevice/server/storage_tasks/ShardedStorageThreadPool.h"
 
@@ -26,27 +26,42 @@ ServerWorker* ServerProcessor::createWorker(WorkContext::KeepAlive executor,
   return worker;
 }
 
-std::unique_ptr<LogStorageState_PurgeCoordinator_Bridge>
-ServerProcessor::createPurgeCoordinator(logid_t log_id,
-                                        shard_index_t shard,
-                                        LogStorageState* parent) {
-  return std::make_unique<PurgeCoordinator>(log_id, shard, parent);
-}
-
-void ServerProcessor::maybeCreateLogStorageStateMap() {
-  if (runningOnStorageNode()) {
-    // sharded_storage_thread_pool_ may be nullptr in tests, in that case
-    // assume there is one shard only.
+void ServerProcessor::fixupLogStorageStateMap() {
+  if (!runningOnStorageNode()) {
+    ld_check(log_storage_state_map_ == nullptr);
+    return;
+  }
+  if (log_storage_state_map_ == nullptr) {
+    // sharded_storage_thread_pool_ & log_storage_state_map may be
+    // nullptr in tests, in that case assume there is one shard only
+    // and allocate `log_storage_state_map_`.
     const shard_size_t num_shards = sharded_storage_thread_pool_
         ? sharded_storage_thread_pool_->numShards()
         : 1;
     log_storage_state_map_ = std::make_unique<LogStorageStateMap>(
-        num_shards, updateableSettings()->log_state_recovery_interval, this);
+        num_shards,
+        stats_,
+        updateableSettings()->enable_record_cache,
+        updateableSettings()->log_state_recovery_interval);
   }
+  log_storage_state_map_->setProcessor(this);
 }
 
 void ServerProcessor::init() {
   Processor::init();
+  traffic_shaper_ = std::make_unique<TrafficShaper>(this, stats_);
+  if (getWorkerCount(WorkerType::GENERAL) != 0) {
+    watchdog_thread_ = std::make_unique<WatchDogThread>(
+        this,
+        updateableSettings()->watchdog_poll_interval_ms,
+        updateableSettings()->watchdog_bt_ratelimit);
+  }
+  // Now that workers are running, we can initialize SequencerBatching
+  // (which waits for all workers to process a Request).  It would be nice
+  // to do this lazily only when sequencer batching is actually on, however
+  // because it needs to talk to all workers and wait for replies, it would
+  // be suspect to deadlocks.
+  sequencer_batching_.reset(new SequencerBatching(this));
   if (sharded_storage_thread_pool_ != nullptr) {
     // All shards are assumed to be waiting to be rebuilt until
     // markShardAsNotMissingData() is called.
@@ -58,24 +73,57 @@ void ServerProcessor::init() {
     }
   }
   if (gossip_settings_->enabled &&
-      getWorkerCount(WorkerType::FAILURE_DETECTOR) > 0) {
+      getWorkerCount(WorkerType::FAILURE_DETECTOR) > 0 &&
+      updateableSettings()->enable_health_monitor) {
     try {
       auto executor =
           getWorker(worker_id_t(0), WorkerType::FAILURE_DETECTOR).getExecutor();
-      health_monitor_ = std::make_unique<ServerHealthMonitor>(
+      health_monitor_ = std::make_unique<HealthMonitor>(
           *executor,
           updateableSettings()->health_monitor_poll_interval_ms,
           getWorkerCount(WorkerType::GENERAL),
-          getWorker(worker_id_t(0), WorkerType::FAILURE_DETECTOR).getStats());
-      health_monitor_->startUp();
+          getWorker(worker_id_t(0), WorkerType::FAILURE_DETECTOR).getStats(),
+          updateableSettings()->health_monitor_max_queue_stalls_avg_ms,
+          updateableSettings()->health_monitor_max_queue_stall_duration_ms,
+          updateableSettings()->health_monitor_max_overloaded_worker_percentage,
+          updateableSettings()->health_monitor_max_stalls_avg_ms,
+          updateableSettings()->health_monitor_max_stalled_worker_percentage,
+          updateableSettings()->health_monitor_max_delay);
+      applyToWorkerPool(
+          [& hm = *health_monitor_](Worker& w) {
+            w.setLongExecutionCallback(
+                [& hm = hm](int idx, std::chrono::milliseconds duration) {
+                  hm.reportWorkerStall(idx, duration);
+                });
+            w.setLongQueuedCallback(
+                [& hm = hm](int idx, std::chrono::milliseconds duration) {
+                  hm.reportWorkerQueueStall(idx, duration);
+                });
+          },
+          Processor::Order::FORWARD,
+          WorkerType::GENERAL);
+
+      watchdog_thread_->setSlowWatchdogLoopCallback(
+          [& hm = *health_monitor_](bool delayed) {
+            hm.reportWatchdogHealth(delayed);
+          });
+      watchdog_thread_->setSlowWorkersCallback(
+          [& hm = *health_monitor_](int num_stalled) {
+            hm.reportStalledWorkers(num_stalled);
+          });
+
     } catch (const ConstructorFailed&) {
-      ld_error("Failed to construct ServerHealthMonitor: %s",
-               error_description(err));
-      STAT_INCR(stats_, health_monitor_errors);
+      ld_error("Failed to construct HealthMonitor: %s", error_description(err));
     }
-  } else {
-    STAT_INCR(stats_, health_monitor_errors);
   }
+}
+
+void ServerProcessor::startRunning() {
+  Processor::startRunning();
+  if (gossip_settings_->enabled && health_monitor_.get()) {
+    health_monitor_->startUp();
+  }
+  watchdog_thread_->startRunning();
 }
 
 int ServerProcessor::getWorkerCount(WorkerType type) const {
@@ -129,4 +177,36 @@ LogStorageStateMap& ServerProcessor::getLogStorageStateMap() const {
   ld_check(log_storage_state_map_);
   return *log_storage_state_map_;
 }
+
+void ServerProcessor::shutdown() {
+  if (isShuttingDown()) {
+    return;
+  }
+  if (watchdog_thread_) {
+    watchdog_thread_->shutdown();
+  }
+
+  if (traffic_shaper_) {
+    traffic_shaper_->shutdown();
+  }
+
+  Processor::shutdown();
+}
+
+ServerProcessor::~ServerProcessor() {
+  shutdown();
+}
+
+void ServerProcessor::initTLSCredMonitor() {
+  auto settings = updateableSettings().get();
+  auto server_settings = updateableServerSettings().get();
+  tls_cred_monitor_ = std::make_unique<ServerTLSCredMonitor>(
+      this,
+      settings->ssl_cert_refresh_interval,
+      std::set<std::string>{settings->ssl_cert_path,
+                            settings->ssl_key_path,
+                            settings->ssl_ca_path},
+      server_settings->tls_ticket_seeds_path);
+}
+
 }} // namespace facebook::logdevice

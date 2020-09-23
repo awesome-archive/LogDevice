@@ -5,7 +5,7 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-#include "logdevice/server/RebuildingMarkerChecker.h"
+#include "logdevice/server/rebuilding/RebuildingMarkerChecker.h"
 
 #include <gtest/gtest.h>
 
@@ -16,16 +16,16 @@
 namespace facebook { namespace logdevice {
 
 using namespace facebook::logdevice::configuration;
-using namespace facebook::logdevice::configuration::nodes;
 
 NodesConfiguration buildNodesConfiguration(NodeID my_id, int num_shards) {
-  NodesConfigurationTestUtil::NodeTemplate tmpl{my_id.index()};
-  tmpl.num_shards = num_shards;
-  tmpl.generation = my_id.generation();
+  configuration::Node node =
+      configuration::Node::withTestDefaults(my_id.index());
+  node.addStorageRole(num_shards);
+  node.generation = my_id.generation();
 
   NodesConfiguration nc;
-  auto new_nc =
-      nc.applyUpdate(NodesConfigurationTestUtil::addNewNodeUpdate(nc, tmpl));
+  auto new_nc = nc.applyUpdate(
+      NodesConfigurationTestUtil::addNewNodeUpdate(nc, node, my_id.index()));
   ld_check(new_nc);
 
   // Assert that all the shards are PROVISIONING
@@ -48,7 +48,6 @@ TEST(RebuildingMarkerCheckerTest, testAllProvisioning) {
   RebuildingMarkerChecker checker(
       nc.getStorageMembership()->getShardStates(node_idx),
       NodeID(node_idx, generation),
-      nc.getStorageMembership()->getVersion(),
       nc_api.get(),
       store.get());
 
@@ -93,7 +92,6 @@ TEST(RebuildingMarkerCheckerTest, testFirstGeneration) {
   RebuildingMarkerChecker checker(
       nc.getStorageMembership()->getShardStates(node_idx),
       NodeID(node_idx, generation),
-      nc.getStorageMembership()->getVersion(),
       nullptr /* simulating a disabled NCM */,
       store.get());
 
@@ -145,7 +143,6 @@ TEST(RebuildingMarkerCheckerTest, testMissingData) {
   RebuildingMarkerChecker checker(
       nc.getStorageMembership()->getShardStates(node_idx),
       NodeID(node_idx, generation),
-      nc.getStorageMembership()->getVersion(),
       nc_api.get(),
       store.get());
 

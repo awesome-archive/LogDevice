@@ -57,7 +57,7 @@ void RocksDBSettings::defineSettings(SettingEasyInit& init) {
 
   init("rocksdb-compression-type",
        &compression,
-       "none",
+       "lz4",
        [](const std::string& val) {
          if (val == "snappy") {
            return rocksdb::kSnappyCompression;
@@ -81,8 +81,8 @@ void RocksDBSettings::defineSettings(SettingEasyInit& init) {
                "' for option --rocksdb-compression-type");
          }
        },
-       "compression algorithm: 'snappy' (default), 'none', 'zlib', 'bzip2', "
-       "'lz4', 'lz4hc', 'zstd'",
+       "compression algorithm: 'lz4' (default), 'lz4hc', 'snappy', "
+       "'zlib', 'bzip2', 'zstd', 'none'",
        SERVER | REQUIRES_RESTART,
        SettingsCategory::RocksDB);
 
@@ -415,7 +415,7 @@ void RocksDBSettings::defineSettings(SettingEasyInit& init) {
        nullptr,
        "the largest L0 files that it is beneficial to compact on their own. "
        "Note that we can still compact larger files than this if that enables "
-       "usto compact a longer range of consecutive files.",
+       "us to compact a longer range of consecutive files.",
        SERVER,
        SettingsCategory::LogsDB);
 
@@ -441,7 +441,7 @@ void RocksDBSettings::defineSettings(SettingEasyInit& init) {
          }
        },
        "Partial compaction candidate file ranges that contain a file that "
-       "comprises a larger propotion of the total file size in the range than "
+       "comprises a larger proportion of the total file size in the range than "
        "this setting, will not be considered.",
        SERVER,
        SettingsCategory::LogsDB);
@@ -652,8 +652,8 @@ void RocksDBSettings::defineSettings(SettingEasyInit& init) {
                std::to_string(val.count()) + "ms given.");
          }
        },
-       "Minumum guaranteed time period for a node to re-dirty a partition "
-       "after a MemTable is flushed without incurring a syncronous write "
+       "Minimum guaranteed time period for a node to re-dirty a partition "
+       "after a MemTable is flushed without incurring a synchronous write "
        "penalty to update the partition dirty metadata.",
        SERVER,
        SettingsCategory::LogsDB);
@@ -789,11 +789,60 @@ void RocksDBSettings::defineSettings(SettingEasyInit& init) {
        SettingsCategory::Storage);
 
   init("rocksdb-background-wal-sync",
-       &background_wal_sync,
+       (bool*)nullptr,
        "true",
        nullptr,
-       "Perform all RocksDB WAL syncs on a background thread rather than "
-       "synchronously on a 'fast' storage thread executing the write.",
+       "Deprecated and ignored.",
+       SERVER,
+       SettingsCategory::LogsDB);
+
+  init("rocksdb-wal-buffering",
+       &wal_buffering,
+       "background-range-sync",
+       [](const std::string& val) -> WALBufferingMode {
+         if (val == "none") {
+           return WALBufferingMode::NONE;
+         } else if (val == "background-range-sync") {
+           return WALBufferingMode::BACKGROUND_RANGE_SYNC;
+         } else if (val == "background-append") {
+           return WALBufferingMode::BACKGROUND_APPEND;
+         } else if (val == "delayed-append") {
+           return WALBufferingMode::DELAYED_APPEND;
+         }
+         throw boost::program_options::error(
+             "value of --rocksdb-wal-buffering must be one of: "
+             "background-range-sync, background-append, delayed-append. Got: " +
+             val);
+       },
+       "What write-ahead log operations to offload from write path to "
+       "background thread. 'none' - no offloading, 'background-range-sync' - "
+       "offload optional sync_file_range() calls, 'background-append' - "
+       "offload writes, 'delayed-append' - offload and batch writes.",
+       SERVER,
+       SettingsCategory::LogsDB);
+
+  init("rocksdb-wal-buffer-size",
+       &wal_buffer_size,
+       "8M",
+       parse_positive<uint64_t>(),
+       "WAL buffer size when rocksdb-wal-buffering is set to background-append "
+       "or delayed-append. Some things to consider: "
+       "(1) We allocate 2 buffers of this size for each WAL file. "
+       "(2) There may occasionally be a few such files open at a time, but "
+       "most of the time just one. "
+       "(3) Normally, a new WAL file is created on every flush, which "
+       "typically happens every few hundred MB, but in extreme cases may be "
+       "happeninig every couple MB during rebuilding. "
+       "(4) If append-store-durability is set to 'memory', WAL gets very few "
+       "writes - only occasional small pieces of metadata. "
+       "(5) If this buffer size is set too small, writes may stall if a "
+       "particularly slow background write or sync stalls long enough "
+       "for foreground thread to run out of buffer space. "
+       "(6) If this buffer size is set too big, the allocation/deallocation of "
+       "the oversized buffers may be a significant overhead when creating WAL "
+       "files that never grow big enough to use all of the buffer. (The latter "
+       "limitation is unnecessary: we could make the buffer grow lazily; that "
+       "is not implemented at the moment.)",
        SERVER,
        SettingsCategory::LogsDB);
 
@@ -805,12 +854,10 @@ void RocksDBSettings::defineSettings(SettingEasyInit& init) {
        "records that do not pass copyset filters. This greatly improves the "
        "efficiency of reading and rebuilding if records are large (1KB or "
        "bigger). For small records, the overhead of maintaining the copyset "
-       "index negates the savings. **WARNING**: if this setting is enabled, "
-       "records written without --write-copyset-index will be skipped by the "
-       "copyset filter and will not be delivered to readers. Enable "
-       "--write-copyset-index first and wait for all data records written "
-       "before --write-copyset-index was enabled (if any) to be trimmed "
-       "before enabling this setting.",
+       "index negates the savings. If this setting is enabled while "
+       "--rocksdb-write-copyset-index is not, it will be ignored. After "
+       "enabling --rocksdb-write-copyset-index, all **NEW** partitions "
+       "will have copyset idnex enabled",
        SERVER | REQUIRES_RESTART,
        SettingsCategory::LogsDB);
 
@@ -923,6 +970,17 @@ void RocksDBSettings::defineSettings(SettingEasyInit& init) {
        nullptr,
        "Used for testing only. If true, a node will report all stores it "
        "receives as corrupted.",
+       SERVER,
+       SettingsCategory::Testing);
+
+  init("rocksdb-test-stall-sst-reads",
+       &test_stall_sst_reads,
+       "false",
+       nullptr,
+       "Used for testing. If set to 'true', rocksdb::RandomAccessFile::Read() "
+       "calls will stall indefinitely, until the setting is changed to "
+       "'false'. This simulates a file read getting stuck. Can be used for "
+       "testing resilience of read path to such situation.",
        SERVER,
        SettingsCategory::Testing);
 
@@ -1235,7 +1293,7 @@ void RocksDBSettings::defineSettings(SettingEasyInit& init) {
        "1",
        parse_positive<ssize_t>(),
        "maximum number of concurrent background memtable flushes per shard. "
-       "Flushes run on the rocksdb hipri thread pool",
+       "Flushes run on the rocksdb hi-pri thread pool",
        SERVER | REQUIRES_RESTART,
        SettingsCategory::RocksDB);
 
@@ -1273,6 +1331,35 @@ void RocksDBSettings::defineSettings(SettingEasyInit& init) {
        "1",
        parse_positive<ssize_t>(),
        "number of LSM-tree levels if level compaction is used",
+       SERVER | REQUIRES_RESTART,
+       SettingsCategory::RocksDB);
+
+  init("rocksdb-keep-log-file-num",
+       &keep_log_file_num,
+       "100",
+       parse_positive<ssize_t>(),
+       "number of RocksDB log files to retain. A periodic scan process in "
+       "RocksDB reclaims old files.",
+       SERVER | REQUIRES_RESTART,
+       SettingsCategory::RocksDB);
+
+  init("rocksdb-max-log-file-size",
+       &max_log_file_size,
+       "100M",
+       parse_nonnegative<ssize_t>(),
+       "Max size of a RocksDB log file. A new file is created once the limit "
+       "is reached. 0 for unlimited.",
+       SERVER | REQUIRES_RESTART,
+       SettingsCategory::RocksDB);
+
+  init("rocksdb-log-readahead-size",
+       &log_readahead_size,
+       "0",
+       parse_nonnegative<ssize_t>(),
+       "The number of bytes to prefetch when reading the log (including the "
+       "manifest). This is mostly useful for reading a remotely located log, "
+       "as it can save the number of round-trips. If 0, then the prefetching "
+       "is disabled.",
        SERVER | REQUIRES_RESTART,
        SettingsCategory::RocksDB);
 
@@ -1324,8 +1411,8 @@ void RocksDBSettings::defineSettings(SettingEasyInit& init) {
       "100G", // >> memtable-size-per-node to make this irrelevant
       parse_memory_budget(),
       "When any RocksDB memtable ('write buffer') reaches this size it is made "
-      "immitable, then flushed into a newly created L0 file. This setting may "
-      "soon be superceded by a more dynamic --memtable-size-per-node limit. ",
+      "immutable, then flushed into a newly created L0 file. This setting may "
+      "soon be superseded by a more dynamic --memtable-size-per-node limit. ",
       SERVER,
       SettingsCategory::RocksDB);
 
@@ -1494,32 +1581,123 @@ void RocksDBSettings::defineSettings(SettingEasyInit& init) {
 
   init("rocksdb-io-tracing-shards",
        &io_tracing_shards,
-       "",
-       [](const std::string& val) -> std::vector<shard_index_t> {
+       "all",
+       [](const std::string& val) -> IOTracingShards {
+         IOTracingShards ret;
+         if (val == "none" || val == "") {
+           return ret;
+         }
+         if (val == "all") {
+           ret.all_shards = true;
+           return ret;
+         }
          std::vector<std::string> tokens;
          folly::split(',', val, tokens, true /* ignoreEmpty */);
 
-         std::vector<shard_index_t> v;
          for (const auto& token : tokens) {
            try {
-             v.push_back(folly::to<shard_index_t>(token));
+             ret.shards.push_back(folly::to<shard_index_t>(token));
            } catch (std::range_error&) {
              throw boost::program_options::error(
                  "Invalid shard idx in --rocksdb-io-tracing-shards: " + val);
            }
          }
 
-         std::sort(v.begin(), v.end());
-         v.erase(std::unique(v.begin(), v.end()), v.end());
+         std::sort(ret.shards.begin(), ret.shards.end());
+         ret.shards.erase(std::unique(ret.shards.begin(), ret.shards.end()),
+                          ret.shards.end());
 
-         return v;
+         return ret;
        },
-       "List of shards for which to enable IO tracing. IO tracing prints "
-       "information about every single IO operation (like file read() and "
-       "write() calls) to the log at info level. It's very spammy, use with "
-       "caution.",
+       "List of shards for which to enable IO tracing. 'all' to enable for all "
+       "shards, 'none' or empty string to disable for all shards. IO tracing "
+       "prints information about every sufficiently slow (see "
+       "rocksdb-io-tracing-threshold) IO operation (like file read() and "
+       "write() calls) to the log at info level.",
        SERVER,
        SettingsCategory::LogsDB);
+
+  init("rocksdb-io-tracing-threshold",
+       &io_tracing_threshold,
+       "5s",
+       nullptr,
+       "IO tracing (see rocksdb-io-tracing-shards) will report only operations "
+       "that took at least this long. Set to '0' to report all operations.",
+       SERVER,
+       SettingsCategory::LogsDB);
+
+  init("rocksdb-io-tracing-stall-threshold",
+       &io_tracing_stall_threshold,
+       "30s",
+       nullptr,
+       "If this setting is nonzero, and rocksdb-io-tracing-shards is enabled, "
+       "IO tracing will spin up a background thread to periodically poll the "
+       "list of active IO operations and report when an operation is stuck for "
+       "at least this long. The purpose is to detect stuck IO operations, "
+       "which wouldn't be reported by the regular IO tracing because it only "
+       "reports an operation after it completes. If set to '0', stall "
+       "detection will be disabled, and no background thread will be created.",
+       SERVER,
+       SettingsCategory::LogsDB);
+
+  init("rocksdb-paranoid-checks",
+       &paranoid_checks,
+       "true",
+       nullptr,
+       "If true, RocksDB will aggressively check consistency of the data. "
+       "Also, if any of the  writes to the database fails (Put, Delete, Merge, "
+       "Write), the database will switch to read-only mode and fail all other "
+       "Write operations. "
+       "In most cases you want this to be set to true.",
+       SERVER | REQUIRES_RESTART,
+       SettingsCategory::RocksDB);
+
+  init("rocksdb-writable-file-max-buffer-size",
+       &writable_file_max_buffer_size,
+       "16M",
+       parse_positive<size_t>(),
+       "Buffer size rocksdb will use when writing files. Applies to sst files, "
+       "and likely to some metadata files like MANIFEST and OPTIONS. This "
+       "memory is not allocated all at once, the buffer grows exponentially "
+       "up to this size; so it's ok for this setting to be too high.",
+       SERVER | REQUIRES_RESTART,
+       SettingsCategory::RocksDB);
+
+  init("write-copyset-index",
+       &write_copyset_index_,
+       "true",
+       nullptr,
+       "If set, storage nodes will write the copyset index for all records in "
+       "new partitions created after this is enabled. "
+       "Note that this won't be used until --rocksdb-use-copyset-index is "
+       "enabled.",
+       SERVER | REQUIRES_RESTART,
+       SettingsCategory::RocksDB);
+
+  init("rocksdb-write-copyset-index",
+       &write_copyset_index_,
+       "true",
+       nullptr,
+       "If set, storage nodes will write the copyset index for all records in "
+       "new partitions created after this is enabled. "
+       "Note that this won't be used until --rocksdb-use-copyset-index is "
+       "enabled.",
+       SERVER | REQUIRES_RESTART,
+       SettingsCategory::RocksDB);
+
+#ifdef LOGDEVICE_ROCKSDB_HAS_SKIP_CHECKING_SST_FILE_SIZES_ON_DB_OPEN
+  init("rocksdb-skip-checking-sst-file-sizes-on-db-open",
+       &skip_checking_sst_file_sizes_on_db_open,
+       "true",
+       nullptr,
+       "If true, then rocksdb will not fetch and check sizes of all sst "
+       "files wjen opening a DB. This may significantly speed up startup, "
+       "especially when using remote storage. It'll still check that all "
+       "required sst files exist. If rocksdb-paranoid-checks is false, "
+       "this option is ignored, and sst files are not checked at all.",
+       SERVER,
+       SettingsCategory::RocksDB);
+#endif
 }
 
 rocksdb::Options RocksDBSettings::passThroughRocksDBOptions() const {
@@ -1547,6 +1725,9 @@ rocksdb::Options RocksDBSettings::passThroughRocksDBOptions() const {
   options.max_bytes_for_level_multiplier = max_bytes_for_level_multiplier;
   options.max_write_buffer_number = max_write_buffer_number;
   options.num_levels = num_levels;
+  options.keep_log_file_num = keep_log_file_num;
+  options.max_log_file_size = max_log_file_size;
+  options.log_readahead_size = log_readahead_size;
   options.target_file_size_base = target_file_size_base;
   options.write_buffer_size = write_buffer_size;
   options.max_total_wal_size = max_total_wal_size;
@@ -1555,6 +1736,12 @@ rocksdb::Options RocksDBSettings::passThroughRocksDBOptions() const {
   options.use_direct_reads = use_direct_reads;
   options.use_direct_io_for_flush_and_compaction =
       use_direct_io_for_flush_and_compaction;
+  options.paranoid_checks = paranoid_checks;
+  options.writable_file_max_buffer_size = writable_file_max_buffer_size;
+#ifdef LOGDEVICE_ROCKSDB_HAS_SKIP_CHECKING_SST_FILE_SIZES_ON_DB_OPEN
+  options.skip_checking_sst_file_sizes_on_db_open =
+      skip_checking_sst_file_sizes_on_db_open;
+#endif
 
   options.compaction_options_universal.min_merge_width = uc_min_merge_width;
   options.compaction_options_universal.max_merge_width = uc_max_merge_width;

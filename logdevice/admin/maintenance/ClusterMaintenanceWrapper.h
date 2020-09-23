@@ -87,17 +87,22 @@ class ClusterMaintenanceWrapper {
 
   /**
    * Accepts a list of shard ids and return them grouped by group-ids. Note that
-   * the shard may appear in multiple groups.
+   * the shard may appear in multiple groups. This list is filtered by a
+   * priority. Note that MEDIUM and UNKNOWN are treated the same.
    */
   folly::F14FastMap<GroupID, ShardSet>
-  groupShardsByGroupID(const std::vector<ShardID>& shards) const;
+  groupShardsByGroupID(const std::vector<ShardID>& shards,
+                       MaintenancePriority priority) const;
 
   /**
    * Accepts a list of node ids and return them grouped by group-ids. Note that
-   * the node may appear in multiple groups.
+   * the node may appear in multiple groups. This list is filtered by a
+   * priority. Note that MEDIUM and UNKNOWN are treated the same.
+
    */
   folly::F14FastMap<GroupID, folly::F14FastSet<node_index_t>>
-  groupSequencersByGroupID(const std::vector<node_index_t>& shards) const;
+  groupSequencersByGroupID(const std::vector<node_index_t>& shards,
+                           MaintenancePriority priority) const;
 
   /**
    * Does the maintenances applied on a shard want us to skip safety checks?
@@ -148,7 +153,7 @@ class ClusterMaintenanceWrapper {
              nodes_config_->getVersion().val_);
   }
 
-  uint64_t getVersion() {
+  uint64_t getVersion() const {
     return static_cast<uint64_t>(state_->get_version());
   }
 

@@ -12,6 +12,7 @@
 #include <folly/hash/SpookyHashV2.h>
 
 #include "logdevice/common/configuration/ServerConfig.h"
+#include "logdevice/common/configuration/nodes/NodesConfigurationCodec.h"
 #include "logdevice/common/debug.h"
 #include "logdevice/common/util.h"
 
@@ -394,6 +395,22 @@ void NodesConfiguration::recomputeConfigMetadata() {
   num_shards_ = computeNumShards();
   max_node_index_ = computeMaxNodeIndex();
   sequencer_locator_config_ = computeSequencersConfig();
+  serialized_config_ = serializeConfig();
+}
+
+folly::Optional<std::string> NodesConfiguration::serialize() const {
+  return serialized_config_;
+}
+
+folly::Optional<std::string> NodesConfiguration::serializeConfig() const {
+  auto serialized =
+      NodesConfigurationCodec::serialize(*this, {/* compression */ true});
+  if (serialized.empty() && err != Status::OK) {
+    ld_error("Failed to serialize the NodesConfiguration with error %s",
+             error_description(err));
+    return folly::none;
+  }
+  return serialized;
 }
 
 std::shared_ptr<const NodesConfiguration>
@@ -403,13 +420,13 @@ NodesConfiguration::withIncrementedVersionAndTimestamp(
         new_sequencer_membership_version,
     folly::Optional<membership::MembershipVersion::Type>
         new_storage_membership_version) const {
-  if (new_nc_version.hasValue() && new_nc_version.value() <= version_) {
+  if (new_nc_version.has_value() && new_nc_version.value() <= version_) {
     return nullptr;
   }
 
   auto new_config = std::make_shared<NodesConfiguration>(*this);
   new_config->touch();
-  if (new_nc_version.hasValue()) {
+  if (new_nc_version.has_value()) {
     new_config->setVersion(new_nc_version.value());
   }
 

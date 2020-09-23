@@ -28,11 +28,14 @@ class ClientProcessor : public Processor {
   static std::shared_ptr<ClientProcessor> create(Args&&... args) {
     auto p = std::make_shared<ClientProcessor>(std::forward<Args>(args)...);
     p->init();
+    p->startRunning();
     return p;
   }
 
   Worker* createWorker(WorkContext::KeepAlive executor,
                        worker_id_t i,
                        WorkerType type) override;
+
+  ~ClientProcessor() override;
 };
 }} // namespace facebook::logdevice

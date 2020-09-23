@@ -5,7 +5,11 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
+
 #include "logdevice/server/FailureDetector.h"
+
+#include <chrono>
+#include <unordered_set>
 
 #include <folly/Memory.h>
 #include <folly/Random.h>
@@ -15,9 +19,9 @@
 #include "logdevice/common/GetClusterStateRequest.h"
 #include "logdevice/common/NodeID.h"
 #include "logdevice/common/Sender.h"
-#include "logdevice/common/Socket.h"
 #include "logdevice/common/configuration/Configuration.h"
 #include "logdevice/common/configuration/nodes/utils.h"
+#include "logdevice/common/request_util.h"
 #include "logdevice/common/stats/ServerHistograms.h"
 #include "logdevice/common/stats/Stats.h"
 #include "logdevice/common/util.h"
@@ -57,13 +61,13 @@ class FailureDetector::RoundRobinSelector
     const auto& serv_disc = nodes_configuration->getServiceDiscovery();
     NodeID this_node = detector->getMyNodeID();
 
-    if (next_node_idx_.hasValue() &&
+    if (next_node_idx_.has_value() &&
         !serv_disc->hasNode(next_node_idx_.value())) {
       // The node was removed from config.
       next_node_idx_ = folly::none;
     }
 
-    if (!next_node_idx_.hasValue() || iters_ >= serv_disc->numNodes()) {
+    if (!next_node_idx_.has_value() || iters_ >= serv_disc->numNodes()) {
       // Every `nodes.size()' iterations reset next_node_idx_ to this
       // node's neighbour. This is meant to avoid all nodes gossiping to the
       // same node in each round, even in the presence of sporadic down nodes.
@@ -79,7 +83,7 @@ class FailureDetector::RoundRobinSelector
 
     NodeID target;
     for (int attempts = serv_disc->numNodes(); attempts > 0; --attempts) {
-      ld_assert(next_node_idx_.hasValue());
+      ld_assert(next_node_idx_.has_value());
       ld_assert(serv_disc->hasNode(next_node_idx_.value()));
       target = nodes_configuration->getNodeID(next_node_idx_.value());
 
@@ -111,40 +115,12 @@ class FailureDetector::RoundRobinSelector
   size_t iters_{0};
 };
 
-// Request used to complete initialization that needs to
-// happen on the thread only
-class FailureDetector::InitRequest : public Request {
- public:
-  explicit InitRequest(FailureDetector* parent)
-      : Request(RequestType::FAILURE_DETECTOR_INIT), parent_(parent) {}
-
-  Execution execute() override {
-    parent_->startClusterStateTimer();
-    return Execution::COMPLETE;
-  }
-
-  WorkerType getWorkerTypeAffinity() override {
-    return WorkerType::FAILURE_DETECTOR;
-  }
-
- private:
-  FailureDetector* parent_;
-};
-
 FailureDetector::FailureDetector(UpdateableSettings<GossipSettings> settings,
                                  ServerProcessor* processor,
-                                 StatsHolder* stats,
-                                 bool attach)
+                                 StatsHolder* stats)
     : settings_(std::move(settings)), stats_(stats), processor_(processor) {
-  size_t max_nodes = processor->settings()->max_nodes;
-
-  // Preallocating makes it easier to handle cluster expansion and shrinking.
   initial_time_ms_ = getCurrentTimeInMillis();
-  for (size_t i = 0; i < max_nodes; ++i) {
-    Node& node = nodes_[i];
-    node.last_suspected_at_ = initial_time_ms_;
-  }
-
+  updateNodesMap();
   switch (settings_->mode) {
     case GossipSettings::SelectionMode::RANDOM:
       selector_.reset(new RandomSelector());
@@ -160,130 +136,208 @@ FailureDetector::FailureDetector(UpdateableSettings<GossipSettings> settings,
   start_time_ = std::chrono::steady_clock::now();
   instance_id_ = std::chrono::milliseconds(processor->getServerInstanceId());
   ld_info(
-      "Failure Detector starting with instance id: %lu", instance_id_.count());
+      "Failure Detector created with instance id: %lu", instance_id_.count());
 
   auto cs = processor->cluster_state_.get();
   for (const auto& it : nodes_) {
     cs->setNodeState(it.first, ClusterState::NodeState::DEAD);
+    cs->setNodeStatus(it.first, NodeHealthStatus::UNHEALTHY);
   }
 
-  if (attach) {
-    std::unique_ptr<Request> rq = std::make_unique<InitRequest>(this);
-    int rv = processor->postRequest(rq);
-    if (rv) {
-      ld_warning("Unable to post InitRequest, err=%d", rv);
-    }
-  }
+  registered_rsms_.push_back(configuration::InternalLogs::EVENT_LOG_DELTAS);
+  registered_rsms_.push_back(configuration::InternalLogs::CONFIG_LOG_DELTAS);
+  /* skipping maintenance log as it doesn't run on cluster */
+
+  // Set this to now so we know if the node stops processing gossip messages.
+  last_gossip_received_ts_ = SteadyTimestamp::now();
 }
 
-FailureDetector::FailureDetector(UpdateableSettings<GossipSettings> settings,
-                                 ServerProcessor* processor,
-                                 bool attach)
-    : FailureDetector(std::move(settings), processor, nullptr, attach) {}
+void FailureDetector::fetchVersions(RsmVersionType type) {
+  Worker* w = Worker::onThisThread(false);
+  if (!w) {
+    return;
+  }
+
+  /* Update RSM versions of this node */
+  Processor* p = w->processor_;
+  node_index_t my_idx = getMyNodeID().index();
+  auto& this_node = nodes_[my_idx];
+  auto rsm_versions = type == RsmVersionType::IN_MEMORY
+      ? p->getAllRSMVersions()
+      : p->getAllDurableRSMVersions();
+  auto& node_rsm_versions = type == RsmVersionType::IN_MEMORY
+      ? this_node.rsm_versions_
+      : this_node.rsm_durable_versions_;
+  for (auto& v : rsm_versions) {
+    node_rsm_versions[v.first] = v.second;
+  }
+
+  /* Update NCM versions of this node */
+  const auto& nodes_configuration = getNodesConfiguration();
+  this_node.ncm_versions_[0] = nodes_configuration->getVersion();
+  this_node.ncm_versions_[1] =
+      nodes_configuration->getSequencerMembership()->getVersion();
+  this_node.ncm_versions_[2] =
+      nodes_configuration->getStorageMembership()->getVersion();
+}
+
+FailureDetector::Node&
+FailureDetector::insertOrGetNode(size_t node_idx,
+                                 folly::SharedMutex::ReadHolder& nodes_lock) {
+  auto it = nodes_.find(node_idx);
+  if (it != nodes_.end()) {
+    return it->second;
+  }
+
+  nodes_lock.unlock();
+  folly::SharedMutex::WriteHolder write_lock(nodes_mutex_);
+  auto inserted = nodes_.emplace(std::piecewise_construct,
+                                 std::forward_as_tuple(node_idx),
+                                 std::forward_as_tuple());
+  it = inserted.first;
+  if (inserted.second) {
+    it->second.last_suspected_at_ = initial_time_ms_;
+  }
+  nodes_lock = folly::SharedMutex::ReadHolder(std::move(write_lock));
+  return it->second;
+}
+
+void FailureDetector::start() {
+  std::unique_ptr<Request> rq =
+      std::make_unique<FuncRequest>(worker_id_t(0),
+                                    WorkerType::FAILURE_DETECTOR,
+                                    RequestType::FAILURE_DETECTOR_INIT,
+                                    [this] {
+                                      std::lock_guard lock(mutex_);
+                                      startGetClusterState();
+                                    });
+  int rv = processor_->postImportant(rq);
+  ld_check(rv == 0);
+}
 
 StatsHolder* FailureDetector::getStats() {
   return stats_;
 }
 
-void FailureDetector::startClusterStateTimer() {
+void FailureDetector::startGetClusterState() {
   auto cs = Worker::getClusterState();
   if (!cs) {
     ld_info("Invalid get-cluster-state");
     buildInitialState();
   } else {
-    cs_timer_.assign([=] {
-      if (waiting_for_cluster_state_) {
-        ld_info("Timed out waiting for cluster state reply.");
-        buildInitialState();
-      }
-    });
-    cs_timer_.activate(settings_->gcs_wait_duration);
-
     ld_info("Sending GET_CLUSTER_STATE to build initial FD cluster view");
-    sendGetClusterState();
-  }
-}
 
-void FailureDetector::sendGetClusterState() {
-  Worker* w = Worker::onThisThread();
-  auto settings = w->processor_->settings();
+    Worker* w = Worker::onThisThread();
+    auto settings = w->processor_->settings();
 
-  auto cb = [&](Status status,
-                const std::vector<uint8_t>& cs_update,
-                std::vector<node_index_t> boycotted_nodes) {
-    if (status != E::OK) {
-      ld_error(
-          "Unable to refresh cluster state: %s", error_description(status));
-      return;
-    }
+    auto cb = [&](Status status,
+                  const std::vector<std::pair<node_index_t, uint16_t>>&
+                      cs_update,
+                  std::vector<node_index_t> boycotted_nodes,
+                  std::vector<std::pair<node_index_t, uint16_t>>
+                      cs_status_update) {
+      std::lock_guard lock(mutex_);
 
-    std::vector<std::string> dead;
-    for (int i = 0; i < cs_update.size(); i++) {
-      if (cs_update[i]) {
-        dead.push_back("N" + std::to_string(i));
+      if (status != E::OK) {
+        ld_error(
+            "Unable to refresh cluster state: %s", error_description(status));
+        buildInitialState();
+        return;
       }
+
+      std::vector<std::string> dead;
+      for (auto& [node_idx, state] : cs_update) {
+        if (state) {
+          dead.push_back("N" + std::to_string(node_idx));
+        }
+      }
+
+      std::vector<std::string> boycotted_tostring;
+      boycotted_tostring.reserve(boycotted_nodes.size());
+      for (auto index : boycotted_nodes) {
+        boycotted_tostring.emplace_back("N" + std::to_string(index));
+      }
+
+      ld_info(
+          "Cluster state received with %lu dead nodes (%s) and %lu boycotted "
+          "nodes (%s)",
+          dead.size(),
+          folly::join(',', dead).c_str(),
+          boycotted_tostring.size(),
+          folly::join(',', boycotted_tostring).c_str());
+
+      buildInitialState(
+          cs_update, std::move(boycotted_nodes), std::move(cs_status_update));
+    };
+
+    std::unique_ptr<Request> req = std::make_unique<GetClusterStateRequest>(
+        settings_->gcs_wait_duration,
+        settings->get_cluster_state_wave_timeout,
+        std::move(cb));
+    auto result = req->execute();
+    if (result == Request::Execution::CONTINUE) {
+      req.release();
     }
-
-    std::vector<std::string> boycotted_tostring;
-    boycotted_tostring.reserve(boycotted_nodes.size());
-    for (auto index : boycotted_nodes) {
-      boycotted_tostring.emplace_back("N" + std::to_string(index));
-    }
-
-    ld_info("Cluster state received with %lu dead nodes (%s) and %lu boycotted "
-            "nodes (%s)",
-            dead.size(),
-            folly::join(',', dead).c_str(),
-            boycotted_tostring.size(),
-            folly::join(',', boycotted_tostring).c_str());
-
-    buildInitialState(cs_update, std::move(boycotted_nodes));
-  };
-
-  std::unique_ptr<Request> req = std::make_unique<GetClusterStateRequest>(
-      settings->get_cluster_state_timeout,
-      settings->get_cluster_state_wave_timeout,
-      std::move(cb));
-  auto result = req->execute();
-  if (result == Request::Execution::CONTINUE) {
-    req.release();
   }
 }
 
 void FailureDetector::buildInitialState(
-    const std::vector<uint8_t>& cs_update,
-    std::vector<node_index_t> boycotted_nodes) {
-  if (waiting_for_cluster_state_ == false) {
-    return;
-  }
-
-  cs_timer_.cancel();
-  waiting_for_cluster_state_ = false;
+    const std::vector<std::pair<node_index_t, uint16_t>>& cs_update,
+    std::vector<node_index_t> boycotted_nodes,
+    std::vector<std::pair<node_index_t, uint16_t>> cs_status_update) {
   ld_info("Wait over%s", cs_update.size() ? " (cluster state received)" : "");
 
-  if (cs_update.size()) {
-    const auto& nodes_configuration = getNodesConfiguration();
-    node_index_t my_idx = getMyNodeID().index();
+  ld_check(waiting_for_cluster_state_);
+  waiting_for_cluster_state_ = false;
 
-    // Set the correct state of nodes instead of DEAD
-    FailureDetector::NodeState state;
+  const auto& nodes_configuration = getNodesConfiguration();
+  node_index_t my_idx = getMyNodeID().index();
+  auto cs = getClusterState();
 
-    auto cs = getClusterState();
-    for (size_t i = 0; i <= nodes_configuration->getMaxNodeIndex(); ++i) {
-      if (i == my_idx)
-        continue;
+  if (!cs_update.empty() || !cs_status_update.empty()) {
+    folly::SharedMutex::ReadHolder nodes_lock(nodes_mutex_);
 
-      cs->setNodeState(i, static_cast<ClusterState::NodeState>(cs_update[i]));
-      state = cs->isNodeAlive(i) ? NodeState::ALIVE : NodeState::DEAD;
-      RATELIMIT_INFO(std::chrono::seconds(1),
-                     10,
-                     "N%zu transitioned to %s",
-                     i,
-                     (state == NodeState::ALIVE) ? "ALIVE" : "DEAD");
-      nodes_[i].state = state;
+    if (!cs_update.empty()) {
+      for (auto& [node_idx, new_state] : cs_update) {
+        if (node_idx == my_idx ||
+            node_idx > nodes_configuration->getMaxNodeIndex()) {
+          continue;
+        }
+        Node& node = insertOrGetNode(node_idx, nodes_lock);
+        cs->setNodeState(
+            node_idx, static_cast<ClusterState::NodeState>(new_state));
+        FailureDetector::NodeState state =
+            cs->isNodeAlive(node_idx) ? NodeState::ALIVE : NodeState::DEAD;
+        node.state_.store(state);
+        RATELIMIT_INFO(std::chrono::seconds(1),
+                       10,
+                       "N%d transitioned to %s",
+                       node_idx,
+                       (state == NodeState::ALIVE) ? "ALIVE" : "DEAD");
+      }
     }
 
-    cs->setBoycottedNodes(std::move(boycotted_nodes));
+    if (!cs_status_update.empty()) {
+      for (auto& [node_idx, new_status] : cs_status_update) {
+        if (node_idx == my_idx ||
+            node_idx > nodes_configuration->getMaxNodeIndex()) {
+          continue;
+        }
+        Node& node = insertOrGetNode(node_idx, nodes_lock);
+        auto status = static_cast<NodeHealthStatus>(new_status);
+        cs->setNodeStatus(node_idx, status);
+        node.status_ = status;
+        RATELIMIT_INFO(std::chrono::seconds(1),
+                       10,
+                       "N%d transitioned to %s (status)",
+                       node_idx,
+                       toString(status).c_str());
+      }
+    }
+
+    if (!cs_update.empty()) {
+      cs->setBoycottedNodes(std::move(boycotted_nodes));
+    }
   }
 
   if (!isolation_checker_) {
@@ -292,9 +346,14 @@ void FailureDetector::buildInitialState(
     isolation_checker_->init();
   }
 
-  // Tell others that this node is alive, so that they can
-  // start sending gossips.
-  broadcastBringup();
+  startSuspectTimer();
+
+  // Tell others that this node is alive, so that they can start sending
+  // gossips.
+  broadcastBringupUpdate(0);
+
+  // Set this to now so we know if the node stops processing gossip messages.
+  last_gossip_received_ts_ = SteadyTimestamp::now();
 
   // Start gossiping after we have got a chance to build FD state.
   // If cluster-state reply doesn't come, it is fine, since we will
@@ -310,31 +369,25 @@ bool FailureDetector::checkSkew(const GOSSIP_Message& msg) {
   HISTOGRAM_ADD(Worker::stats(), gossip_recv_latency, skew * 1000);
 
   auto threshold = settings_->gossip_time_skew_threshold;
-  if (skew >= std::min(std::chrono::milliseconds(1000), threshold).count()) {
+  bool drop_gossip = (skew >= threshold.count());
+
+  if (drop_gossip || skew >= 1000) {
     STAT_INCR(getStats(), gossips_delayed_total);
     RATELIMIT_WARNING(std::chrono::seconds(1),
                       5,
                       "A delayed gossip received from %s, delay:%lums"
-                      ", sender time:%lu, now:%lu",
+                      ", sender time:%lu, now:%lu,%s",
                       msg.gossip_node_.toString().c_str(),
                       skew,
                       msg.sent_time_.count(),
-                      millis_now.count());
+                      millis_now.count(),
+                      drop_gossip ? " Dropping." : "");
   }
-
-  bool drop_gossip = (skew >= threshold.count());
 
   if (drop_gossip) {
-    RATELIMIT_WARNING(std::chrono::seconds(1),
-                      10,
-                      "Dropping delayed gossip received from %s, delay:%lums"
-                      ", sender time:%lu, now:%lu",
-                      msg.gossip_node_.toString().c_str(),
-                      skew,
-                      msg.sent_time_.count(),
-                      millis_now.count());
     STAT_INCR(getStats(), gossips_dropped_total);
   }
+
   return drop_gossip;
 }
 
@@ -355,8 +408,10 @@ bool FailureDetector::isValidInstanceId(std::chrono::milliseconds id,
 }
 
 void FailureDetector::noteConfigurationChanged() {
-  if (broadcasted_i_am_starting && isLogsConfigLoaded()) {
-    broadcastBringup();
+  std::lock_guard lock(mutex_);
+
+  if (need_to_broadcast_starting_state_finished_ && isLogsConfigLoaded()) {
+    broadcastBringupUpdate(0);
   }
 
   if (isolation_checker_) {
@@ -365,22 +420,24 @@ void FailureDetector::noteConfigurationChanged() {
 }
 
 void FailureDetector::gossip() {
+  updateNodesMap();
   const auto& nodes_configuration = getNodesConfiguration();
-  size_t size = nodes_configuration->getMaxNodeIndex() + 1;
+  const auto& serv_disc = nodes_configuration->getServiceDiscovery();
 
-  std::lock_guard<std::mutex> lock(mutex_);
+  folly::SharedMutex::ReadHolder nodes_lock(nodes_mutex_);
 
   NodeID dest = selector_->getNode(this);
 
   if (shouldDumpState()) {
     ld_info("FD state before constructing gossip message for %s",
             dest.isNodeID() ? dest.toString().c_str() : "none");
-    dumpFDState();
+    dumpFDState(nodes_lock);
   }
 
   NodeID this_node = getMyNodeID();
   auto now = SteadyTimestamp::now();
-  // bump other nodes' entry in gossip list if at least 1 gossip_interval passed
+  // bump other nodes' entry in gossip list if at least 1 gossip_interval
+  // passed
   if (now >= last_gossip_tick_time_ + settings_->gossip_interval) {
     for (auto& it : nodes_) {
       if (it.first != this_node.index()) {
@@ -392,15 +449,14 @@ void FailureDetector::gossip() {
     last_gossip_tick_time_ = now;
   }
 
-  folly::SharedMutex::ReadHolder read_lock(nodes_mutex_);
-
   // stayin' alive
-  Node& node(nodes_[this_node.index()]);
+  Node& node(nodes_.at(this_node.index()));
   node.gossip_ = 0;
   node.gossip_ts_ = instance_id_;
   node.failover_ =
       failover_.load() ? instance_id_ : std::chrono::milliseconds::zero();
   node.is_node_starting_ = !isLogsConfigLoaded();
+  node.status_ = node_health_status_.load(std::memory_order_relaxed);
   // Don't trigger other nodes' state transition until we receive min number
   // of gossips. The GCS reply is not same as a regular gossip, and therefore
   // doesn't contain Node::gossip_ values. The default values of Node::gossip_
@@ -411,7 +467,7 @@ void FailureDetector::gossip() {
   // based on gossip_list[], which will again move the node into
   // DEAD->SUSPECT->ALIVE state machine.
   if (num_gossips_received_ >= settings_->min_gossips_for_stable_state) {
-    detectFailures(this_node.index(), size);
+    detectFailures(this_node.index(), nodes_lock);
   } else {
     // In normal scenario, 'this' node will move out of suspect state,
     // either upon expiration of suspect timer, or eventually because of
@@ -423,16 +479,25 @@ void FailureDetector::gossip() {
     //    there's only 1 node in the cluster
     // we still want to transition out of suspect state when it expires,
     // and change cluster_state_ accordingly.
-    updateNodeState(
-        this_node.index(), false /*dead*/, true /*self*/, false /*failover*/);
+    updateNodeState(this_node.index(),
+                    node,
+                    false /*dead*/,
+                    true /*self*/,
+                    false /*failover*/);
+    updateNodeStatus(this_node.index(), node, node.status_);
   }
 
-  updateBoycottedNodes();
+  getClusterState()->setBoycottedNodes(
+      getBoycottTracker().getBoycottedNodes(SystemTimestamp::now()));
 
   if (!dest.isNodeID()) {
     RATELIMIT_WARNING(std::chrono::minutes(1),
                       1,
                       "Unable to find a node to send a gossip message to");
+    // For single node cases, update self's rsm version
+    if (nodes_configuration->clusterSize() == 1) {
+      fetchVersions(RsmVersionType::IN_MEMORY);
+    }
     return;
   }
 
@@ -440,8 +505,8 @@ void FailureDetector::gossip() {
 
   // If at least one entry in the failover list is non-zero, include the
   // list in the message.
-  // In GOSSIP protocol >= HASHMAP_SUPPORT_IN_GOSSIP, this wouldn't be necessary
-  // because failover list is sent through a list of GOSSIP_Node.
+  // In GOSSIP protocol >= HASHMAP_SUPPORT_IN_GOSSIP, this wouldn't be
+  // necessary because failover list is sent through a list of GOSSIP_Node.
   for (auto& it : nodes_) {
     if (it.second.failover_ > std::chrono::milliseconds::zero()) {
       flags |= GOSSIP_Message::HAS_FAILOVER_LIST_FLAG;
@@ -449,8 +514,8 @@ void FailureDetector::gossip() {
     }
   }
 
-  // In GOSSIP protocol >= HASHMAP_SUPPORT_IN_GOSSIP, this wouldn't be necessary
-  // because starting list is sent through a list of GOSSIP_Node.
+  // In GOSSIP protocol >= HASHMAP_SUPPORT_IN_GOSSIP, this wouldn't be
+  // necessary because starting list is sent through a list of GOSSIP_Node.
   flags |= GOSSIP_Message::HAS_STARTING_LIST_FLAG;
 
   const auto boycott_map = getBoycottTracker().getBoycottsForGossip();
@@ -471,68 +536,139 @@ void FailureDetector::gossip() {
                  std::back_inserter(boycott_durations),
                  [](const auto& entry) { return entry.second; });
 
-  GOSSIP_Message::node_list_t node_list;
-  for (auto& it : nodes_) {
-    GOSSIP_Node gnode;
-    gnode.node_id_ = it.first;
-    gnode.gossip_ = it.second.gossip_;
-    gnode.gossip_ts_ = it.second.gossip_ts_;
-    gnode.failover_ = it.second.failover_;
-    gnode.is_node_starting_ = it.second.is_node_starting_;
-    node_list.push_back(gnode);
+  GOSSIP_Message::node_list_t gossip_node_list;
+  GOSSIP_Message::versions_node_list_t versions_list;
+  if (!skip_sending_versions_) {
+    fetchVersions(rsm_version_type_to_send_);
+    if (rsm_version_type_to_send_ == RsmVersionType::IN_MEMORY) {
+      flags |= GOSSIP_Message::HAS_IN_MEM_VERSIONS;
+    } else if (rsm_version_type_to_send_ == RsmVersionType::DURABLE) {
+      flags |= GOSSIP_Message::HAS_DURABLE_SNAPSHOT_VERSIONS;
+    }
+    // Toggle for next iteration
+    if (processor_->settings()->rsm_snapshot_store_type ==
+        SnapshotStoreType::LOCAL_STORE) {
+      rsm_version_type_to_send_ =
+          RsmVersionType(((int)rsm_version_type_to_send_ + 1) % 2);
+    }
   }
+
+  for (auto serv_it = serv_disc->begin(); serv_it != serv_disc->end();
+       ++serv_it) {
+    if (nodes_.find(serv_it->first) == nodes_.end()) {
+      continue;
+    }
+    auto& fdnode = nodes_[serv_it->first];
+    // If at least one entry in the failover list is non-zero, include the
+    // list in the message.
+    // In GOSSIP protocol >= HASHMAP_SUPPORT_IN_GOSSIP, this wouldn't be
+    // necessary because failover list is sent through a list of GOSSIP_Node.
+    if (fdnode.failover_ > std::chrono::milliseconds::zero()) {
+      flags |= GOSSIP_Message::HAS_FAILOVER_LIST_FLAG;
+    }
+
+    GOSSIP_Node gnode;
+    gnode.node_id_ = serv_it->first;
+    gnode.gossip_ = fdnode.gossip_;
+    gnode.gossip_ts_ = fdnode.gossip_ts_;
+    gnode.failover_ = fdnode.failover_;
+    gnode.is_node_starting_ = fdnode.is_node_starting_;
+    gnode.node_status_ = fdnode.status_;
+    gossip_node_list.push_back(gnode);
+
+    if (flags & GOSSIP_Message::HAS_IN_MEM_VERSIONS ||
+        flags & GOSSIP_Message::HAS_DURABLE_SNAPSHOT_VERSIONS) {
+      Versions_Node rnode;
+      rnode.node_id_ = serv_it->first;
+      for (auto& rsm_type : registered_rsms_) {
+        lsn_t rsm_version = LSN_INVALID;
+        auto& rsm_ver_map = flags & GOSSIP_Message::HAS_IN_MEM_VERSIONS
+            ? fdnode.rsm_versions_
+            : fdnode.rsm_durable_versions_;
+        if (rsm_ver_map.find(rsm_type) != rsm_ver_map.end()) {
+          rsm_version = rsm_ver_map[rsm_type];
+        }
+        rnode.rsm_versions_.push_back(rsm_version);
+      }
+      rnode.ncm_versions_ = fdnode.ncm_versions_;
+      versions_list.push_back(rnode);
+    }
+  }
+
+  // if it has been too long since we processed a gossip message, set a flag
+  // so the receiving node(s) can mark this node appropriately.
+  if (settings_->gossip_intervals_without_processing_threshold) {
+    auto window = (settings_->gossip_interval *
+                   settings_->gossip_intervals_without_processing_threshold);
+    if (now > last_gossip_received_ts_ + window) {
+      RATELIMIT_WARNING(std::chrono::seconds(1),
+                        1,
+                        "haven't been processing gossips for %lu seconds"
+                        "(%ld intervals)",
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            now - last_gossip_received_ts_)
+                            .count(),
+                        (std::chrono::duration_cast<std::chrono::milliseconds>(
+                             now - last_gossip_received_ts_) /
+                         settings_->gossip_interval));
+      flags |= GOSSIP_Message::LONG_TIME_SINCE_LAST_GOSSIP;
+      STAT_INCR(getStats(), gossips_failed_to_process);
+    }
+  }
+
+  skip_sending_versions_ = (skip_sending_versions_ + 1) %
+      (settings_->gossip_include_rsm_versions_frequency);
 
   // bump the message sequence number
   ++current_msg_id_;
   int rv = sendGossipMessage(
       dest,
       std::make_unique<GOSSIP_Message>(this_node,
-                                       std::move(node_list),
+                                       std::move(gossip_node_list),
                                        instance_id_,
                                        getCurrentTimeInMillis(),
                                        std::move(boycotts),
                                        std::move(boycott_durations),
                                        flags,
-                                       current_msg_id_));
+                                       current_msg_id_,
+                                       registered_rsms_,
+                                       std::move(versions_list)));
 
   if (rv != 0) {
-    RATELIMIT_WARNING(std::chrono::seconds(1),
-                      10,
-                      "Failed to send GOSSIP to node %s: %s",
-                      Sender::describeConnection(Address(dest)).c_str(),
-                      error_description(err));
+    RATELIMIT_DEBUG(std::chrono::seconds(1),
+                    10,
+                    "Failed to send GOSSIP to node %s: %s",
+                    Sender::describeConnection(Address(dest)).c_str(),
+                    error_description(err));
   }
 
   if (shouldDumpState()) {
     ld_info("FD state after constructing gossip message for %s",
             dest.toString().c_str());
-    dumpFDState();
+    dumpFDState(nodes_lock);
   }
 }
 
-namespace {
-template <typename T>
-bool update_min(T& x, const T val) {
-  if (val <= x) {
-    x = val;
-    return true;
-  }
-  return false;
-}
-} // namespace
-
-bool FailureDetector::processFlags(const GOSSIP_Message& msg) {
-  // This is called after locking nodes_mutex_ read lock
-
+bool FailureDetector::processFlags(
+    const GOSSIP_Message& msg,
+    Node& sender_node,
+    const folly::SharedMutex::ReadHolder& nodes_lock) {
   const bool is_node_bringup =
       bool(msg.flags_ & GOSSIP_Message::NODE_BRINGUP_FLAG);
   const bool is_suspect_state_finished =
       bool(msg.flags_ & GOSSIP_Message::SUSPECT_STATE_FINISHED);
   const bool is_start_state_finished =
       bool(msg.flags_ & GOSSIP_Message::STARTING_STATE_FINISHED);
+  const bool is_stalled_gossip_processor =
+      bool(msg.flags_ & GOSSIP_Message::LONG_TIME_SINCE_LAST_GOSSIP);
   auto msg_type = flagsToString(msg.flags_);
 
-  if (!is_node_bringup && !is_suspect_state_finished) {
+  if (!is_stalled_gossip_processor) {
+    sender_node.stalled_gossip_processor_ = false;
+  }
+
+  if (!is_node_bringup && !is_suspect_state_finished &&
+      !is_stalled_gossip_processor) {
     return false; /* not a special broadcast message */
   }
 
@@ -545,36 +681,27 @@ bool FailureDetector::processFlags(const GOSSIP_Message& msg) {
                  msg.instance_id_.count(),
                  msg.sent_time_.count());
   if (shouldDumpState()) {
-    dumpFDState();
+    dumpFDState(nodes_lock);
   }
 
   node_index_t my_idx = getMyNodeID().index();
   node_index_t sender_idx = msg.gossip_node_.index();
   ld_check(my_idx != sender_idx);
 
-  if (nodes_.find(sender_idx) == nodes_.end()) {
-    // This does not occur because this is checked before calling the function
-    RATELIMIT_ERROR(std::chrono::seconds(1),
-                    1,
-                    "Sender (%s) is not present in our config",
-                    msg.gossip_node_.toString().c_str());
-    return true;
-  }
-
   if (!isValidInstanceId(msg.instance_id_, sender_idx)) {
     return true;
   }
 
   // marking sender alive
-  Node& sender_node(nodes_[sender_idx]);
   sender_node.gossip_ = 0;
   sender_node.gossip_ts_ = msg.instance_id_;
   sender_node.failover_ = std::chrono::milliseconds::zero();
   bool is_starting = sender_node.is_node_starting_ = !is_start_state_finished;
 
   if (is_suspect_state_finished) {
-    if (sender_node.state != NodeState::ALIVE) {
+    if (sender_node.state_.load() != NodeState::ALIVE) {
       updateDependencies(sender_idx,
+                         sender_node,
                          NodeState::ALIVE,
                          /*failover*/ false,
                          is_starting);
@@ -590,9 +717,13 @@ bool FailureDetector::processFlags(const GOSSIP_Message& msg) {
               is_starting);
     }
   } else if (is_node_bringup) {
-    updateNodeState(sender_idx, false, false, false);
+    updateNodeState(sender_idx, sender_node, false, false, false);
+    // When new instance id comes up, reset all version information
+    resetVersions(sender_idx);
+  } else if (is_stalled_gossip_processor) {
+    ld_info("N%hu has stopped processing gossip messages.", sender_idx);
+    sender_node.stalled_gossip_processor_ = true;
   } else {
-    ld_check(true);
     return true;
   }
 
@@ -600,7 +731,7 @@ bool FailureDetector::processFlags(const GOSSIP_Message& msg) {
     ld_info("FD state after receiving %s message from %s",
             msg_type.c_str(),
             msg.gossip_node_.toString().c_str());
-    dumpFDState();
+    dumpFDState(nodes_lock);
   }
 
   return true;
@@ -608,18 +739,47 @@ bool FailureDetector::processFlags(const GOSSIP_Message& msg) {
 
 std::string
 FailureDetector::flagsToString(GOSSIP_Message::GOSSIP_flags_t flags) {
+  std::string s;
   if (flags & GOSSIP_Message::SUSPECT_STATE_FINISHED) {
-    return "suspect-state-finished";
-  } else if (flags & GOSSIP_Message::NODE_BRINGUP_FLAG) {
+    s = "suspect-state-finished";
+  }
+  if (flags & GOSSIP_Message::STARTING_STATE_FINISHED) {
+    if (!s.empty()) {
+      s += "|";
+    }
+    s += "starting_state_finished";
+  }
+
+  if (flags & GOSSIP_Message::LONG_TIME_SINCE_LAST_GOSSIP) {
+    if (!s.empty()) {
+      s += "|";
+    }
+    s += "long-time-since-last-gossip";
+  }
+
+  if (!s.empty()) {
+    return s;
+  }
+
+  if (flags & GOSSIP_Message::NODE_BRINGUP_FLAG) {
     return "bringup";
-  } else if (flags & GOSSIP_Message::STARTING_STATE_FINISHED) {
-    return "starting_state_finished";
   }
 
   return "unknown";
 }
 
 void FailureDetector::onGossipReceived(const GOSSIP_Message& msg) {
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  if (waiting_for_cluster_state_) {
+    // Don't process gossip messages before we build initial state.
+    RATELIMIT_DEBUG(std::chrono::seconds(1),
+                    10,
+                    "Ignoring GOSSIP message because we're still waiting for "
+                    "get-cluster-state request.");
+    return;
+  }
+
   node_index_t this_index = getMyNodeID().index();
 
   if (shouldDumpState()) {
@@ -634,33 +794,27 @@ void FailureDetector::onGossipReceived(const GOSSIP_Message& msg) {
   }
 
   node_index_t sender_idx = msg.gossip_node_.index();
-  std::lock_guard<std::mutex> lock(mutex_);
-  folly::SharedMutex::ReadHolder read_lock(nodes_mutex_);
+  folly::SharedMutex::ReadHolder nodes_lock(nodes_mutex_);
 
-  if (nodes_.find(sender_idx) == nodes_.end()) {
-    read_lock.unlock();
-    folly::SharedMutex::WriteHolder write_lock(nodes_mutex_);
-    if (nodes_.find(sender_idx) == nodes_.end()) {
-      Node& new_node = nodes_[sender_idx];
-      new_node.last_suspected_at_ = initial_time_ms_;
+  {
+    Node& sender_node = insertOrGetNode(sender_idx, nodes_lock);
+
+    if (sender_node.gossip_ts_ > msg.instance_id_) {
+      RATELIMIT_WARNING(std::chrono::seconds(1),
+                        5,
+                        "Possible time-skew detected on %s, received a lower "
+                        "instance id(%lu) from sender than already known(%lu)",
+                        msg.gossip_node_.toString().c_str(),
+                        msg.instance_id_.count(),
+                        sender_node.gossip_ts_.count());
+      STAT_INCR(getStats(), gossips_rejected_instance_id);
+      return;
     }
-    read_lock = folly::SharedMutex::ReadHolder(std::move(write_lock));
-  }
 
-  if (nodes_[sender_idx].gossip_ts_ > msg.instance_id_) {
-    RATELIMIT_WARNING(std::chrono::seconds(1),
-                      5,
-                      "Possible time-skew detected on %s, received a lower "
-                      "instance id(%lu) from sender than already known(%lu)",
-                      msg.gossip_node_.toString().c_str(),
-                      msg.instance_id_.count(),
-                      nodes_[sender_idx].gossip_ts_.count());
-    STAT_INCR(getStats(), gossips_rejected_instance_id);
-    return;
-  }
-
-  if (processFlags(msg)) {
-    return;
+    if (processFlags(msg, sender_node, nodes_lock)) {
+      // It's a bringup message, not a real gossip message.
+      return;
+    }
   }
 
   // Merge the contents of gossip list with those from the message
@@ -670,21 +824,15 @@ void FailureDetector::onGossipReceived(const GOSSIP_Message& msg) {
   const bool has_starting_list =
       msg.flags_ & GOSSIP_Message::HAS_STARTING_LIST_FLAG;
 
+  bool update_statuses = senderUsingHealthMonitor(sender_idx, msg.node_list_);
+  std::unordered_set<size_t> node_ids_to_skip;
+  std::unordered_set<size_t> nodes_with_new_instances;
   for (auto node : msg.node_list_) {
     size_t id = node.node_id_;
 
-    if (nodes_.find(id) == nodes_.end()) {
-      read_lock.unlock();
-      folly::SharedMutex::WriteHolder write_lock(nodes_mutex_);
-      if (nodes_.find(id) == nodes_.end()) {
-        Node& new_node = nodes_[sender_idx];
-        new_node.last_suspected_at_ = initial_time_ms_;
-      }
-      read_lock = folly::SharedMutex::ReadHolder(std::move(write_lock));
-    }
-
     // Don't modify this node's state based on gossip message.
     if (id == this_index) {
+      node_ids_to_skip.insert(id);
       continue;
     }
 
@@ -701,64 +849,85 @@ void FailureDetector::onGossipReceived(const GOSSIP_Message& msg) {
       continue;
     }
 
+    Node& node_state = insertOrGetNode(id, nodes_lock);
+
     // If the incoming Gossip message knows about an older instance of the
     // process running on Node Ni, then ignore this update.
-    if (nodes_[id].gossip_ts_ > node.gossip_ts_) {
+    if (node_state.gossip_ts_ > node.gossip_ts_) {
       ld_spew("Received a stale instance id from %s,"
               " for N%zu, our:%lu, received:%lu",
               msg.gossip_node_.toString().c_str(),
               id,
-              nodes_[id].gossip_ts_.count(),
+              node_state.gossip_ts_.count(),
               node.gossip_ts_.count());
+      node_ids_to_skip.insert(id);
       continue;
-    } else if (nodes_[id].gossip_ts_ < node.gossip_ts_) {
+    } else if (node_state.gossip_ts_ < node.gossip_ts_) {
       // If the incoming Gossip message knows about a valid
       // newer instance of Node Ni, then copy everything
       if (isValidInstanceId(node.gossip_ts_, id)) {
-        nodes_[id].gossip_ = node.gossip_;
-        nodes_[id].gossip_ts_ = node.gossip_ts_;
-        nodes_[id].failover_ = has_failover_list
+        node_state.gossip_ = node.gossip_;
+        node_state.gossip_ts_ = node.gossip_ts_;
+        node_state.failover_ = has_failover_list
             ? node.failover_
             : std::chrono::milliseconds::zero();
         if (has_starting_list) {
-          // TODO: figure out what to do for compat
-          nodes_[id].is_node_starting_ = node.is_node_starting_;
+          node_state.is_node_starting_ = node.is_node_starting_;
         }
+        if (update_statuses || id == sender_idx) {
+          node_state.status_ = node.node_status_;
+        }
+        nodes_[id].status_ = node.node_status_;
+        nodes_with_new_instances.insert(id);
       }
       continue;
     }
 
-    update_min(nodes_[id].gossip_, node.gossip_);
+    if (node.gossip_ <= nodes_[id].gossip_) {
+      nodes_[id].gossip_ = node.gossip_;
+      if (update_statuses || id == sender_idx) {
+        nodes_[id].status_ = node.node_status_;
+      }
+    }
+
     if (has_starting_list) {
-      nodes_[id].is_node_starting_ =
-          nodes_[id].is_node_starting_ && node.is_node_starting_;
+      node_state.is_node_starting_ &= node.is_node_starting_;
     }
     if (has_failover_list) {
-      nodes_[id].failover_ = std::max(nodes_[id].failover_, node.failover_);
+      node_state.failover_ = std::max(node_state.failover_, node.failover_);
     }
   }
 
   getBoycottTracker().updateReportedBoycotts(msg.boycott_list_);
   getBoycottTracker().updateReportedBoycottDurations(
       msg.boycott_durations_list_, std::chrono::system_clock::now());
+  updateVersions(msg, node_ids_to_skip, nodes_with_new_instances);
 
   num_gossips_received_++;
   if (num_gossips_received_ <= settings_->min_gossips_for_stable_state) {
     ld_debug("Received gossip#%zu", num_gossips_received_);
   }
+
+  last_gossip_received_ts_ = SteadyTimestamp::now();
 }
 
 void FailureDetector::startSuspectTimer() {
   ld_info("Starting suspect state timer");
   node_index_t my_idx = getMyNodeID().index();
 
-  folly::SharedMutex::ReadHolder read_lock(nodes_mutex_);
-  nodes_[my_idx].gossip_ = 0;
-  updateNodeState(my_idx, false, true, false);
+  folly::SharedMutex::ReadHolder nodes_lock(nodes_mutex_);
+  Node& node = insertOrGetNode(my_idx, nodes_lock);
+  node.gossip_ = 0;
+  updateNodeState(my_idx, node, false, true, false);
+  updateNodeStatus(my_idx, node, node.status_);
 
-  suspect_timer_.assign([=] {
+  suspect_timer_.assign([this, my_idx] {
     ld_info("Suspect timeout expired");
-    updateNodeState(my_idx, false, true, false);
+    std::lock_guard lock(mutex_);
+    folly::SharedMutex::ReadHolder nodes_lock2(nodes_mutex_);
+    Node& node = nodes_.at(my_idx);
+    updateNodeState(my_idx, node, false, true, false);
+    updateNodeStatus(my_idx, node, node.status_);
   });
 
   suspect_timer_.activate(settings_->suspect_duration);
@@ -770,6 +939,7 @@ void FailureDetector::startGossiping() {
   Worker* w = Worker::onThisThread();
   gossip_timer_node_ = w->registerTimer(
       [this](ExponentialBackoffTimerNode* node) {
+        std::lock_guard lock(mutex_);
         gossip();
         node->timer->activate();
       },
@@ -781,15 +951,15 @@ void FailureDetector::startGossiping() {
 
 std::string FailureDetector::dumpGossipList(std::vector<uint32_t> list) {
   const auto& nodes_configuration = getNodesConfiguration();
-  size_t n = nodes_configuration->getMaxNodeIndex() + 1;
-  n = std::min(n, list.size());
   std::string res;
-
-  for (size_t i = 0; i < n; ++i) {
+  for (auto& node : nodes_) {
+    if (res.size() != 0) {
+      res += ", ";
+    }
     // if i doesn't exist, generation 1 will be used
-    NodeID node_id = nodes_configuration->getNodeID(i);
-    res += node_id.toString() + " = " + folly::to<std::string>(list[i]) +
-        (i < n - 1 ? ", " : "");
+    NodeID node_id = nodes_configuration->getNodeID(node.first);
+    res +=
+        node_id.toString() + " = " + folly::to<std::string>(list[node.first]);
   }
 
   return res;
@@ -798,47 +968,79 @@ std::string FailureDetector::dumpGossipList(std::vector<uint32_t> list) {
 std::string
 FailureDetector::dumpInstanceList(std::vector<std::chrono::milliseconds> list) {
   const auto& nodes_configuration = getNodesConfiguration();
-  size_t n = nodes_configuration->getMaxNodeIndex() + 1;
-  n = std::min(n, list.size());
   std::string res;
+  for (auto& node : nodes_) {
+    if (res.size() != 0) {
+      res += ", ";
+    }
 
-  for (size_t i = 0; i < n; ++i) {
     // if i doesn't exist, generation 1 will be used
-    NodeID node_id = nodes_configuration->getNodeID(i);
+    NodeID node_id = nodes_configuration->getNodeID(node.first);
     res += node_id.toString() + " = " +
-        folly::to<std::string>(list[i].count()) + (i < n - 1 ? ", " : "");
+        folly::to<std::string>(list[node.first].count());
   }
 
   return res;
 }
 
-void FailureDetector::dumpFDState() {
+bool FailureDetector::shouldDumpState() {
+  if (isTracingOn()) {
+    return true;
+  }
+  if (facebook::logdevice::dbg::currentLevel <
+      facebook::logdevice::dbg::Level::SPEW) {
+    return false;
+  }
+  // Throttle to once every 0.5 seconds.
+  const std::chrono::milliseconds state_dump_period{500};
+  if (SteadyTimestamp::now() < last_state_dump_time_ + state_dump_period) {
+    return false;
+  }
+  last_state_dump_time_ = SteadyTimestamp::now();
+  return true;
+}
+
+void FailureDetector::dumpFDState(
+    const folly::SharedMutex::ReadHolder& /* nodes_lock */) {
   const auto& nodes_configuration = getNodesConfiguration();
   size_t n = nodes_configuration->getMaxNodeIndex() + 1;
   std::string status_str;
 
   for (size_t i = 0; i < n; ++i) {
-    // if i doesn't exist, generation 1 will be used
+    if (!nodes_configuration->isNodeInServiceDiscoveryConfig(i) ||
+        !nodes_.count(i)) {
+      continue;
+    }
+
     NodeID node_id = nodes_configuration->getNodeID(i);
-    status_str +=
-        node_id.toString() + "(" + getNodeStateString(nodes_[i].state) + "), ";
+    if (!status_str.empty()) {
+      status_str += ", ";
+    }
+    status_str += node_id.toString() + ": " + nodes_.at(i).toString();
   }
 
   const dbg::Level level = isTracingOn() ? dbg::Level::INFO : dbg::Level::SPEW;
   ld_log(
       level, "Failure Detector status for all nodes: %s", status_str.c_str());
-  // TODO: add dump of Node::gossip_, Node::gossip_ts_, and Node::failover_
 }
 
-void FailureDetector::cancelTimers() {
-  cs_timer_.cancel();
-  suspect_timer_.cancel();
-  gossip_timer_node_ = nullptr;
+std::string FailureDetector::Node::toString() const {
+  return folly::sformat(
+      "({}, {}, bl: {}, gs: {}, ts: {}, fo: {}, starting: {}, health: {})",
+      getNodeStateString(state_.load()),
+      logdevice::toString(status_),
+      blacklisted_.load(),
+      gossip_,
+      RecordTimestamp(gossip_ts_).toString(),
+      RecordTimestamp(failover_).toString(),
+      is_node_starting_,
+      static_cast<int>(status_));
 }
 
 void FailureDetector::shutdown() {
-  ld_info("Cancelling timers");
-  cancelTimers();
+  ld_info("Stopping failure detector");
+  suspect_timer_.cancel();
+  gossip_timer_node_ = nullptr;
 }
 
 void FailureDetector::dumpGossipMessage(const GOSSIP_Message& msg) {
@@ -857,14 +1059,18 @@ void FailureDetector::getClusterDeadNodeStats(size_t* effective_dead_cnt,
   }
 }
 
-void FailureDetector::detectFailures(node_index_t self, size_t n) {
-  // This is called after locking nodes_mutex_ read lock
-
+void FailureDetector::detectFailures(
+    node_index_t self,
+    const folly::SharedMutex::ReadHolder& /* nodes_lock */) {
   const int threshold = settings_->gossip_failure_threshold;
   const auto& nodes_configuration = getNodesConfiguration();
+  const auto& serv_disc = nodes_configuration->getServiceDiscovery();
 
   size_t dead_cnt = 0;
   size_t effective_dead_cnt = 0;
+  size_t overloaded_cnt = 0;
+  size_t unhealthy_cnt = 0;
+  size_t effective_unhealthy_cnt = 0;
   size_t cluster_size = nodes_configuration->clusterSize();
   size_t effective_cluster_size = cluster_size;
 
@@ -872,7 +1078,20 @@ void FailureDetector::detectFailures(node_index_t self, size_t n) {
   for (auto& it : nodes_) {
     if (it.first == self) {
       // don't transition yourself to DEAD
-      updateNodeState(self, false /*dead*/, true /*self*/, false /*failover*/);
+      updateNodeState(
+          self, it.second, false /*dead*/, true /*self*/, false /*failover*/);
+      updateNodeStatus(self, it.second, it.second.status_);
+      switch (it.second.status_) {
+        case NodeHealthStatus::UNHEALTHY:
+          ++unhealthy_cnt;
+          ++effective_unhealthy_cnt;
+          break;
+        case NodeHealthStatus::OVERLOADED:
+          ++overloaded_cnt;
+          break;
+        default:
+          break;
+      };
       continue;
     }
 
@@ -880,12 +1099,15 @@ void FailureDetector::detectFailures(node_index_t self, size_t n) {
     // other nodes haven't heard from it in a long time
     // OR
     // Node 'it' is performing a graceful shutdown.
+    // OR
+    // 'it' hasn't been processgin gossip messages from some time.
     // Mark it DEAD so no work ends up sent its way.
     bool failover = (it.second.failover_ > std::chrono::milliseconds::zero());
-    bool dead = (it.second.gossip_ > threshold);
+    bool dead = (it.second.gossip_ > threshold) ||
+        (it.second.stalled_gossip_processor_);
     if (dead) {
-      // if the node is actually dead, clear the failover boolean, to make sure
-      // we don't mistakenly transition from DEAD to FAILING_OVER in the
+      // if the node is actually dead, clear the failover boolean, to make
+      // sure we don't mistakenly transition from DEAD to FAILING_OVER in the
       // Cluster State.
       failover = false;
     } else {
@@ -897,11 +1119,16 @@ void FailureDetector::detectFailures(node_index_t self, size_t n) {
       dead = failover;
     }
 
-    updateNodeState(it.first, dead, false, failover);
+    updateNodeState(it.first, it.second, dead, false, failover);
+    if (serv_disc->hasNode(it.first)) {
+      updateNodeStatus(it.first,
+                       it.second,
+                       dead ? NodeHealthStatus::UNHEALTHY : it.second.status_);
+    }
 
     // re-check node's state as it may be suspect, in which case it is still
     // considered dead
-    dead = (it.second.state != NodeState::ALIVE);
+    dead = (it.second.state_.load() != NodeState::ALIVE);
 
     if (nodes_configuration->isNodeInServiceDiscoveryConfig(it.first)) {
       bool node_disabled =
@@ -913,10 +1140,24 @@ void FailureDetector::detectFailures(node_index_t self, size_t n) {
       }
       if (dead) {
         ++dead_cnt;
+        ++unhealthy_cnt;
         if (!node_disabled) {
           // only active nodes matter for isolation. see comment below.
           ++effective_dead_cnt;
+          ++effective_unhealthy_cnt;
         }
+      } else {
+        switch (it.second.status_) {
+          case NodeHealthStatus::UNHEALTHY:
+            ++unhealthy_cnt;
+            ++effective_unhealthy_cnt;
+            break;
+          case NodeHealthStatus::OVERLOADED:
+            ++overloaded_cnt;
+            break;
+          default:
+            break;
+        };
       }
     }
   }
@@ -927,6 +1168,10 @@ void FailureDetector::detectFailures(node_index_t self, size_t n) {
   STAT_SET(getStats(), num_dead_nodes, dead_cnt);
   STAT_SET(getStats(), effective_num_nodes, effective_cluster_size);
   STAT_SET(getStats(), effective_dead_nodes, effective_dead_cnt);
+  // HealthMonitor stats
+  STAT_SET(getStats(), num_overloaded_nodes, overloaded_cnt);
+  STAT_SET(getStats(), num_unhealthy_nodes, unhealthy_cnt);
+  STAT_SET(getStats(), effective_unhealthy_nodes, effective_unhealthy_cnt);
 
   // Check whether more than half of the nodes are dead. This may mean that
   // there is a network partitioning and we are in a minority. We record this
@@ -934,8 +1179,8 @@ void FailureDetector::detectFailures(node_index_t self, size_t n) {
   // For the purpose of this check, we consider only the effective numbers. We
   // ignore nodes that are disabled, meaning that they do not participate in
   // cluster activities. This allows the cluster to keep functioning with a
-  // subset of nodes, when the others are disabled. The reasoning is: if a node
-  // dies while being disabled, it shouldn't affect the cluster, and so
+  // subset of nodes, when the others are disabled. The reasoning is: if a
+  // node dies while being disabled, it shouldn't affect the cluster, and so
   // shouldn't trigger isolation mode.
   isolated_.store(2 * effective_dead_cnt > effective_cluster_size);
 
@@ -945,14 +1190,11 @@ void FailureDetector::detectFailures(node_index_t self, size_t n) {
 }
 
 void FailureDetector::updateDependencies(node_index_t idx,
+                                         Node& node,
                                          FailureDetector::NodeState new_state,
                                          bool failover,
                                          bool starting) {
-  // This is called after locking nodes_mutex_ read lock
-  if (nodes_.find(idx) == nodes_.end()) {
-    return;
-  }
-  nodes_[idx].state = new_state;
+  node.state_.store(new_state);
   const bool is_dead = (new_state != NodeState::ALIVE);
   auto cs = getClusterState();
 
@@ -978,22 +1220,18 @@ void FailureDetector::updateDependencies(node_index_t idx,
 }
 
 void FailureDetector::updateNodeState(node_index_t idx,
+                                      Node& node,
                                       bool dead,
                                       bool self,
                                       bool failover) {
-  // This is called after locking nodes_mutex_ read lock
-  if (nodes_.find(idx) == nodes_.end()) {
-    return;
-  }
-
   bool starting;
   if (self) {
     starting = !isLogsConfigLoaded();
   } else {
-    starting = nodes_[idx].is_node_starting_;
+    starting = node.is_node_starting_;
   }
 
-  NodeState current = nodes_[idx].state, next = NodeState::DEAD;
+  NodeState current = node.state_.load(), next = NodeState::DEAD;
   auto current_time_ms = getCurrentTimeInMillis();
   auto suspect_duration = settings_->suspect_duration;
 
@@ -1005,7 +1243,7 @@ void FailureDetector::updateNodeState(node_index_t idx,
         // last_suspect_time to be reset.
         if (settings_->suspect_duration.count() > 0) {
           next = NodeState::SUSPECT;
-          nodes_[idx].last_suspected_at_.store(current_time_ms);
+          node.last_suspected_at_.store(current_time_ms);
         } else {
           next = NodeState::ALIVE;
         }
@@ -1013,7 +1251,7 @@ void FailureDetector::updateNodeState(node_index_t idx,
       case SUSPECT:
         ld_check(suspect_duration.count() > 0);
         if (current_time_ms >
-            nodes_[idx].last_suspected_at_.load() + suspect_duration) {
+            node.last_suspected_at_.load() + suspect_duration) {
           next = NodeState::ALIVE;
         }
         break;
@@ -1028,10 +1266,7 @@ void FailureDetector::updateNodeState(node_index_t idx,
       // Node's state is no longer DEAD. Reset connection throttling
       // on a server socket to that node to allow subsequent gossip
       // messages to be immediately sent to it.
-      Socket* socket = getServerSocket(idx);
-      if (socket) {
-        socket->resetConnectThrottle();
-      }
+      resetServerSocketConnectThrottle(idx);
     } else {
       // This node should transition itself to DEAD.
       if (self) {
@@ -1050,32 +1285,49 @@ void FailureDetector::updateNodeState(node_index_t idx,
             starting);
   }
 
-  updateDependencies(idx, next, failover, starting);
+  updateDependencies(idx, node, next, failover, starting);
   if (self && current != next && next == NodeState::ALIVE) {
-    broadcastSuspectDurationFinished();
+    broadcastBringupUpdate(GOSSIP_Message::SUSPECT_STATE_FINISHED);
   }
 }
 
+void FailureDetector::updateNodeStatus(node_index_t idx,
+                                       Node& node,
+                                       NodeHealthStatus status) {
+  // This is called after locking nodes_mutex_ read lock
+  NodeHealthStatus current = node.status_;
+  if (current != status) {
+    RATELIMIT_INFO(std::chrono::seconds(1),
+                   10,
+                   "N%hu transitioned from %s to %s,(status) FD State:"
+                   "(gossip: %u, instance-id: %lu)",
+                   idx,
+                   toString(current).c_str(),
+                   toString(status).c_str(),
+                   node.gossip_,
+                   node.gossip_ts_.count());
+  }
+  node.status_ = status;
+  getClusterState()->setNodeStatus(idx, status);
+}
+
 bool FailureDetector::isValidDestination(node_index_t node_idx) {
-  folly::SharedMutex::ReadHolder read_lock(nodes_mutex_);
+  {
+    folly::SharedMutex::ReadHolder read_lock(nodes_mutex_);
 
-  if (nodes_.find(node_idx) == nodes_.end()) {
-    return false;
+    auto it = nodes_.find(node_idx);
+
+    if (it == nodes_.end()) {
+      return false;
+    }
+
+    if (it->second.blacklisted_.load()) {
+      // exclude blacklisted nodes
+      return false;
+    }
   }
 
-  if (nodes_[node_idx].blacklisted) {
-    // exclude blacklisted nodes
-    return false;
-  }
-
-  Socket* socket = getServerSocket(node_idx);
-  if (!socket) {
-    // If a connection to the node doesn't exist yet, consider it as a valid
-    // destination.
-    return true;
-  }
-
-  int rv = socket->checkConnection(nullptr);
+  int rv = checkServerConnection(node_idx);
   if (rv != 0) {
     if (err == E::DISABLED || err == E::NOBUFS) {
       ld_spew("Can't gossip to N%u: %s", node_idx, error_description(err));
@@ -1094,7 +1346,7 @@ bool FailureDetector::isMyDomainIsolated(NodeLocationScope scope) const {
   return isolation_checker_->isMyDomainIsolated(scope);
 }
 
-const char* FailureDetector::getNodeStateString(NodeState state) const {
+const char* FailureDetector::getNodeStateString(NodeState state) {
   switch (state) {
     case ALIVE:
       return "ALIVE";
@@ -1110,23 +1362,22 @@ std::string FailureDetector::getStateString(node_index_t idx) const {
   std::lock_guard<std::mutex> lock(mutex_);
   folly::SharedMutex::ReadHolder read_lock(nodes_mutex_);
 
-  if (nodes_.find(idx) == nodes_.end()) {
+  auto it = nodes_.find(idx);
+  if (it == nodes_.end()) {
     return "invalid node index";
   }
 
-  char buf[1024];
-  {
-    snprintf(buf,
-             sizeof(buf),
-             "(gossip: %u, instance-id: %lu, failover: %lu, starting: %d, "
-             "state: %s)",
-             nodes_.at(idx).gossip_,
-             nodes_.at(idx).gossip_ts_.count(),
-             nodes_.at(idx).failover_.count(),
-             (int)nodes_.at(idx).is_node_starting_,
-             getNodeStateString(nodes_.at(idx).state));
-  }
-  return std::string(buf);
+  const Node& node = it->second;
+
+  return folly::sformat(
+      "(gossip: {}, instance-id: {}, failover: {}, starting: {}, "
+      "status: {}, state: {})",
+      node.gossip_,
+      node.gossip_ts_.count(),
+      node.failover_.count(),
+      (int)node.is_node_starting_,
+      toString(node.status_),
+      getNodeStateString(node.state_.load()));
 }
 
 folly::dynamic FailureDetector::getStateJson(node_index_t idx) const {
@@ -1134,18 +1385,20 @@ folly::dynamic FailureDetector::getStateJson(node_index_t idx) const {
   std::lock_guard<std::mutex> lock(mutex_);
   folly::SharedMutex::ReadHolder read_lock(nodes_mutex_);
 
-  if (nodes_.find(idx) == nodes_.end()) {
+  auto it = nodes_.find(idx);
+  if (it == nodes_.end()) {
     obj["error"] = "invalid node index";
     return obj;
   }
+  const Node& node = it->second;
 
-  {
-    obj["gossip"] = nodes_.at(idx).gossip_;
-    obj["instance-id"] = nodes_.at(idx).gossip_ts_.count();
-    obj["failover"] = nodes_.at(idx).failover_.count();
-    obj["starting"] = (int)nodes_.at(idx).is_node_starting_;
-    obj["state"] = getNodeStateString(nodes_.at(idx).state);
-  }
+  obj["gossip"] = node.gossip_;
+  obj["instance-id"] = node.gossip_ts_.count();
+  obj["failover"] = node.failover_.count();
+  obj["starting"] = (int)node.is_node_starting_;
+  obj["state"] = getNodeStateString(node.state_.load());
+  obj["status"] = toString(node.status_);
+
   return obj;
 }
 
@@ -1161,6 +1414,16 @@ FailureDetector::getNodesConfiguration() const {
   return Worker::onThisThread()->getNodesConfiguration();
 }
 
+void FailureDetector::updateNodesMap() {
+  for (const auto& node_attributes :
+       *(processor_->getNodesConfiguration()->getServiceDiscovery())) {
+    if (nodes_.count(node_attributes.first) == 0) {
+      Node& node = nodes_[node_attributes.first];
+      node.last_suspected_at_ = initial_time_ms_;
+    }
+  }
+}
+
 NodeID FailureDetector::getMyNodeID() const {
   return Worker::onThisThread()->processor_->getMyNodeID();
 }
@@ -1169,7 +1432,16 @@ ClusterState* FailureDetector::getClusterState() const {
   return Worker::getClusterState();
 }
 
-void FailureDetector::broadcastWrapper(GOSSIP_Message::GOSSIP_flags_t flags) {
+void FailureDetector::broadcastBringupUpdate(
+    GOSSIP_Message::GOSSIP_flags_t additional_flags) {
+  auto flags = additional_flags | GOSSIP_Message::NODE_BRINGUP_FLAG;
+
+  bool config_loaded = isLogsConfigLoaded();
+  if (config_loaded) {
+    flags |= GOSSIP_Message::STARTING_STATE_FINISHED;
+  }
+  need_to_broadcast_starting_state_finished_ = !config_loaded;
+
   const auto& nodes_configuration = getNodesConfiguration();
   const auto& serv_disc = nodes_configuration->getServiceDiscovery();
   node_index_t my_idx = getMyNodeID().index();
@@ -1210,8 +1482,6 @@ void FailureDetector::broadcastWrapper(GOSSIP_Message::GOSSIP_flags_t flags) {
               error_description(err));
     }
   }
-  folly::SharedMutex::ReadHolder read_lock(nodes_mutex_);
-  nodes_[my_idx].gossip_ = 0;
 }
 
 int FailureDetector::sendGossipMessage(NodeID node,
@@ -1276,9 +1546,17 @@ void FailureDetector::onGossipMessageSent(Status st,
   }
 }
 
-void FailureDetector::updateBoycottedNodes() {
-  getClusterState()->setBoycottedNodes(
-      getBoycottTracker().getBoycottedNodes(SystemTimestamp::now()));
+bool FailureDetector::senderUsingHealthMonitor(
+    node_index_t sender_idx,
+    GOSSIP_Message::node_list_t node_list) {
+  bool using_health_monitor{false};
+  for (auto& node : node_list) {
+    if (node.node_id_ != sender_idx) {
+      continue;
+    }
+    using_health_monitor = node.node_status_ != NodeHealthStatus::UNDEFINED;
+  }
+  return using_health_monitor;
 }
 
 void FailureDetector::setOutliers(std::vector<NodeID> outliers) {
@@ -1306,26 +1584,26 @@ FailureDetector::getNodeBoycottObject(node_index_t node_index) {
   return it->second;
 }
 
-Socket* FailureDetector::getServerSocket(node_index_t idx) {
-  return Worker::onThisThread()->sender().findServerSocket(idx);
+void FailureDetector::resetServerSocketConnectThrottle(node_index_t node_idx) {
+  Worker::onThisThread()->sender().resetServerSocketConnectThrottle(node_idx);
+}
+
+int FailureDetector::checkServerConnection(node_index_t node_idx) {
+  return Worker::onThisThread()->sender().checkServerConnection(node_idx);
 }
 
 void FailureDetector::setBlacklisted(node_index_t idx, bool blacklisted) {
   std::lock_guard<std::mutex> lock(mutex_);
   folly::SharedMutex::ReadHolder read_lock(nodes_mutex_);
-  if (nodes_.find(idx) != nodes_.end()) {
-    nodes_[idx].blacklisted = blacklisted;
+  if (nodes_.count(idx)) {
+    nodes_.at(idx).blacklisted_.store(blacklisted);
   }
 }
 
 bool FailureDetector::isBlacklisted(node_index_t idx) const {
-  bool blacklisted = false;
-  std::lock_guard<std::mutex> lock(mutex_);
   folly::SharedMutex::ReadHolder read_lock(nodes_mutex_);
-  if (nodes_.find(idx) != nodes_.end()) {
-    blacklisted = nodes_.at(idx).blacklisted;
-  }
-  return blacklisted;
+  auto it = nodes_.find(idx);
+  return it != nodes_.end() && it->second.blacklisted_.load();
 }
 
 bool FailureDetector::isAlive(node_index_t idx) const {
@@ -1379,13 +1657,197 @@ bool FailureDetector::isIsolated() const {
   return isolated_.load();
 }
 
+bool FailureDetector::isStableState() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return num_gossips_received_ >= settings_->min_gossips_for_stable_state;
+}
+
 bool FailureDetector::isLogsConfigLoaded() {
-  if (!Worker::onThisThread(false)) {
-    // we are here because we are in a test and FailureDetector is being
-    // constructed.
-    return true;
-  }
+  ld_check(Worker::onThisThread(false));
   return processor_->isLogsConfigLoaded();
+}
+
+void FailureDetector::updateVersions(
+    const GOSSIP_Message& msg,
+    std::unordered_set<size_t> node_ids_to_skip,
+    std::unordered_set<size_t> nodes_with_new_instances) {
+  node_index_t sender_idx = msg.gossip_node_.index();
+  for (const auto& node : msg.versions_) {
+    size_t id = node.node_id_;
+    if (node_ids_to_skip.find(id) != node_ids_to_skip.end()) {
+      continue;
+    }
+    if (nodes_.find(id) == nodes_.end()) {
+      continue;
+    }
+
+    bool new_instance_id =
+        nodes_with_new_instances.find(id) != nodes_with_new_instances.end();
+    auto& fdnode = nodes_[id];
+    auto& fdnode_rsm_versions = msg.flags_ & GOSSIP_Message::HAS_IN_MEM_VERSIONS
+        ? fdnode.rsm_versions_
+        : fdnode.rsm_durable_versions_;
+    for (size_t i = 0; i < msg.rsm_types_.size(); ++i) {
+      if (std::find(registered_rsms_.begin(),
+                    registered_rsms_.end(),
+                    msg.rsm_types_[i]) == registered_rsms_.end()) {
+        ld_info("Adding RSM type:%lu to this node's FD state, because %s "
+                "included it in the Gossip message",
+                msg.rsm_types_[i].val_,
+                msg.gossip_node_.toString().c_str());
+        // To handle cases where different nodes are gossiping different rsms at
+        // the same time, e.g. during rolling-restart where old server and
+        // new server may have different rsms registered.
+        registered_rsms_.push_back(msg.rsm_types_[i]);
+        fdnode_rsm_versions[msg.rsm_types_[i]] = LSN_INVALID;
+      }
+      lsn_t existing = fdnode_rsm_versions[msg.rsm_types_[i]];
+      lsn_t recvd = node.rsm_versions_[i];
+      if (id == sender_idx) {
+        // If sender doesn't have a valid version, stop accepting versions
+        // from others
+        fdnode.accept_durable_versions_[msg.rsm_types_[i]] =
+            recvd > LSN_INVALID;
+        fdnode_rsm_versions[msg.rsm_types_[i]] = node.rsm_versions_[i];
+        continue;
+      }
+
+      bool accepting_durable_ver_indirectly = true;
+      if (msg.flags_ & GOSSIP_Message::HAS_DURABLE_SNAPSHOT_VERSIONS) {
+        auto it = fdnode.accept_durable_versions_.find(msg.rsm_types_[i]);
+        if (it != fdnode.accept_durable_versions_.end() && !it->second) {
+          accepting_durable_ver_indirectly = false;
+        }
+      }
+      if (new_instance_id ||
+          (accepting_durable_ver_indirectly && (recvd > existing))) {
+        ld_debug("Updating RSM %s versions for N%zu, GOSSIP received from:%s, "
+                 "new_instance_id:%s, rsm_type:%lu, "
+                 "recvd:%s, existing:%s, accepting indirectly:%d",
+                 msg.flags_ & GOSSIP_Message::HAS_IN_MEM_VERSIONS ? "in-memory"
+                                                                  : "durable",
+                 id,
+                 msg.gossip_node_.toString().c_str(),
+                 new_instance_id ? "yes" : "no",
+                 msg.rsm_types_[i].val_,
+                 lsn_to_string(recvd).c_str(),
+                 lsn_to_string(existing).c_str(),
+                 accepting_durable_ver_indirectly);
+        fdnode_rsm_versions[msg.rsm_types_[i]] = node.rsm_versions_[i];
+      }
+    }
+
+    // Update NCM versions
+    for (size_t i = 0; i < fdnode.ncm_versions_.size(); ++i) {
+      auto& existing = fdnode.ncm_versions_[i];
+      auto& recvd = node.ncm_versions_[i];
+      if (recvd > existing || new_instance_id) {
+        ld_debug("Updating NCM versions for N%zu, GOSSIP received from:%s, "
+                 "new_instance_id:%s, recvd:%lu, existing:%lu",
+                 id,
+                 msg.gossip_node_.toString().c_str(),
+                 new_instance_id ? "yes" : "no",
+                 recvd.val_,
+                 existing.val_);
+        existing = recvd;
+      }
+    }
+  }
+}
+
+Status FailureDetector::getRSMVersion(node_index_t idx,
+                                      logid_t rsm_type,
+                                      lsn_t& result_out) {
+  folly::SharedMutex::ReadHolder read_lock(nodes_mutex_);
+  if (std::find(registered_rsms_.begin(), registered_rsms_.end(), rsm_type) ==
+      registered_rsms_.end()) {
+    return E::NOTSUPPORTED;
+  }
+
+  if (nodes_[idx].state_.load() == NodeState::DEAD) {
+    return E::STALE;
+  }
+
+  result_out = nodes_[idx].rsm_versions_[rsm_type];
+  return E::OK;
+}
+
+Status FailureDetector::getAllRSMVersionsInCluster(
+    logid_t rsm_type,
+    RsmVersionType type,
+    std::multimap<lsn_t, node_index_t, std::greater<lsn_t>>& result_out) {
+  folly::SharedMutex::ReadHolder read_lock(nodes_mutex_);
+  if (std::find(registered_rsms_.begin(), registered_rsms_.end(), rsm_type) ==
+      registered_rsms_.end()) {
+    return E::NOTSUPPORTED;
+  }
+
+  for (auto& node : nodes_) {
+    if (node.second.state_.load() != NodeState::DEAD) {
+      auto& node_rsm_versions = type == RsmVersionType::IN_MEMORY
+          ? node.second.rsm_versions_
+          : node.second.rsm_durable_versions_;
+      result_out.insert(
+          std::make_pair(node_rsm_versions[rsm_type], node.first));
+    }
+  }
+  return E::OK;
+}
+
+void FailureDetector::getRSMVersionsForNode(node_index_t idx,
+                                            InfoRsmTable& table) {
+  logid_t logsconfig = configuration::InternalLogs::CONFIG_LOG_DELTAS;
+  lsn_t logsconfig_mem_ver = LSN_INVALID, logsconfig_durable_ver = LSN_INVALID;
+  logid_t eventlog = configuration::InternalLogs::EVENT_LOG_DELTAS;
+  lsn_t eventlog_mem_ver = LSN_INVALID, eventlog_durable_ver = LSN_INVALID;
+
+  folly::SharedMutex::ReadHolder read_lock(nodes_mutex_);
+  auto state = nodes_[idx].state_.load();
+  auto state_str = getNodeStateString(state);
+  if (state != NodeState::DEAD) {
+    auto rsm_versions_for_node = nodes_[idx].rsm_versions_;
+    auto rsm_durable_versions_for_node = nodes_[idx].rsm_durable_versions_;
+    if (rsm_versions_for_node.find(logsconfig) != rsm_versions_for_node.end()) {
+      logsconfig_mem_ver = rsm_versions_for_node[logsconfig];
+      logsconfig_durable_ver = rsm_durable_versions_for_node[logsconfig];
+    }
+    if (rsm_versions_for_node.find(eventlog) != rsm_versions_for_node.end()) {
+      eventlog_mem_ver = rsm_versions_for_node[eventlog];
+      eventlog_durable_ver = rsm_durable_versions_for_node[eventlog];
+    }
+  }
+
+  table.next()
+      .set<0>(idx)
+      .set<1>(state_str)
+      .set<2>(logsconfig_mem_ver)
+      .set<3>(logsconfig_durable_ver)
+      .set<4>(eventlog_mem_ver)
+      .set<5>(eventlog_durable_ver);
+}
+
+Status FailureDetector::getNCMVersionsForNode(
+    node_index_t idx,
+    std::array<membership::MembershipVersion::Type, 3>& result_out) {
+  folly::SharedMutex::ReadHolder read_lock(nodes_mutex_);
+  if (nodes_[idx].state_.load() == NodeState::DEAD) {
+    return E::STALE;
+  }
+
+  result_out = nodes_[idx].ncm_versions_;
+  return E::OK;
+}
+
+void FailureDetector::resetVersions(node_index_t idx) {
+  ld_info("Resetting RSM and NCM Versions for N%hu", idx);
+  auto& fdnode = nodes_[idx];
+
+  fdnode.rsm_versions_.clear();
+  fdnode.rsm_durable_versions_.clear();
+
+  fdnode.ncm_versions_[0] = membership::MembershipVersion::Type(0);
+  fdnode.ncm_versions_[1] = membership::MembershipVersion::Type(0);
+  fdnode.ncm_versions_[2] = membership::MembershipVersion::Type(0);
 }
 
 }} // namespace facebook::logdevice

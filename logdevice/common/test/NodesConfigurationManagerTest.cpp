@@ -97,7 +97,8 @@ class NodesConfigurationManagerTest : public ::testing::Test {
     auto store = std::make_unique<ZookeeperNodesConfigurationStore>(
         kConfigKey,
         NodesConfigurationCodec::extractConfigVersion,
-        std::move(z));
+        std::move(z),
+        /* max_retries= */ 3);
 
     Settings settings = create_default_settings<Settings>();
     settings.num_workers = 3;
@@ -116,8 +117,9 @@ class NodesConfigurationManagerTest : public ::testing::Test {
     ncm_ = NodesConfigurationManager::create(
         NodesConfigurationManager::OperationMode::forTooling(),
         std::move(deps));
-    ASSERT_TRUE(ncm_->init(std::make_shared<const NodesConfiguration>()));
+    ASSERT_NE(nullptr, ncm_);
     ncm_->upgradeToProposer();
+    ASSERT_TRUE(ncm_->init(std::make_shared<const NodesConfiguration>()));
   }
 
   //////// Helper functions ////////
@@ -160,7 +162,7 @@ TEST_F(NodesConfigurationManagerTest, basic) {
   };
   auto futures =
       fulfill_on_all_workers<folly::Unit>(processor_.get(), verify_version);
-  folly::collectAllSemiFuture(futures).get();
+  folly::collectAll(futures).get();
 }
 
 TEST_F(NodesConfigurationManagerTest, update) {
@@ -224,7 +226,7 @@ TEST_F(NodesConfigurationManagerTest, trackState) {
   {
     auto nc = ncm_->getConfig();
     auto p = nc->getStorageMembership()->getShardState(ShardID{17, 0});
-    EXPECT_TRUE(p.hasValue());
+    EXPECT_TRUE(p.has_value());
     EXPECT_EQ(membership::StorageState::READ_ONLY, p->storage_state);
     EXPECT_EQ(membership::MetaDataStorageState::NONE, p->metadata_state);
   }
@@ -381,113 +383,14 @@ TEST_F(NodesConfigurationManagerTest, LinearizableReadOnStartup) {
   }
 }
 
-TEST_F(NodesConfigurationManagerTest, DivergenceReporting) {
-  auto expect_diverged = [&](bool diverged, bool same_version_stat_bumped) {
-    const auto& ncm_nc = processor_->getNodesConfigurationFromNCMSource();
-    const auto& server_nc =
-        processor_->getNodesConfigurationFromServerConfigSource();
-
-    EXPECT_EQ(
-        !diverged, ncm_nc->equalWithTimestampAndVersionIgnored(*server_nc));
-    auto wait_res = wait_until(
-        "Diverged Stats are updated",
-        [&]() {
-          auto expected = (diverged ? 1 : 0);
-          auto got = processor_->stats_->aggregate()
-                         .nodes_configuration_server_config_diverged.load();
-          ld_info("expected %d, got %ld", expected, got);
-          return expected == got;
-        },
-        std::chrono::steady_clock::now() + std::chrono::seconds(10));
-    EXPECT_EQ(0, wait_res);
-
-    wait_res = wait_until(
-        "Diverged with same version Stats are updated",
-        [&]() {
-          auto expected = (same_version_stat_bumped ? 1 : 0);
-          auto got =
-              processor_->stats_->aggregate()
-                  .nodes_configuration_server_config_diverged_with_same_version
-                  .load();
-          ld_info("expected %d, got %ld", expected, got);
-          return expected == got;
-        },
-        std::chrono::steady_clock::now() + std::chrono::seconds(10));
-    EXPECT_EQ(0, wait_res);
-  };
-
-  {
-    // Because we only log the divergence on servers, we need to set the server
-    // setting to true.
-    SettingsUpdater updater;
-    updater.registerSettings(processor_->updateableSettings());
-    updater.setInternalSetting("server", "true");
-  }
-
-  // Initially both the NCM NC and ServerConfig NC should be empty
-  waitTillNCMReceives(
-      MembershipVersion::Type{MembershipVersion::EMPTY_VERSION.val()});
-  expect_diverged(false, false);
-
-  // Do a ServerConfig update and expect the configs to diverge
-  {
-    auto new_server_config = processor_->config_->getServerConfig()
-                                 ->withNodes(createSimpleNodesConfig(2))
-                                 ->withIncrementedVersion();
-    processor_->config_->updateableServerConfig()->update(
-        std::move(new_server_config));
-  }
-  expect_diverged(true, false);
-
-  // Re-sync the NC config and expect the divergence metrics to be 0
-  {
-    auto new_nc = processor_->getNodesConfigurationFromServerConfigSource();
-    auto new_version = new_nc->getVersion();
-    ncm_->overwrite(
-        std::move(new_nc),
-        [](Status status, std::shared_ptr<const NodesConfiguration>) {
-          ASSERT_EQ(Status::OK, status);
-        });
-    waitTillNCMReceives(new_version);
-  }
-  expect_diverged(false, false);
-
-  // Do a ServerConfig update without a version bump and expect the configs to
-  // diverge and the with_version stat to get bumped
-  {
-    auto new_server_config = processor_->config_->getServerConfig()->withNodes(
-        createSimpleNodesConfig(3));
-    processor_->config_->updateableServerConfig()->update(
-        std::move(new_server_config));
-  }
-  expect_diverged(true, true);
-
-  // Re-sync the NC config and expect the divergence metrics to be 0
-  {
-    // We can't have a new NC with the same version, we will need to bump the
-    // version of the new NC
-    auto new_version = vcs_config_version_t(
-        processor_->config_->getServerConfig()->getVersion().val() + 1);
-    auto new_nc =
-        processor_->getNodesConfigurationFromServerConfigSource()->withVersion(
-            new_version);
-    ncm_->overwrite(
-        std::move(new_nc),
-        [](Status status, std::shared_ptr<const NodesConfiguration>) {
-          ASSERT_EQ(Status::OK, status);
-        });
-    waitTillNCMReceives(new_version);
-  }
-  expect_diverged(false, false);
-}
-
 // Second setup with multiple NCMs sharing the same underlying FileBasedNCS
 class NodesConfigurationManagerTest2 : public ::testing::Test {
  public:
   void SetUp() override {
     dbg::currentLevel = getLogLevelFromEnv().value_or(dbg::Level::INFO);
 
-    temp_dir_ = createTemporaryDir("NodesConfigurationManagerTest2");
+    temp_dir_ =
+        std::make_unique<TemporaryDirectory>("NodesConfigurationManagerTest2");
     file_ncs_ = createNCS();
 
     // provision initial config in FileBasedNCS
@@ -497,7 +400,9 @@ class NodesConfigurationManagerTest2 : public ::testing::Test {
     auto serialized = NodesConfigurationCodec::serialize(*nc);
     ASSERT_EQ(Status::OK,
               file_ncs_->updateConfigSync(
-                  serialized, /* base_version */ folly::none));
+                  serialized,
+                  /* base_version */
+                  NodesConfigurationStore::Condition::overwrite()));
 
     Settings settings = create_default_settings<Settings>();
     settings.num_workers = 3;
@@ -515,8 +420,8 @@ class NodesConfigurationManagerTest2 : public ::testing::Test {
     ncm1_ = NodesConfigurationManager::create(
         NodesConfigurationManager::OperationMode::forTooling(),
         std::move(deps));
-    ASSERT_TRUE(ncm1_->init(std::make_shared<const NodesConfiguration>()));
     ncm1_->upgradeToProposer();
+    ASSERT_TRUE(ncm1_->init(std::make_shared<const NodesConfiguration>()));
 
     waitTillNCMReceives(*ncm1_, init_version_);
 
@@ -531,8 +436,8 @@ class NodesConfigurationManagerTest2 : public ::testing::Test {
     ncm2_ = NodesConfigurationManager::create(
         NodesConfigurationManager::OperationMode::forTooling(),
         std::move(deps));
-    ASSERT_TRUE(ncm2_->init(std::make_shared<const NodesConfiguration>()));
     ncm2_->upgradeToProposer();
+    ASSERT_TRUE(ncm2_->init(std::make_shared<const NodesConfiguration>()));
   }
 
   //////// Helper functions ////////
@@ -545,7 +450,8 @@ class NodesConfigurationManagerTest2 : public ::testing::Test {
   void writeNewConfig(std::shared_ptr<const NodesConfiguration> new_config) {
     // overwrite; fire and forget
     file_ncs_->updateConfig(NodesConfigurationCodec::serialize(*new_config),
-                            /* base_version = */ folly::none,
+                            /* base_version = */
+                            NodesConfigurationStore::Condition::overwrite(),
                             /* cb = */ {});
   }
 
@@ -561,7 +467,7 @@ class NodesConfigurationManagerTest2 : public ::testing::Test {
   }
 
  public:
-  std::unique_ptr<folly::test::TemporaryDirectory> temp_dir_;
+  std::unique_ptr<TemporaryDirectory> temp_dir_;
   std::unique_ptr<FileBasedNodesConfigurationStore> file_ncs_;
   membership::MembershipVersion::Type init_version_;
 

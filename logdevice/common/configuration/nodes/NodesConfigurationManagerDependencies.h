@@ -143,6 +143,12 @@ class NCMRequest : public Request {
     return worker_id_.val();
   }
 
+  // All the NCM requests are critical and should be executed with HI_PRI
+  // priority.
+  virtual int8_t getExecutorPriority() const override {
+    return folly::Executor::HI_PRI;
+  }
+
   Request::Execution execute() final override;
 
  protected:
@@ -306,10 +312,6 @@ class Dependencies {
   reportPropagationLatency(const std::shared_ptr<const NodesConfiguration>&);
   // Only worker threads have access to stats
   void reportEvent(NCMReportType type);
-
-  // Compare the ServerConfig NC against the NCM NC and report the divergence
-  // to the stats.
-  void checkAndReportConsistency();
 
   NCMWeakPtr ncm_{};
   // Worker / thread pinning in the current work execution model

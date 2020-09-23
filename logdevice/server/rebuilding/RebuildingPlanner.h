@@ -21,7 +21,7 @@
 #include "logdevice/common/settings/RebuildingSettings.h"
 #include "logdevice/common/types_internal.h"
 #include "logdevice/include/LogTailAttributes.h"
-#include "logdevice/server/RebuildingLogEnumerator.h"
+#include "logdevice/server/rebuilding/RebuildingLogEnumerator.h"
 #include "logdevice/server/rebuilding/RebuildingPlan.h"
 
 namespace facebook { namespace logdevice {
@@ -30,7 +30,7 @@ namespace facebook { namespace logdevice {
  * RebuildingPlanner is responsible for retrieving a RebuildingPlan for each log
  * on each local donor shard.
  *
- * A RebuildingPlan is the set of epoch ranges that the LogRebuilding state
+ * A RebuildingPlan is the set of epoch ranges that the ShardRebuilding state
  * machine on each shard will be responsible for rebuilding.
  *
  * This state machine starts off retrieving the LSN up to which the log has to

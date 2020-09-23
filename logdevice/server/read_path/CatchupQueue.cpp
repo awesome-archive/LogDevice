@@ -80,7 +80,8 @@ void CatchupQueue::add(ServerReadStream& stream, CatchupQueue::PushMode mode) {
   switch (mode) {
     case PushMode::DELAYED: {
       auto latency_optional = deps_->getDeliveryLatency(stream.log_id_);
-      if (latency_optional.hasValue() && latency_optional.value().count() > 0) {
+      if (latency_optional.has_value() &&
+          latency_optional.value().count() > 0) {
         // put in the separate queue so pushRecords() skips it until it's ready
         // to read more
         auto delivery_latency = latency_optional.value();
@@ -861,7 +862,7 @@ void CatchupQueue::onReadTaskDone(const ReadStorageTask& task) {
   // registered again at that time. (See pushRecords() call below).
   resume_cb_.deactivate();
 
-  ServerReadStream* stream = task.stream_.get();
+  ServerReadStream* stream = task.stream_.get().get();
   onStorageTaskStopped(stream);
   if (!stream) {
     // The ServerReadStreams was erased while the storage task was in flight.

@@ -11,11 +11,14 @@
 #include <memory>
 #include <random>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <folly/Optional.h>
 
+#include "logdevice/common/AdminCommandTable.h"
 #include "logdevice/common/DomainIsolationChecker.h"
+#include "logdevice/common/NodeHealthStatus.h"
 #include "logdevice/common/NodeID.h"
 #include "logdevice/common/Request.h"
 #include "logdevice/common/SequencerPlacement.h"
@@ -23,6 +26,7 @@
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/configuration/ServerConfig.h"
 #include "logdevice/common/protocol/GOSSIP_Message.h"
+#include "logdevice/common/replicated_state_machine/ReplicatedStateMachine.h"
 #include "logdevice/common/settings/GossipSettings.h"
 #include "logdevice/common/settings/UpdateableSettings.h"
 #include "logdevice/common/types_internal.h"
@@ -37,10 +41,8 @@ namespace facebook { namespace logdevice {
 
 class GOSSIP_Message;
 class ServerProcessor;
-class Socket;
 class StatsHolder;
 class ClusterState;
-class MockFailureDetector;
 
 class FailureDetector {
  public:
@@ -68,25 +70,25 @@ class FailureDetector {
   };
 
   /**
+   * Creates FailureDetector in a dormant state.
+   * Calling start() brings it to life.
+   *
    * @param settings   failure detector-specific settings
    * @param processor  processor pointer to get main settings and
    *                   pass for gossip thread(Worker class) constructor
    * @param stats      for updating FD counters
-   * @param attach     skip gossiping for certain tests(if set to false)
    */
   FailureDetector(UpdateableSettings<GossipSettings> settings,
                   ServerProcessor* processor,
-                  StatsHolder* stats,
-                  bool attach = true);
-  /*
-   * For MockTest like FailureDetectorTest, which do their own mock gossips.
-   * These tests don't set processor->failure_detector_
-   */
-  FailureDetector(UpdateableSettings<GossipSettings> settings,
-                  ServerProcessor* processor,
-                  bool attach = false);
+                  StatsHolder* stats);
 
   virtual ~FailureDetector() {}
+
+  /**
+   * Bring the FailureDetector alive: start gossiping and updating cluster
+   * state and everything.
+   */
+  void start();
 
   /**
    * Checks whether a node with the given index is considered to be
@@ -170,30 +172,17 @@ class FailureDetector {
    */
   bool isIsolated() const;
 
-  void shutdown();
-
   /**
-   * This method can be called in 2 cases:
-   * 1. As part of notification of cluster state reply,
-   *    so that FailureDetector can initialize its internal state at startup.
-   * 2. On timing out waiting for cluster-state reply to come.
-   *
-   * @param
-   *   cs_update :      default to empty vector
-   *                    not-empty if a cluster-state update is received
-   * @param
-   *   boycotted_nodes: default to empty vector
-   *                    not-empty if a cluster-state update is received
+   * Returns whether we received at least min_gossips_for_stable_state gossips.
    */
-  void buildInitialState(const std::vector<uint8_t>& cs_update = {},
-                         std::vector<node_index_t> boycotted_nodes = {});
+  bool isStableState() const;
+
+  void shutdown();
 
   // called by the onSent method of GOSSIP_Message to notify the
   // failure detector
   void onGossipMessageSent(Status st, const Address& to, uint64_t msg_id);
 
-  // update the ClusterState with the boycotts contained in the BoycottTracker
-  void updateBoycottedNodes();
   /**
    * Thread safe
    *
@@ -231,11 +220,66 @@ class FailureDetector {
   void getClusterDeadNodeStats(size_t* effective_dead_cnt,
                                size_t* effective_cluster_size);
 
+  void setNodeStatus(NodeHealthStatus status) {
+    node_health_status_.store(status, std::memory_order_relaxed);
+  }
+
+  /** This fetches the new set of nodes and updates nodes_
+   *  to reflect the actual nodes configuration.
+   */
+  void updateNodesMap();
+
+  /**
+   * Updates the RSM and NCM versions maintained in FD upon receiving
+   * GOSSIP Message from another node.
+   *
+   * 'node_ids_to_skip' contains nodes for which we shouldn't be applying
+   * the information present in the incoming GOSSIP, it includes this node's
+   * index plus the nodes whose instane id is stale (i.e this FailureDetector
+   * knows a better instance id for that node)
+   *
+   * 'node_ids_with_new_instances' contains nodes that have been detected
+   * to be running with a new instance id than previously known to this
+   * FailureDetector. Therefore we must apply all the updates unconditionally.
+   */
+  void updateVersions(const GOSSIP_Message& msg,
+                      std::unordered_set<size_t> node_ids_to_skip,
+                      std::unordered_set<size_t> node_ids_with_new_instances);
+
+  /* Get a RSM's version on a given cluster node
+   * @return if the Node idx is DEAD, returns E::STALE
+   *         else if the 'rsm_type' is not registered, return E::NOTSUPPORTED
+   *         else returns E::OK and populates 'result_out'
+   */
+  Status getRSMVersion(node_index_t idx, logid_t rsm_type, lsn_t& result_out);
+
+  /** Populate admin command table's fields
+   *  If the Node 'idx' is DEAD, populates LSN_INVALID,
+   *  Else populates from the rsm data structures in FD.
+   */
+  void getRSMVersionsForNode(node_index_t idx, InfoRsmTable& table);
+
+  /* Get a RSM's version on all cluster nodes, sorted by lsn
+   * @return if the RSM is registered, returns E::OK and populates 'result_out'
+   *         else, returns E::NOTSUPPORTED
+   */
+  Status getAllRSMVersionsInCluster(
+      logid_t rsm_type,
+      RsmVersionType type,
+      std::multimap<lsn_t, node_index_t, std::greater<lsn_t>>& result_out);
+
+  /* Get all NCM versions for a given node
+   * The order is mentioned in FailureDetector::Node::ncm_versions_
+   * @return if the Node idx is DEAD, returns E::STALE
+   *         else, populates 'result_out' and returns E::OK
+   */
+  Status getNCMVersionsForNode(
+      node_index_t idx,
+      std::array<membership::MembershipVersion::Type, 3>& result_out);
+
  protected:
   // send a gossip message to some node in the cluster
   void gossip();
-
-  void cancelTimers();
 
   virtual bool isLogsConfigLoaded();
 
@@ -244,35 +288,13 @@ class FailureDetector {
   class RandomSelector;
   class RoundRobinSelector;
 
-  std::chrono::milliseconds initial_time_ms_;
-
-  Timer cs_timer_;
-  bool waiting_for_cluster_state_{true};
-
-  // Don't rely on gossip() and detectFailures() to transition this node out
-  // of suspect state(as it can cause 100ms race). This timer helps in making
-  // sure that this node transitions from SUSPECT to ALIVE earliest(on this node
-  // , as opposed to some other node). The rare case when this may not happen is
-  // when gossip thread is not scheduled for some time.
-  Timer suspect_timer_;
-  void startSuspectTimer();
-
-  void startGossiping();
-
-  /**
-   * Send a GET-CLUSTER-STATE to fetch ALIVE/DEAD status of cluster nodes
-   * If reply comes within timeout, transition the cluster nodes to the
-   * received state immediately, otherwise use the previous state transition
-   * logic i.e. move everyone from DEAD to SUSPECT at the same time (i.e. while
-   * executing gossip() and calling detectFailures())
-   */
-  void startClusterStateTimer();
-
-  void sendGetClusterState();
-
   struct Node {
-    NodeState state;
-    bool blacklisted;
+    // All fields of Node are assigned with locked mutex_, almost always from
+    // the gossip thread.
+    // The atomic fields may be read without locking mutex_.
+
+    std::atomic<NodeState> state_;
+    std::atomic<bool> blacklisted_;
 
     // Time when the node was suspected to be ALIVE, and transitioned
     // from DEAD to SUSPECT state
@@ -293,15 +315,43 @@ class FailureDetector {
     // The node is in starting state?
     bool is_node_starting_;
 
+    // Health Status of node.
+    NodeHealthStatus status_;
+
+    // RSM versions for a Node
+    std::map<logid_t, lsn_t> rsm_versions_;
+    std::map<logid_t, lsn_t> rsm_durable_versions_;
+    // Keep rejecting durable versions for a node Nx from misc nodes Ny until
+    // Nx itself indicates so e.g. if a shard is broken, other nodes can send a
+    // higher(but stale) version for Nx, while Nx is sending LSN_INVALID
+    std::map<logid_t, bool> accept_durable_versions_;
+
+    // An array containing NCM information in the following order:
+    // - nc_version
+    // - sequencer_membership_version
+    // - storage_membership_version
+    std::array<membership::MembershipVersion::Type, 3> ncm_versions_;
+
+    // This is set when a node hasn't been processing gossips for some time
+    // indicated by a setting GOSSIP_Message::LONG_TIME_SINCE_LAST_GOSSIP flag.
+    bool stalled_gossip_processor_{false};
+
     Node()
-        : state(NodeState::DEAD),
-          blacklisted(false),
+        : state_(NodeState::DEAD),
+          blacklisted_(false),
           last_suspected_at_(std::chrono::milliseconds::zero()),
           gossip_(std::numeric_limits<uint32_t>::max()),
           gossip_ts_(std::chrono::milliseconds::zero()),
           failover_(std::chrono::milliseconds::zero()),
-          is_node_starting_(false) {}
+          is_node_starting_(false),
+          status_{NodeHealthStatus::UNHEALTHY} {}
+
+    std::string toString() const;
   };
+
+  std::chrono::milliseconds initial_time_ms_;
+
+  Timer suspect_timer_;
 
   // Used for restricting the logging of FD state and Gossip messages
   // to the first 'gossip_msg_dump_duration' seconds
@@ -309,81 +359,6 @@ class FailureDetector {
 
   // Used for rate limiting the output of dumpFDState().
   AtomicSteadyTimestamp last_state_dump_time_{AtomicSteadyTimestamp::min()};
-
-  bool isTracingOn() {
-    return (std::chrono::steady_clock::now() - start_time_ <=
-            settings_->gossip_msg_dump_duration);
-  }
-
-  bool shouldDumpState() {
-    if (isTracingOn()) {
-      return true;
-    }
-    if (facebook::logdevice::dbg::currentLevel <
-        facebook::logdevice::dbg::Level::SPEW) {
-      return false;
-    }
-    // Throttle to once every 0.5 seconds.
-    const std::chrono::milliseconds state_dump_period{500};
-    if (SteadyTimestamp::now() < last_state_dump_time_ + state_dump_period) {
-      return false;
-    }
-    last_state_dump_time_ = SteadyTimestamp::now();
-    return true;
-  }
-
-  std::chrono::milliseconds getCurrentTimeInMillis() const {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch());
-  }
-
-  // Check if incoming gossip message is more than
-  // 'gossip_time_skew_threshold' milli-seconds delayed
-  bool checkSkew(const GOSSIP_Message& msg);
-
-  bool isValidInstanceId(std::chrono::milliseconds id, node_index_t idx);
-
-  // Detects which nodes are down based on the data in Node::gossip_
-  void detectFailures(node_index_t self, size_t n);
-
-  // Executes a state transition and updates the dead list; `dead' is used to
-  // indicates that the node was detected as unavailable through gossiping.
-  void updateNodeState(node_index_t node, bool dead, bool self, bool failover);
-
-  // Is `node' a good candidate to send a GOSSIP message to?
-  bool isValidDestination(node_index_t node);
-
-  // Returns the node state name. Used in dbg statements.
-  const char* getNodeStateString(NodeState state) const;
-
-  // Dumps dead/suspect/alive status of all nodes in the cluster
-  // as perceived by this node's Failure Detector.
-  void dumpFDState();
-
-  // used to dump gossip list
-  std::string dumpGossipList(std::vector<uint32_t> list);
-
-  // used to dump instance ids(timestamps) of all nodes
-  std::string dumpInstanceList(std::vector<std::chrono::milliseconds> list);
-
-  void dumpGossipMessage(const GOSSIP_Message& msg);
-
-  /**
-   * Used for handling bringup & suspect-state-finished notifications.
-   * All other information contained in the gossip message is ignored.
-   *
-   * @return: true:  if msg contains NODE_BRINGUP_FLAG or
-   *                 SUSPECT_STATE_FINISHED flags
-   *          false: otherwise
-   */
-  bool processFlags(const GOSSIP_Message& msg);
-
-  std::string flagsToString(GOSSIP_Message::GOSSIP_flags_t flags);
-
-  void updateDependencies(node_index_t idx,
-                          NodeState new_state,
-                          bool failover,
-                          bool starting);
 
   // Monotonically increasing instance ID of logdeviced
   // This is used to distinguish b/w server instances across restarts.
@@ -404,11 +379,19 @@ class FailureDetector {
   // Domain isolation checker for detecting isolation of the local domain
   std::unique_ptr<DomainIsolationChecker> isolation_checker_;
 
-  // Protects access to Node::failover_ and nodes_. No contention is expected on
+  // Protects nodes_, but only the unordered_map itself, not the Node contents.
+  // Very rarely locked for writing: only during startup and when a new node
+  // is inserted into nodes_.
+  // All private and protected methods are called with unlocked nodes_mutex_,
+  // unless stated otherwise.
+  mutable folly::SharedMutex nodes_mutex_;
+
+  // Protects everything else. No contention is expected on
   // this lock since it's only ever used from a gossip thread and an admin
   // thread when dumping the state of the failure detector.
+  // All private and protected methods are called with locked mutex_,
+  // unless stated otherwise.
   mutable std::mutex mutex_;
-  mutable folly::SharedMutex nodes_mutex_;
 
   // failure detection threshold and other settings
   UpdateableSettings<GossipSettings> settings_;
@@ -436,6 +419,9 @@ class FailureDetector {
   size_t effective_dead_cnt_{0};
   size_t effective_cluster_size_{0};
 
+  std::atomic<NodeHealthStatus> node_health_status_{
+      NodeHealthStatus::UNDEFINED};
+
   // keep track of the time of the last gossip tick, which is when
   // the tick counters in Node::gossip_ were last updated
   SteadyTimestamp last_gossip_tick_time_{SteadyTimestamp::min()};
@@ -444,10 +430,176 @@ class FailureDetector {
   ExponentialBackoffTimerNode* gossip_timer_node_{nullptr};
 
   BoycottTracker boycott_tracker_;
+
+  bool waiting_for_cluster_state_{true};
+
+  // True if we ever sent gossip without STARTING_STATE_FINISHED flag.
+  // If so, we'll need to broadcast another round of gossip without the flag
+  // to let everyone know we've started.
+  bool need_to_broadcast_starting_state_finished_{false};
+
+  // The last time this node processed a gossip message. This is updated
+  // inside FailureDetector::onGossipReceived
+  SteadyTimestamp last_gossip_received_ts_;
+
+  // All private and protected methods are called with locked mutex_ and
+  // unlocked nodes_mutex_, unless stated otherwise.
+
+  /**
+   * Send a GET-CLUSTER-STATE to fetch ALIVE/DEAD status of cluster nodes
+   * If reply comes within timeout, transition the cluster nodes to the
+   * received state immediately, otherwise use the previous state transition
+   * logic i.e. move everyone from DEAD to SUSPECT at the same time (i.e. while
+   * executing gossip() and calling detectFailures())
+   */
+  void startGetClusterState();
+
+  /**
+   * This method can be called in 2 cases:
+   * 1. As part of notification of cluster state reply,
+   *    so that FailureDetector can initialize its internal state at startup.
+   * 2. On timing out waiting for cluster-state reply to come.
+   *
+   * @param
+   *   cs_update :      default to empty vector
+   *                    not-empty if a cluster-state update is received
+   * @param
+   *   boycotted_nodes: default to empty vector
+   *                    not-empty if a cluster-state update is received
+   * @param
+   *   cs_status_update: default to empty vector
+   *                    not-empty if a cluster-state update is received
+   */
+  void buildInitialState(
+      const std::vector<std::pair<node_index_t, uint16_t>>& cs_update = {},
+      std::vector<node_index_t> boycotted_nodes = {},
+      std::vector<std::pair<node_index_t, uint16_t>> cs_status_update = {});
+
+  // Don't rely on gossip() and detectFailures() to transition this node out
+  // of suspect state(as it can cause 100ms race). This timer helps in making
+  // sure that this node transitions from SUSPECT to ALIVE earliest(on this node
+  // , as opposed to some other node). The rare case when this may not happen is
+  // when gossip thread is not scheduled for some time.
+  void startSuspectTimer();
+
+  // Send a GOSSIP message with given flags to all cluster nodes to notify the,
+  // of this node's startup progress (see NODE_BRINGUP_FLAG).
+  // Used at most 3 times:
+  //  - when FailureDetector starts,
+  //  - when LogsConfig gets fully loaded afterwards,
+  //  - when suspect timer fires, with SUSPECT_STATE_FINISHED.
+  // Adds STARTING_STATE_FINISHED flag if config is fully loaded.
+  // May be called with nodes_mutex_ locked or unlocked.
+  void broadcastBringupUpdate(GOSSIP_Message::GOSSIP_flags_t additional_flags);
+
+  // Executes a state transition and updates the dead list; `dead' is used to
+  // indicates that the node was detected as unavailable through gossiping.
+  // Called with nodes_mutex_ locked for reading.
+  void updateNodeState(node_index_t idx,
+                       Node& node,
+                       bool dead,
+                       bool self,
+                       bool failover);
+
+  // Update the ClusterState with the new node status.
+  void updateNodeStatus(node_index_t idx, Node& node, NodeHealthStatus status);
+
+  // Called with nodes_mutex_ locked for reading.
+  void updateDependencies(node_index_t idx,
+                          Node& node,
+                          NodeState new_state,
+                          bool failover,
+                          bool starting);
+
+  /**
+   * Clear the RSM and NCM versions
+   * This is called after some cluster node sends a bringup message
+   */
+  void resetVersions(node_index_t idx);
+
+  void startGossiping();
+
+  // Detects which nodes are down based on the data in Node::gossip_.
+  // Updates ClusterState with node state and status.
+  // Called with locked nodes_mutex_.
+  void detectFailures(node_index_t self,
+                      const folly::SharedMutex::ReadHolder& nodes_lock);
+
+  // Check if incoming gossip message is more than
+  // 'gossip_time_skew_threshold' milli-seconds delayed
+  bool checkSkew(const GOSSIP_Message& msg);
+
+  /**
+   * Used for handling bringup & suspect-state-finished notifications.
+   * All other information contained in the gossip message is ignored.
+   * Called with nodes_mutex_ locked for reading.
+   *
+   * @return: true:  if msg contains NODE_BRINGUP_FLAG or
+   *                 SUSPECT_STATE_FINISHED flags
+   *          false: otherwise
+   */
+  bool processFlags(const GOSSIP_Message& msg,
+                    Node& sender_node,
+                    const folly::SharedMutex::ReadHolder& nodes_lock);
+
+  bool isTracingOn() {
+    return (std::chrono::steady_clock::now() - start_time_ <=
+            settings_->gossip_msg_dump_duration);
+  }
+
+  bool shouldDumpState();
+
+  // Dumps dead/suspect/alive status of all nodes in the cluster
+  // as perceived by this node's Failure Detector.
+  void dumpFDState(const folly::SharedMutex::ReadHolder& nodes_lock);
+
+  std::chrono::milliseconds getCurrentTimeInMillis() const {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch());
+  }
+
+  bool isValidInstanceId(std::chrono::milliseconds id, node_index_t idx);
+
+  // Finds the node in nodes_. If it's not there, creates it.
+  // Called with nodes_mutex_ locked for reading.
+  // May unlock and re-lock the `nodes_lock`; keep in mind that this may
+  // invalidate existing Node& references.
+  Node& insertOrGetNode(size_t node_idx,
+                        folly::SharedMutex::ReadHolder& nodes_lock);
+
+  // Is `node' a good candidate to send a GOSSIP message to?
+  bool isValidDestination(node_index_t node);
+
+  // Returns the node state name. Used in dbg statements.
+  static const char* getNodeStateString(NodeState state);
+
+  // Returns the node status name. Used in dbg statements.
+  static const char* getNodeStatusString(NodeHealthStatus status);
+
+  // used to dump gossip list
+  std::string dumpGossipList(std::vector<uint32_t> list);
+
+  // used to dump instance ids(timestamps) of all nodes
+  std::string dumpInstanceList(std::vector<std::chrono::milliseconds> list);
+
+  static void dumpGossipMessage(const GOSSIP_Message& msg);
+
+  std::string flagsToString(GOSSIP_Message::GOSSIP_flags_t flags);
+
   // returns the boycott tracker. Used to be able to mock it out in tests
   virtual BoycottTracker& getBoycottTracker() {
     return boycott_tracker_;
   }
+
+  // Reads this node's RSM and NCM versions from Processor
+  virtual void fetchVersions(RsmVersionType type);
+
+  // RSMs for which we need to distribute the versions in the cluster
+  std::vector<logid_t> registered_rsms_;
+  // keeps track of when RSM version information should be sent along with
+  // the GOSSIP_Message
+  uint32_t skip_sending_versions_{0};
+  RsmVersionType rsm_version_type_to_send_{RsmVersionType::IN_MEMORY};
 
   // these helper functions are overridden in unit tests
   virtual std::shared_ptr<const configuration::nodes::NodesConfiguration>
@@ -457,39 +609,15 @@ class FailureDetector {
   virtual ClusterState* getClusterState() const;
   virtual int sendGossipMessage(NodeID, std::unique_ptr<GOSSIP_Message>);
 
-  void broadcastWrapper(GOSSIP_Message::GOSSIP_flags_t flags);
+  // checks whether gossip sender is aware of HM. If not, node status updates
+  // from this sender should not be propagated.
+  bool senderUsingHealthMonitor(node_index_t sender_idx,
+                                GOSSIP_Message::node_list_t node_list);
 
-  bool broadcasted_i_am_starting{false};
+  virtual void resetServerSocketConnectThrottle(node_index_t);
 
-  // Notify all cluster nodes that this node just came up.
-  // This is a best-effort message and sent at most twice:
-  // 1) once when FailureDetector starts;
-  // 2) once more if LogsConfig gets fully loaded afterwards.
-  // gossip_list and failover_list are not included.
-  // All further messages will be sent every 'gossip-interval'
-  // milli-seconds via gossip().
-  void broadcastBringup() {
-    startSuspectTimer();
-    bool am_i_starting = !isLogsConfigLoaded();
-    broadcastWrapper(
-        GOSSIP_Message::NODE_BRINGUP_FLAG |
-        (am_i_starting ? 0 : GOSSIP_Message::STARTING_STATE_FINISHED));
-    broadcasted_i_am_starting = am_i_starting;
-  }
+  virtual int checkServerConnection(node_index_t);
 
-  void broadcastSuspectDurationFinished() {
-    // clubbed with bringup flag for backward compatibility,
-    // so that older code doesn't process this as a regular
-    // gossip message.
-    bool am_i_starting = !isLogsConfigLoaded();
-    broadcastWrapper(
-        GOSSIP_Message::SUSPECT_STATE_FINISHED |
-        GOSSIP_Message::NODE_BRINGUP_FLAG |
-        (am_i_starting ? 0 : GOSSIP_Message::STARTING_STATE_FINISHED));
-    broadcasted_i_am_starting = am_i_starting;
-  }
-
-  virtual Socket* getServerSocket(node_index_t idx);
   virtual StatsHolder* getStats();
 
   friend class MockFailureDetector;

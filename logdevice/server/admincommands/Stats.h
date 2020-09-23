@@ -59,6 +59,17 @@ inline void printStats(const Stats& stats,
                   trafficClasses()[tc].c_str(),
                   val);
     }
+    // Per-monitoring-tag stats.
+    void statWithTag(const std::string& name,
+                     const std::string& tag,
+                     int64_t val) override {
+      out_.printf("STAT %s%s.%s %" PRId64 "\r\n",
+                  keyPrefix_,
+                  name.c_str(),
+                  tag.c_str(),
+                  val);
+    }
+
     // Per-flow-group stats.
     void stat(const std::string& name,
               NodeLocationScope flow_group,
@@ -139,6 +150,9 @@ inline void printStats(const Stats& stats,
     void histogram(const std::string& /*name*/,
                    shard_index_t /*shard*/,
                    const HistogramInterface& /*hist*/) override {}
+    void histogramWithTag(const std::string& /*name*/,
+                          const std::string& /*tag*/,
+                          const HistogramInterface& /*hist*/) override {}
 
    private:
     folly::io::Appender& out_;

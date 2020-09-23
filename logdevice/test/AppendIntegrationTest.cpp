@@ -53,19 +53,17 @@ TEST_F(AppendIntegrationTest, AppendRequestEcho) {
 
                         make_test_plugin_registry());
 
-  char data[128]; // send the contents of this array as payload
-
-  std::unique_ptr<AppendRequest> appendrq(
-      new AppendRequest(nullptr,
-                        logid_t(1),
-                        AppendAttributes(),
-                        Payload(data, sizeof(data)),
-                        std::chrono::milliseconds::max(),
-                        [&reply_sem](Status st, const DataRecord& r) {
-                          EXPECT_EQ(E::OK, st);
-                          EXPECT_EQ(esn_t(1), lsn_to_esn(r.attrs.lsn));
-                          reply_sem.post();
-                        }));
+  auto appendrq = std::make_unique<AppendRequest>(
+      nullptr,
+      logid_t(1),
+      AppendAttributes(),
+      PayloadHolder::copyString(std::string(128, '.')),
+      std::chrono::milliseconds::max(),
+      [&reply_sem](Status st, const DataRecord& r) {
+        EXPECT_EQ(E::OK, st);
+        EXPECT_EQ(esn_t(1), lsn_to_esn(r.attrs.lsn));
+        reply_sem.post();
+      });
 
   appendrq->bypassWriteTokenCheck();
   std::unique_ptr<Request> rq(std::move(appendrq));
@@ -251,9 +249,8 @@ TEST_F(AppendIntegrationTest, AbortCorruptedSequencers) {
   cluster_factory.useHashBasedSequencerAssignment(
       /*gossip_interval_ms=*/20, "10s");
   cluster_factory.setParam("--rocksdb-verify-checksum-during-store", "true");
-  logsconfig::LogAttributes log_attrs =
-      cluster_factory.createDefaultLogAttributes(NUM_NODES);
-  log_attrs.set_replicationFactor(REPLICATION_FACTOR);
+  auto log_attrs = cluster_factory.createDefaultLogAttributes(NUM_NODES)
+                       .with_replicationFactor(REPLICATION_FACTOR);
   cluster_factory.setLogAttributes(log_attrs);
   auto cluster = cluster_factory.create(NUM_NODES);
 
@@ -378,9 +375,8 @@ TEST_F(AppendIntegrationTest, GraylistCorruptedStorageNodes) {
   cluster_factory.setParam("--enable-adaptive-store-timeout", "false");
   cluster_factory.setParam("--gray-list-threshold", "0.6");
   cluster_factory.useHashBasedSequencerAssignment(/*gossip_interval_ms=*/20);
-  logsconfig::LogAttributes log_attrs =
-      cluster_factory.createDefaultLogAttributes(NUM_NODES);
-  log_attrs.set_replicationFactor(REPLICATION_FACTOR);
+  auto log_attrs = cluster_factory.createDefaultLogAttributes(NUM_NODES)
+                       .with_replicationFactor(REPLICATION_FACTOR);
   cluster_factory.setLogAttributes(log_attrs);
   auto cluster = cluster_factory.create(NUM_NODES);
 
@@ -505,25 +501,14 @@ TEST_F(AppendIntegrationTest, NoSequencer) {
   std::shared_ptr<configuration::LocalLogsConfig> logs_config =
       checked_downcast<std::unique_ptr<configuration::LocalLogsConfig>>(
           cluster_config->localLogsConfig()->copy());
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
+  auto log_attrs = logsconfig::LogAttributes().with_replicationFactor(3);
   logs_config->insert(EXTRA_LOG_ID.val_, "test_log_log", log_attrs);
 
-  auto client_config = std::make_shared<UpdateableConfig>();
-  client_config->updateableServerConfig()->update(
-      cluster_config->serverConfig());
-  client_config->updateableLogsConfig()->update(logs_config);
-  auto plugin_registry =
-      std::make_shared<PluginRegistry>(getClientPluginProviders());
-  std::shared_ptr<Client> client = std::make_shared<ClientImpl>(
-      client_config->get()->serverConfig()->getClusterName(),
-      client_config,
-      "",
-      "",
-      this->testTimeout(),
-      std::unique_ptr<ClientSettings>(),
-      plugin_registry);
-  ASSERT_TRUE((bool)client);
+  std::shared_ptr<Client> client = cluster->createClient();
+  ClientImpl* client_impl = static_cast<ClientImpl*>(client.get());
+  ld_check(client_impl);
+  client_impl->getConfig()->updateableLogsConfig()->update(
+      std::move(logs_config));
 
   // make an appendSync() call for the new log. Expect "no sequencer for log"
   char data[20];
@@ -552,13 +537,14 @@ TEST_F(AppendIntegrationTest, LogIdNotInServerConfig) {
   std::shared_ptr<configuration::LocalLogsConfig> logs_config =
       checked_downcast<std::unique_ptr<configuration::LocalLogsConfig>>(
           cluster_config->localLogsConfig()->copy());
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
+  auto log_attrs = logsconfig::LogAttributes().with_replicationFactor(3);
   logs_config->insert(EXTRA_LOG_ID.val_, "test_log_log", log_attrs);
 
   auto client_config = std::make_shared<UpdateableConfig>();
   client_config->updateableServerConfig()->update(
       cluster_config->serverConfig());
+  client_config->updateableNodesConfiguration()->update(
+      cluster_config->getNodesConfiguration());
   client_config->updateableLogsConfig()->update(logs_config);
   auto plugin_registry =
       std::make_shared<PluginRegistry>(getClientPluginProviders());
@@ -590,7 +576,9 @@ TEST_F(AppendIntegrationTest, LogIdNotInServerConfig) {
  * either success or (more likely) E::TIMEDOUT.
  */
 TEST_F(AppendIntegrationTest, AppendTimeout) {
-  auto cluster = IntegrationTestUtils::ClusterFactory().create(1);
+  // One node would have been enough in here for this test, but we added another
+  // one for the client to able the nodes config.
+  auto cluster = IntegrationTestUtils::ClusterFactory().create(2);
 
   cluster->getSequencerNode().suspend();
 
@@ -653,21 +641,20 @@ TEST_F(AppendIntegrationTest, ThreadMapping) {
 
                         make_test_plugin_registry());
 
-  const std::string payload = "foo";
   auto append = [&](logid_t log_id) -> std::thread::id {
     Semaphore sem;
     std::thread::id thread_id;
 
-    std::unique_ptr<AppendRequest> appendrq(
-        new AppendRequest(nullptr,
-                          log_id,
-                          AppendAttributes(),
-                          Payload(payload.data(), payload.size()),
-                          std::chrono::milliseconds::max(),
-                          [&](Status /*st*/, const DataRecord& /*r*/) {
-                            thread_id = std::this_thread::get_id();
-                            sem.post();
-                          }));
+    auto appendrq = std::make_unique<AppendRequest>(
+        nullptr,
+        log_id,
+        AppendAttributes(),
+        PayloadHolder::copyString("foo"),
+        std::chrono::milliseconds::max(),
+        [&](Status /*st*/, const DataRecord& /*r*/) {
+          thread_id = std::this_thread::get_id();
+          sem.post();
+        });
     appendrq->bypassWriteTokenCheck();
     std::unique_ptr<Request> rq(std::move(appendrq));
     EXPECT_EQ(0, processor->postRequest(rq));
@@ -723,9 +710,7 @@ TEST_F(AppendIntegrationTest, InternalLogAppendersMemoryLimitTest) {
                      .useHashBasedSequencerAssignment()
                      .create(nodes);
 
-  for (const auto& it : cluster->getNodes()) {
-    it.second->waitUntilAvailable();
-  }
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
 
   auto client = cluster->createClient();
   const logid_t LOG_ID(1);
@@ -856,16 +841,14 @@ TEST_F(AppendIntegrationTest, WriteAfterReplace) {
   std::shared_ptr<Client> client = cluster->createClient();
 
   // We expect this to be a 1 seqencer + 1 storage node setup
-  ld_check(cluster->getConfig()
-               ->get()
-               ->serverConfig()
-               ->getNode(0)
-               ->isSequencingEnabled());
-  ld_check(cluster->getConfig()
-               ->get()
-               ->serverConfig()
-               ->getNode(1)
-               ->isReadableStorageNode());
+  EXPECT_TRUE(cluster->getConfig()
+                  ->getNodesConfiguration()
+                  ->getSequencerMembership()
+                  ->isSequencingEnabled(0));
+  EXPECT_TRUE(cluster->getConfig()
+                  ->getNodesConfiguration()
+                  ->getStorageMembership()
+                  ->hasShardShouldReadFrom(1));
 
   const logid_t LOG_ID(1);
   Payload payload("123", 3);
@@ -882,9 +865,9 @@ TEST_F(AppendIntegrationTest, WriteAfterReplace) {
 TEST_F(AppendIntegrationTest, WriteToken) {
   const logid_t LOG_ID(1);
 
-  logsconfig::LogAttributes log_attrs =
-      IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(1);
-  log_attrs.set_writeToken(std::string("hunter2"));
+  auto log_attrs =
+      IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(1)
+          .with_writeToken(std::string("hunter2"));
 
   auto cluster =
       IntegrationTestUtils::ClusterFactory().setLogAttributes(log_attrs).create(
@@ -987,7 +970,7 @@ TEST_F(AppendIntegrationTest, WriteLsnAfterTrimPoint) {
 
     cmd = folly::sformat(
         "info record {} {} {} --json  --table", 2, old_lsn, old_lsn);
-    response = cluster->getNode(0).sendCommand(cmd, false);
+    response = cluster->getNode(0).sendCommand(cmd);
     auto json = folly::parseJson(response);
     // sanity check (this is a dict with rows and headers keys)
     EXPECT_EQ(2, json.size());
@@ -1025,7 +1008,7 @@ TEST_F(AppendIntegrationTest, WriteLsnAfterTrimPoint) {
 
   // double check with admin command that the record wasn't written to RocksDB
   cmd = folly::sformat("info record {} {} {}", 2, new_lsn, new_lsn);
-  response = cluster->getNode(0).sendCommand(cmd, false);
+  response = cluster->getNode(0).sendCommand(cmd);
   EXPECT_TRUE(response.empty());
 
   // we shouldn't be able to read anything back (everything is trimmed)
@@ -1079,9 +1062,9 @@ static void AppendIntegrationTest_Stats_impl(bool sequencer_batching_on) {
   const int NAPPENDS = 5000;
   const int PAYLOAD_SIZE = 300;
   const int NTHREADS = 16;
-  logsconfig::LogAttributes log_attrs =
-      IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(1);
-  log_attrs.set_maxWritesInFlight(2);
+  auto log_attrs =
+      IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(1)
+          .with_maxWritesInFlight(2);
   auto factory = IntegrationTestUtils::ClusterFactory()
                      .doPreProvisionEpochMetaData()
                      .enableMessageErrorInjection()
@@ -1117,4 +1100,101 @@ TEST_F(AppendIntegrationTest, Stats) {
 
 TEST_F(AppendIntegrationTest, StatsWithSequencerBatching) {
   AppendIntegrationTest_Stats_impl(true);
+}
+
+TEST_F(AppendIntegrationTest, AppendOversizedPayloadGroup) {
+  const logid_t logid{1};
+
+  auto cluster = IntegrationTestUtils::ClusterFactory().create(1);
+  // Make sure that sequencer won't reactivate.
+  cluster->waitForMetaDataLogWrites();
+
+  std::shared_ptr<Client> client = cluster->createClient();
+  ASSERT_NE(client, nullptr);
+
+  // Construct payload, which exceeds limit (here payload group encoding
+  // overhead makes it oversized)
+  std::string data(client->getMaxPayloadSize(), 'a');
+  PayloadGroup payload_group(
+      {{1, folly::IOBuf::wrapBufferAsValue(data.data(), data.size())}});
+
+  int rv;
+  rv = client->append(logid,
+                      std::move(payload_group),
+                      [&](Status, const DataRecord&) { ADD_FAILURE(); });
+  EXPECT_NE(0, rv);
+  // payload_group should not be moved-out
+  EXPECT_FALSE(payload_group.empty());
+}
+
+TEST_F(AppendIntegrationTest, AppendPayloadGroup) {
+  const logid_t logid{1};
+
+  auto cluster = IntegrationTestUtils::ClusterFactory().create(1);
+  // Make sure that sequencer won't reactivate.
+  cluster->waitForMetaDataLogWrites();
+
+  std::shared_ptr<Client> client = cluster->createClient();
+  ASSERT_NE(client, nullptr);
+
+  const std::string data1 = "payload";
+  const std::string data2 = data1 + data1;
+  const PayloadKey key1 = 0;
+  const PayloadKey key2 = 11;
+  PayloadGroup payload_group(
+      {{key1, folly::IOBuf::wrapBufferAsValue(data1.data(), data1.size())},
+       {key2, folly::IOBuf::wrapBufferAsValue(data2.data(), data2.size())}});
+
+  Semaphore async_append_sem;
+
+  // Write payload group using async and sync APIs, which should succeed
+  int rv;
+  rv = client->append(
+      logid, folly::copy(payload_group), [&](Status st, const DataRecord& r) {
+        if (st != E::OK) {
+          ld_error("Async append failed with status %s", error_description(st));
+        }
+        EXPECT_EQ(E::OK, st);
+        EXPECT_EQ(logid, r.logid);
+        EXPECT_NE(LSN_INVALID, r.attrs.lsn);
+        // Original payload should be preserved in the record
+        EXPECT_EQ(r.payloads.size(), payload_group.size());
+        EXPECT_EQ(data1.size(), r.payloads.at(key1).computeChainDataLength());
+        EXPECT_EQ(data2.size(), r.payloads.at(key2).computeChainDataLength());
+        // r.payload should be an alias to r.payloads[0]
+        EXPECT_EQ(data1, r.payload.toString());
+
+        async_append_sem.post();
+      });
+  EXPECT_EQ(0, rv);
+
+  lsn_t lsn;
+  lsn = client->appendSync(logid, folly::copy(payload_group));
+  EXPECT_NE(LSN_INVALID, lsn);
+
+  async_append_sem.wait();
+
+  // Suspend sequencer and check how appends fail
+  client->setTimeout(std::chrono::milliseconds(100));
+  cluster->getSequencerNode().suspend();
+
+  rv = client->append(
+      logid, folly::copy(payload_group), [&](Status st, const DataRecord& r) {
+        EXPECT_EQ(E::TIMEDOUT, st);
+        EXPECT_EQ(logid, r.logid);
+        EXPECT_EQ(LSN_INVALID, r.attrs.lsn);
+        // Original payload should be preserved in the record
+        EXPECT_EQ(r.payloads.size(), payload_group.size());
+        EXPECT_EQ(data1.size(), r.payloads.at(key1).computeChainDataLength());
+        EXPECT_EQ(data2.size(), r.payloads.at(key2).computeChainDataLength());
+        // r.payload should be an alias to r.payloads[0]
+        EXPECT_EQ(data1, r.payload.toString());
+
+        async_append_sem.post();
+      });
+  EXPECT_EQ(0, rv);
+  async_append_sem.wait();
+
+  lsn = client->appendSync(logid, folly::copy(payload_group));
+  EXPECT_EQ(LSN_INVALID, lsn);
 }

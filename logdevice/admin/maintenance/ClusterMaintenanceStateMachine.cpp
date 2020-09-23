@@ -24,11 +24,39 @@ template class ReplicatedStateMachine<thrift::ClusterMaintenanceState,
 
 namespace facebook { namespace logdevice { namespace maintenance {
 
-using facebook::logdevice::thrift::ClusterMaintenanceState;
+namespace {
+class SettingsUpdatedRequest : public Request {
+ public:
+  explicit SettingsUpdatedRequest(worker_id_t worker_id, WorkerType worker_type)
+      : Request(RequestType::SETTINGS_UPDATED),
+        worker_id_(worker_id),
+        worker_type_(worker_type) {}
+  Request::Execution execute() override {
+    Worker* w = Worker::onThisThread(true);
+    ld_assert(w != nullptr);
+    if (w->cluster_maintenance_state_machine_) {
+      w->cluster_maintenance_state_machine_->onSettingsUpdated();
+    }
+    return Execution::COMPLETE;
+  }
+  int getThreadAffinity(int) override {
+    return worker_id_.val_;
+  }
+  WorkerType getWorkerTypeAffinity() override {
+    return worker_type_;
+  }
+
+ private:
+  worker_id_t worker_id_;
+  WorkerType worker_type_;
+};
+} // namespace
 
 ClusterMaintenanceStateMachine::ClusterMaintenanceStateMachine(
-    UpdateableSettings<AdminServerSettings> settings)
+    UpdateableSettings<AdminServerSettings> settings,
+    std::unique_ptr<RSMSnapshotStore> snapshot_store)
     : Base(RSMType::MAINTENANCE_LOG_STATE_MACHINE,
+           std::move(snapshot_store),
            configuration::InternalLogs::MAINTENANCE_LOG_DELTAS,
            settings->maintenance_log_snapshotting
                ? configuration::InternalLogs::MAINTENANCE_LOG_SNAPSHOTS
@@ -42,13 +70,46 @@ ClusterMaintenanceStateMachine::ClusterMaintenanceStateMachine(
 }
 
 void ClusterMaintenanceStateMachine::start() {
+  Worker* w = Worker::onThisThread(true);
+  ld_assert(w != nullptr);
+  auto idx = w->idx_;
+  auto* processor = w->processor_;
+  auto rsm_type = rsm_type_;
+  auto worker_type =
+      maintenance::ClusterMaintenanceStateMachine::workerType(w->processor_);
+
+  auto settingsUpdateCallback = [processor, idx, worker_type, rsm_type]() {
+    std::unique_ptr<Request> request =
+        std::make_unique<SettingsUpdatedRequest>(idx, worker_type);
+
+    int rv = processor->postWithRetrying(request);
+
+    if (rv != 0) {
+      rsm_error(rsm_type,
+                "error processing settings update on worker #%d: "
+                "postWithRetrying() failed with status %s",
+                idx.val_,
+                error_description(err));
+    }
+  };
+  // Subscribe to settings update
+  updateable_settings_subscription_ =
+      settings_.raw()->subscribeToUpdates(settingsUpdateCallback);
+  blockStateDelivery(settings_->block_maintenance_rsm);
   Base::start();
+}
+
+void ClusterMaintenanceStateMachine::onSettingsUpdated() {
+  blockStateDelivery(settings_->block_maintenance_rsm);
 }
 
 void ClusterMaintenanceStateMachine::onUpdate(
     const ClusterMaintenanceState& state,
     const MaintenanceDelta* /* unused */,
     lsn_t version) {
+  rsm_info(rsm_type_,
+           "Published new ClusterMaintenanceState version (%lu)",
+           getVersion());
   is_fully_loaded_ = true;
   // When using snapshotting, We create a snapshot when the delta log
   // grows too big.
@@ -225,6 +286,14 @@ Request::Execution StartClusterMaintenanceStateMachineRequest::execute() {
   ld_check(sm_);
   w->setClusterMaintenanceStateMachine(sm_);
   sm_->start();
+  return Request::Execution::COMPLETE;
+}
+
+Request::Execution StopClusterMaintenanceStateMachineRequest::execute() {
+  Worker* w = Worker::onThisThread();
+  if (w->cluster_maintenance_state_machine_) {
+    w->cluster_maintenance_state_machine_->stop();
+  }
   return Request::Execution::COMPLETE;
 }
 

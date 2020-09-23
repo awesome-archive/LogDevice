@@ -11,7 +11,6 @@
 
 #include "logdevice/common/AdminCommandTable.h"
 #include "logdevice/common/Processor.h"
-#include "logdevice/common/Socket.h"
 #include "logdevice/common/request_util.h"
 #include "logdevice/server/admincommands/AdminCommand.h"
 
@@ -44,15 +43,17 @@ class InfoSockets : public AdminCommand {
                            "Write (MB)",
                            "Read-cnt",
                            "Write-cnt",
+                           "Bytes per second",
+                           "RWND Limited pct",
+                           "SNDBUF Limited pct",
                            "Proto",
                            "Sendbuf",
-                           "Peer Config Version",
                            "Is ssl",
                            "FD");
 
     auto tables = run_on_all_workers(server_->getProcessor(), [&]() {
       InfoSocketsTable t(table);
-      getSocketsDebugInfo(Worker::onThisThread()->sender(), t);
+      Worker::onThisThread()->sender().fillDebugInfo(t);
       return t;
     });
 
@@ -61,12 +62,6 @@ class InfoSockets : public AdminCommand {
     }
 
     json_ ? table.printJson(out_) : table.print(out_);
-  }
-
- private:
-  void getSocketsDebugInfo(Sender& sender, InfoSocketsTable& table) {
-    sender.forEachSocket(
-        [&table](const Socket& socket) { socket.getDebugInfo(table); });
   }
 };
 

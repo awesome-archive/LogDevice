@@ -20,7 +20,6 @@
 #include "logdevice/common/MetaDataLogWriter.h"
 #include "logdevice/common/NoopTraceLogger.h"
 #include "logdevice/common/Processor.h"
-#include "logdevice/common/Sender.h"
 #include "logdevice/common/Timer.h"
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/configuration/UpdateableConfig.h"
@@ -28,6 +27,7 @@
 #include "logdevice/common/request_util.h"
 #include "logdevice/common/settings/Settings.h"
 #include "logdevice/common/stats/Stats.h"
+#include "logdevice/common/test/SenderTestProxy.h"
 #include "logdevice/common/test/TestUtil.h"
 
 using namespace facebook::logdevice;
@@ -55,7 +55,7 @@ class SequencerTest : public ::testing::Test {
   std::shared_ptr<Processor> processor_;
   std::shared_ptr<Sequencer> sequencer_;
 
-  bool with_processor_{false};
+  bool with_processor_{true};
   std::atomic<epoch_t::raw_type> draining_timer_epoch_{EPOCH_INVALID.val_};
 
   std::mutex mutex_;
@@ -102,8 +102,6 @@ class SequencerTest : public ::testing::Test {
     TailRecordHeader::flags_t flags =
         (include_payload ? TailRecordHeader::HAS_PAYLOAD : 0);
     flags |= TailRecordHeader::CHECKSUM_PARITY;
-    void* payload_flat = malloc(20);
-    std::strncpy((char*)payload_flat, "Tail Record Test.", 20);
     return TailRecord(
         TailRecordHeader{
             LOG_ID,
@@ -113,8 +111,9 @@ class SequencerTest : public ::testing::Test {
             flags,
             {}},
         OffsetMap({{BYTE_OFFSET, tail_lsn}}),
-        include_payload ? std::make_shared<PayloadHolder>(payload_flat, 20)
-                        : nullptr);
+        include_payload ? PayloadHolder::copyString(
+                              std::string("Tail Record Test.\0\0\0", 20))
+                        : PayloadHolder());
   }
 
   std::shared_ptr<Configuration> getConfig() const {
@@ -126,9 +125,14 @@ class SequencerTest : public ::testing::Test {
     return updateable_config_->getNodesConfiguration();
   }
 
-  ActivateResult completeActivation(int epoch) {
-    return sequencer_->completeActivationWithMetaData(
-        epoch_t(epoch), getConfig(), genMetaData(epoch_t(epoch)));
+  ActivateResult
+  completeActivation(int epoch, folly::Optional<epoch_t> since = folly::none) {
+    auto func = [&]() {
+      return sequencer_->completeActivationWithMetaData(
+          epoch_t(epoch), getConfig(), genMetaData(epoch_t(epoch), since));
+    };
+    bool on_worker = Worker::onThisThread(/*enforce*/ false) != nullptr;
+    return on_worker ? func() : run_on_worker(processor_.get(), 0, func);
   }
 
   void drainingTimerExpired(epoch_t draining_epoch) {
@@ -137,13 +141,13 @@ class SequencerTest : public ::testing::Test {
   }
 
   void checkHistoricalMetaDataRequestEpoch(epoch_t epoch) {
-    ASSERT_TRUE(request_epoch_reading_metadata_.hasValue());
+    ASSERT_TRUE(request_epoch_reading_metadata_.has_value());
     ASSERT_EQ(epoch, request_epoch_reading_metadata_.value());
-    request_epoch_reading_metadata_.clear();
+    request_epoch_reading_metadata_.reset();
   }
 
   void noHistoricalMetaDataRequested() {
-    ASSERT_FALSE(request_epoch_reading_metadata_.hasValue());
+    ASSERT_FALSE(request_epoch_reading_metadata_.has_value());
   }
 
   void removeLogFromConfig();
@@ -202,7 +206,7 @@ class MockAppender : public Appender {
             /* append_request_id= */ request_id_t(0),
             STORE_flags_t(0),
             test->LOG_ID,
-            PayloadHolder(MockAppender::dummyPayload, PayloadHolder::UNOWNED),
+            PayloadHolder::copyString("payload"),
             epoch_t(0),
             size),
         test_(test) {}
@@ -233,7 +237,6 @@ class MockAppender : public Appender {
 
   void onReaped() override {
     epoch_t last_released_epoch;
-    bool lng_changed;
     MockEpochSequencer* mseq =
         dynamic_cast<MockEpochSequencer*>(epoch_sequencer_.get());
     mseq->noteAppenderReaped(
@@ -249,13 +252,11 @@ class MockAppender : public Appender {
                 TailRecordHeader::OFFSET_WITHIN_EPOCH,
                 {}},
             OffsetMap::fromLegacy(0),
-            std::shared_ptr<PayloadHolder>()),
-        &last_released_epoch,
-        &lng_changed);
+            PayloadHolder()),
+        &last_released_epoch);
   }
 
  private:
-  static Payload dummyPayload;
   std::shared_ptr<EpochSequencer> epoch_sequencer_;
   SequencerTest* const test_;
   lsn_t lsn_{LSN_INVALID};
@@ -267,13 +268,13 @@ class MockSequencer : public Sequencer {
       : Sequencer(test->LOG_ID, test->updateable_settings_, &test->stats_),
         test_(test) {}
 
-  ~MockSequencer() override {}
+  ~MockSequencer() override {
+    shutdown();
+  }
 
   std::shared_ptr<const configuration::nodes::NodesConfiguration>
   getNodesConfiguration() const override {
-    return test_->getConfig()
-        ->serverConfig()
-        ->getNodesConfigurationFromServerConfigSource();
+    return test_->getConfig()->getNodesConfiguration();
   }
 
   void startGetTrimPointRequest() override {}
@@ -323,7 +324,6 @@ class MockSequencer : public Sequencer {
 };
 
 constexpr logid_t SequencerTest::LOG_ID;
-Payload MockAppender::dummyPayload("payload", 8);
 
 void MockEpochSequencer::retireAppenders(esn_t start, esn_t end, bool abort) {
   ASSERT_LE(start, end);
@@ -367,7 +367,13 @@ MockEpochSequencer* SequencerTest::getCurrentEpochSequencer() {
 void SequencerTest::setUp() {
   dbg::currentLevel = log_level_;
   auto config = std::make_shared<UpdateableConfig>(
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("sequencer_test.conf")));
+      Configuration::fromJsonFile(TEST_CONFIG_FILE("sequencer_test.conf"))
+          ->withNodesConfiguration(createSimpleNodesConfig(1)));
+
+  // TODO the following 2 settings are required to make the NCPublisher pick
+  // the NCM NodesConfiguration. Should be removed when NCM is the default.
+  settings_.enable_nodes_configuration_manager = true;
+  settings_.use_nodes_configuration_manager_nodes_configuration = true;
 
   // turn on byte offsets
   settings_.byte_offsets = true;
@@ -1098,11 +1104,10 @@ TEST_F(SequencerTest, HistoricalMetadataRequest) {
   setUp();
   ASSERT_EQ(Sequencer::State::UNAVAILABLE, sequencer_->getState());
   sequencer_->startActivation([this](logid_t) { return getMetaData(); });
-  sequencer_->completeActivationWithMetaData(
-      epoch_t(5), getConfig(), genMetaData(epoch_t(5), epoch_t(3)));
+  completeActivation(5, epoch_t(3));
   checkHistoricalMetaDataRequestEpoch(epoch_t(5));
   bool rv = sequencer_->onHistoricalMetaData(
-      E::OK, epoch_t(5), genMetaDataMap({1, 2}));
+      E::OK, epoch_t(5), genMetaDataMap({1, 2}), {});
   // retry not needed
   ASSERT_FALSE(rv);
   auto expected_map = genEpochMetaDataMap({1, 2, 3}, epoch_t(5));
@@ -1115,8 +1120,7 @@ TEST_F(SequencerTest, HistoricalMetadataSinceOne) {
   ASSERT_EQ(Sequencer::State::UNAVAILABLE, sequencer_->getState());
   sequencer_->startActivation([this](logid_t) { return getMetaData(); });
   // got epoch 5 metadata effective since 1
-  sequencer_->completeActivationWithMetaData(
-      epoch_t(5), getConfig(), genMetaData(epoch_t(5), EPOCH_MIN));
+  completeActivation(5, EPOCH_MIN);
   noHistoricalMetaDataRequested();
 }
 
@@ -1125,24 +1129,21 @@ TEST_F(SequencerTest, HistoricalMetadataRequest2) {
   settings_.reactivation_limit = RATE_UNLIMITED;
   setUp();
   sequencer_->startActivation([this](logid_t) { return getMetaData(); });
-  sequencer_->completeActivationWithMetaData(
-      epoch_t(5), getConfig(), genMetaData(epoch_t(5), epoch_t(3)));
+  completeActivation(5, epoch_t(3));
   checkHistoricalMetaDataRequestEpoch(epoch_t(5));
   bool rv = sequencer_->onHistoricalMetaData(
-      E::OK, epoch_t(5), genMetaDataMap({1, 2}));
+      E::OK, epoch_t(5), genMetaDataMap({1, 2}), {});
   // retry not needed
   ASSERT_FALSE(rv);
   // sequencer activates with the same metadata in epoch 10
   sequencer_->startActivation([this](logid_t) { return getMetaData(); });
-  sequencer_->completeActivationWithMetaData(
-      epoch_t(10), getConfig(), genMetaData(epoch_t(10), epoch_t(3)));
+  completeActivation(10, epoch_t(3));
   noHistoricalMetaDataRequested();
   auto expected_map = genEpochMetaDataMap({1, 2, 3}, epoch_t(10));
   ASSERT_EQ(*expected_map, *sequencer_->getMetaDataMap());
   // sequencer activates to epoch 15 with a new metadata with effective since 11
   sequencer_->startActivation([this](logid_t) { return getMetaData(); });
-  sequencer_->completeActivationWithMetaData(
-      epoch_t(15), getConfig(), genMetaData(epoch_t(15), epoch_t(11)));
+  completeActivation(15, epoch_t(11));
   noHistoricalMetaDataRequested();
   expected_map = genEpochMetaDataMap({1, 2, 3, 11}, epoch_t(15));
   ASSERT_EQ(*expected_map, *sequencer_->getMetaDataMap());

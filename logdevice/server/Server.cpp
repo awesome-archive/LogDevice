@@ -7,18 +7,21 @@
  */
 #include "logdevice/server/Server.h"
 
+#include <folly/MapUtil.h>
 #include <folly/io/async/EventBaseThread.h>
+#include <thrift/lib/cpp/util/EnumUtils.h>
 
-#include "logdevice/admin/SimpleAdminServer.h"
+#include "logdevice/admin/AdminAPIHandler.h"
 #include "logdevice/admin/maintenance/ClusterMaintenanceStateMachine.h"
+#include "logdevice/admin/maintenance/MaintenanceManager.h"
+#include "logdevice/admin/settings/AdminServerSettings.h"
 #include "logdevice/common/ConfigInit.h"
+#include "logdevice/common/ConnectionKind.h"
 #include "logdevice/common/ConstructorFailed.h"
 #include "logdevice/common/CopySetManager.h"
 #include "logdevice/common/EpochMetaDataUpdater.h"
-#include "logdevice/common/FileEpochStore.h"
 #include "logdevice/common/MetaDataLogWriter.h"
 #include "logdevice/common/NodesConfigurationInit.h"
-#include "logdevice/common/NodesConfigurationPublisher.h"
 #include "logdevice/common/NoopTraceLogger.h"
 #include "logdevice/common/SequencerLocator.h"
 #include "logdevice/common/SequencerPlacement.h"
@@ -38,8 +41,8 @@
 #include "logdevice/common/debug.h"
 #include "logdevice/common/event_log/EventLogStateMachine.h"
 #include "logdevice/common/nodeset_selection/NodeSetSelectorFactory.h"
-#include "logdevice/common/plugin/AdminServerFactory.h"
 #include "logdevice/common/plugin/BuiltinZookeeperClientFactory.h"
+#include "logdevice/common/plugin/ThriftServerFactory.h"
 #include "logdevice/common/plugin/TraceLoggerFactory.h"
 #include "logdevice/common/settings/SSLSettingValidation.h"
 #include "logdevice/common/settings/SettingsUpdater.h"
@@ -50,24 +53,28 @@
 #include "logdevice/server/LogStoreMonitor.h"
 #include "logdevice/server/MyNodeIDFinder.h"
 #include "logdevice/server/NodeRegistrationHandler.h"
-#include "logdevice/server/RebuildingCoordinator.h"
-#include "logdevice/server/RebuildingSupervisor.h"
+#include "logdevice/server/RsmServerSnapshotStoreFactory.h"
 #include "logdevice/server/ServerProcessor.h"
 #include "logdevice/server/UnreleasedRecordDetector.h"
-#include "logdevice/server/ZookeeperEpochStore.h"
+#include "logdevice/server/epoch_store/FileEpochStore.h"
+#include "logdevice/server/epoch_store/ZookeeperEpochStore.h"
 #include "logdevice/server/fatalsignal.h"
 #include "logdevice/server/locallogstore/ClusterMarkerChecker.h"
+#include "logdevice/server/locallogstore/RocksDBMetricsExport.h"
 #include "logdevice/server/locallogstore/ShardedRocksDBLocalLogStore.h"
+#include "logdevice/server/rebuilding/RebuildingCoordinator.h"
+#include "logdevice/server/rebuilding/RebuildingSupervisor.h"
 #include "logdevice/server/shutdown.h"
 #include "logdevice/server/storage_tasks/RecordCacheRepopulationTask.h"
 #include "logdevice/server/storage_tasks/ShardedStorageThreadPool.h"
+#include "logdevice/server/thrift/SimpleThriftServer.h"
+#include "logdevice/server/thrift/api/LogDeviceAPIThriftHandler.h"
 #include "logdevice/server/util.h"
 
+using namespace facebook::logdevice::configuration::nodes;
 using facebook::logdevice::configuration::LocalLogsConfig;
 
 namespace facebook { namespace logdevice {
-
-using namespace facebook::logdevice::configuration::nodes;
 
 static StatsHolder* errorStats = nullptr;
 
@@ -93,57 +100,82 @@ static void bumpErrorCounter(dbg::Level level) {
   ld_check(false);
 }
 
-bool ServerParameters::shutdownIfMyNodeIdChanged(
+static ConnectionKind
+priorityToConnectionKind(NodeServiceDiscovery::ClientNetworkPriority priority) {
+  using Priority = NodeServiceDiscovery::ClientNetworkPriority;
+  switch (priority) {
+    case Priority::LOW:
+      return ConnectionKind::DATA_LOW_PRIORITY;
+    case Priority::MEDIUM:
+      return ConnectionKind::DATA;
+    case Priority::HIGH:
+      return ConnectionKind::DATA_HIGH_PRIORITY;
+  }
+  folly::assume_unreachable();
+}
+
+bool ServerParameters::shutdownIfMyNodeInfoChanged(
     const NodesConfiguration& config) {
   if (!my_node_id_.has_value()) {
     return true;
   }
-  if (!isSameMyNodeID(config)) {
-    // If some other node took over our NodeID let's shutdown gracefully.
-    // TODO: Assert same service discovery attributes as well
-    ld_critical("MyNodeID is not the same anymore. Rejecting config.");
-    if (server_settings_->shutdown_on_my_node_id_mismatch) {
-      ld_critical("--shutdown-on-my-node-id-mismatch is set, gracefully "
-                  "shutting down.");
-      requestStop();
-    }
-    return false;
-  }
-  return true;
-}
 
-bool ServerParameters::isSameMyNodeID(const NodesConfiguration& config) {
-  ld_check(my_node_id_.hasValue());
-
-  ld_check(my_node_id_finder_);
-
-  auto node_id = my_node_id_finder_->calculate(config);
-  if (!node_id.hasValue()) {
-    ld_error("Couldn't find my node index in config.");
-    return false;
-  }
-  if (my_node_id_.value() != node_id.value()) {
-    ld_error("My node ID changed from %s to %s.",
-             my_node_id_->toString().c_str(),
-             node_id->toString().c_str());
-
-    return false;
-  }
-  return true;
-}
-
-bool ServerParameters::updateServerOrigin(ServerConfig& config) {
-  if (!my_node_id_.has_value()) {
+  if (!hasMyNodeInfoChanged(config)) {
     return true;
   }
 
-  // If the config doesn't have a valid ServerOrigin, then we are the source.
-  if (!config.getServerOrigin().isNodeID()) {
-    // Update the server origin of the config to my node ID if it is not
-    // set already
-    config.setServerOrigin(my_node_id_.value());
+  ld_critical("Configuration mismatch detected, rejecting the config.");
+  if (server_settings_->shutdown_on_node_configuration_mismatch) {
+    // Tempporary hack to get a quick exit until we have fencing
+    // support available from WS.
+    if (server_settings_->hard_exit_on_node_configuration_mismatch) {
+      ld_critical(
+          "--shutdown-on-node-configuration-mismatch and "
+          "hard-exit-on-node-configuration-mismatch are set, hard exiting.");
+      _exit(EXIT_FAILURE);
+    }
+    ld_critical("--shutdown-on-node-configuration-mismatch is set, gracefully "
+                "shutting down.");
+    requestStop();
   }
-  return true;
+  return false;
+}
+
+bool ServerParameters::hasMyNodeInfoChanged(const NodesConfiguration& config) {
+  ld_check(my_node_id_.has_value());
+  ld_check(my_node_id_finder_);
+
+  auto node_id = my_node_id_finder_->calculate(config);
+  if (!node_id.has_value()) {
+    ld_error("Couldn't find my node ID in config.");
+    return true;
+  }
+
+  if (my_node_id_.value() != node_id) {
+    ld_error("My node ID changed from %s to %s.",
+             my_node_id_->toString().c_str(),
+             node_id->toString().c_str());
+    return true;
+  }
+
+  const auto old_service_discovery =
+      updateable_config_->getNodesConfiguration()->getNodeServiceDiscovery(
+          node_id->index());
+  const auto new_service_discovery =
+      config.getNodeServiceDiscovery(node_id->index());
+
+  ld_check(old_service_discovery);
+  ld_check(new_service_discovery);
+
+  if (old_service_discovery->version != new_service_discovery->version) {
+    ld_error("My version changed from %lu to %lu.",
+             old_service_discovery->version,
+             new_service_discovery->version);
+    return true;
+  }
+
+  // No change detected
+  return false;
 }
 
 bool ServerParameters::updateConfigSettings(ServerConfig& config) {
@@ -162,7 +194,7 @@ bool ServerParameters::updateConfigSettings(ServerConfig& config) {
 }
 
 bool ServerParameters::onServerConfigUpdate(ServerConfig& config) {
-  return updateServerOrigin(config) && updateConfigSettings(config);
+  return updateConfigSettings(config);
 }
 
 bool ServerParameters::setConnectionLimits() {
@@ -251,21 +283,44 @@ bool ServerParameters::initMyNodeIDFinder() {
 
 bool ServerParameters::registerAndUpdateNodeInfo(
     std::shared_ptr<NodesConfigurationStore> nodes_configuration_store) {
-  NodeRegistrationHandler handler{*server_settings_.get(),
-                                  *admin_server_settings_.get(),
-                                  updateable_config_->getNodesConfiguration(),
-                                  nodes_configuration_store};
+  NodeRegistrationHandler handler{
+      *server_settings_.get(),
+      *admin_server_settings_.get(),
+      updateable_config_->updateableNodesConfiguration(),
+      nodes_configuration_store};
   // Find our NodeID from the published NodesConfiguration
-  if (auto my_id = my_node_id_finder_->calculate(
-          *updateable_config_->getNodesConfiguration());
-      my_id.hasValue()) {
-    ld_check(my_id->isNodeID());
-    my_node_id_ = std::move(my_id);
+  if (auto my_node_id = my_node_id_finder_->calculate(
+          *updateable_config_->getNodesConfiguration())) {
+    ld_check(my_node_id->isNodeID());
+    // We store our node ID on exiting the scope to avoid being preempted during
+    // self-registration process.
+    SCOPE_EXIT {
+      my_node_id_ = my_node_id;
+    };
 
     if (server_settings_->enable_node_self_registration) {
-      // If self registration is enabled, let's make sure that our attributes
-      // are up to date.
-      Status status = handler.updateSelf(my_node_id_->index());
+      // If self registration is enabled, let's check if our version is correct.
+      const auto service_discovery =
+          updateable_config_->getNodesConfiguration()->getNodeServiceDiscovery(
+              my_node_id->index());
+      ld_check(service_discovery);
+      const auto old_version = service_discovery->version;
+      const auto new_version = server_settings_->version.value_or(old_version);
+      const auto task_handle =
+          folly::get_default(service_discovery->tags, "handle", "");
+      const auto container_handle =
+          folly::get_default(service_discovery->tags, "container", "");
+      if (new_version < old_version) {
+        ld_error("Found the node with the same name but higher version (%lu > "
+                 "%lu) in the config - task handle: %s, container handle: %s",
+                 old_version,
+                 new_version,
+                 task_handle.c_str(),
+                 container_handle.c_str());
+        return false;
+      }
+      // Now let's make sure that our attributes are up to date.
+      Status status = handler.updateSelf(my_node_id->index());
       if (status == Status::OK) {
         ld_info("Successfully updated the NodesConfiguration");
         // Refetch the NodesConfiguration to detect the modification that we
@@ -323,13 +378,17 @@ bool ServerParameters::registerAndUpdateNodeInfo(
       return false;
     }
   }
-  // Let's wait a bit for config propagation to the rest of the cluster so that
-  // they recognize us when we talk to them. It's ok if they don't, that's why
-  // we didn't implement complicated verfication logic in here.
+  // Let's wait a bit for config propagation to the rest of the cluster so
+  // that they recognize us when we talk to them. It's ok if they don't,
+  // that's why we didn't implement complicated verfication logic in here.
   //
-  // TODO(T53579322): Harden the startup of the node to avoid crashing when it's
-  // still unknown to the rest of the cluster
-  /* sleep override */ std::this_thread::sleep_for(std::chrono::seconds(5));
+  // TODO(T53579322): Harden the startup of the node to avoid crashing when
+  // it's still unknown to the rest of the cluster
+
+  /* sleep override */
+  std::this_thread::sleep_for(
+      server_settings_->sleep_secs_after_self_registeration);
+
   return true;
 }
 
@@ -356,7 +415,9 @@ ServerParameters::ServerParameters(
       admin_server_settings_(std::move(admin_server_settings)),
       stop_handler_(std::move(stop_handler)) {
   ld_check(stop_handler_);
+}
 
+void ServerParameters::init() {
   // Note: this won't work well if there are multiple Server instances in the
   // same process: only one of them will get its error counter bumped. Also,
   // there's a data race if the following two lines are run from multiple
@@ -386,7 +447,7 @@ ServerParameters::ServerParameters(
                 std::placeholders::_1)));
   nodes_configuration_hook_handles_.push_back(
       updateable_config_->updateableNodesConfiguration()->addHook(
-          std::bind(&ServerParameters::shutdownIfMyNodeIdChanged,
+          std::bind(&ServerParameters::shutdownIfMyNodeInfoChanged,
                     this,
                     std::placeholders::_1)));
 
@@ -418,22 +479,11 @@ ServerParameters::ServerParameters(
     if (!initNodesConfiguration(nodes_configuration_store)) {
       throw ConstructorFailed();
     }
-    ld_check(updateable_config_->getNodesConfigurationFromNCMSource() !=
-             nullptr);
+    ld_check(updateable_config_->getNodesConfiguration() != nullptr);
   }
 
-  // Publish the NodesConfiguration for the first time and subscribe to
-  // updates in the mean time, until later when the long-lived subscribing
-  // NodesConfigurationPublisher gets created in the Processor.
-  // TODO(T43023435): use an actual TraceLogger to log this initial update.
-  NodesConfigurationPublisher publisher(
-      updateable_config_,
-      processor_settings_,
-      std::make_shared<NoopTraceLogger>(updateable_config_));
-  ld_check(updateable_config_->getNodesConfiguration() != nullptr);
-
-  // Initialize the MyNodeIDFinder that will be used to find our NodeID from the
-  // config.
+  // Initialize the MyNodeIDFinder that will be used to find our NodeID from
+  // the config.
   if (!initMyNodeIDFinder()) {
     ld_error("Failed to construct MyNodeIDFinder");
     throw ConstructorFailed();
@@ -442,7 +492,7 @@ ServerParameters::ServerParameters(
   if (!registerAndUpdateNodeInfo(nodes_configuration_store)) {
     throw ConstructorFailed();
   }
-  ld_check(my_node_id_.hasValue());
+  ld_check(my_node_id_.has_value());
 
   if (updateable_logs_config->get() == nullptr) {
     // Initialize logdevice with an empty LogsConfig that only contains the
@@ -457,10 +507,14 @@ ServerParameters::ServerParameters(
       config->serverConfig()->getInternalLogsConfig());
 
   NodeID node_id = my_node_id_.value();
-  ld_info("My NodeID is %s", node_id.toString().c_str());
+  ld_info("My Node ID is %s", node_id.toString().c_str());
   const auto& nodes_configuration = updateable_config_->getNodesConfiguration();
   ld_check(
       nodes_configuration->isNodeInServiceDiscoveryConfig(node_id.index()));
+
+  ld_info(
+      "My version is %lu",
+      nodes_configuration->getNodeServiceDiscovery(node_id.index())->version);
 
   if (!setConnectionLimits()) {
     throw ConstructorFailed();
@@ -489,15 +543,6 @@ ServerParameters::ServerParameters(
     ld_error("This node is configured as a sequencer, but -S option is "
              "not set");
     throw ConstructorFailed();
-  }
-  if (!server_settings_->audit_log.empty()) {
-    audit_log_ = std::make_shared<LocalLogFile>();
-    if (audit_log_->open(server_settings_->audit_log) < 0) {
-      ld_error("Could not open audit log \"%s\": %s",
-               server_settings_->audit_log.c_str(),
-               strerror(errno));
-      throw ConstructorFailed();
-    };
   }
 
   // This is a hack to update num_logs_configured across all stat objects
@@ -549,9 +594,15 @@ ServerParameters::buildNodesConfigurationStore() {
 
 bool ServerParameters::initNodesConfiguration(
     std::shared_ptr<configuration::nodes::NodesConfigurationStore> store) {
+  // Create an empty NC in the NCS if it doesn't exist already. Most of the
+  // time, this is a single read RTT (because the NC will be there), so it
+  // should be fine to always do it.
+  store->updateConfigSync(
+      NodesConfigurationCodec::serialize(NodesConfiguration()),
+      NodesConfigurationStore::Condition::createIfNotExists());
   NodesConfigurationInit config_init(std::move(store), getProcessorSettings());
   return config_init.initWithoutProcessor(
-      updateable_config_->updateableNCMNodesConfiguration());
+      updateable_config_->updateableNodesConfiguration());
 }
 
 bool ServerParameters::isSequencingEnabled() const {
@@ -578,10 +629,6 @@ std::shared_ptr<TraceLogger> ServerParameters::getTraceLogger() {
   return trace_logger_;
 }
 
-const std::shared_ptr<LocalLogFile>& ServerParameters::getAuditLog() {
-  return audit_log_;
-}
-
 StatsHolder* ServerParameters::getStats() {
   return &server_stats_;
 }
@@ -596,17 +643,20 @@ Server::Server(ServerParameters* params)
       updateable_config_(params_->getUpdateableConfig()),
       server_config_(updateable_config_->getServerConfig()),
       settings_updater_(params_->getSettingsUpdater()),
+      admin_command_processor_(std::make_unique<CommandProcessor>(this)),
       conn_budget_backlog_(server_settings_->connection_backlog),
       conn_budget_backlog_unlimited_(std::numeric_limits<uint64_t>::max()) {
   ld_check(params_);
   start_time_ = std::chrono::system_clock::now();
 
-  if (!(initListeners() && initStore() && initProcessor() &&
-        repopulateRecordCaches() && initSequencers() && initFailureDetector() &&
-        initSequencerPlacement() && initRebuildingCoordinator() &&
-        initClusterMaintenanceStateMachine() && initLogStoreMonitor() &&
-        initUnreleasedRecordDetector() && initLogsConfigManager() &&
-        initAdminServer())) {
+  if (!(initListeners() && initStore() && initLogStorageStateMap() &&
+        initStorageThreadPool() && initProcessor() && initFailureDetector() &&
+        startWorkers() && initNCM() && repopulateRecordCaches() &&
+        initSequencers() && initSequencerPlacement() &&
+        initRebuildingCoordinator() && initClusterMaintenanceStateMachine() &&
+        initLogStoreMonitor() && initUnreleasedRecordDetector() &&
+        initLogsConfigManager() && initAdminServer() && initThriftServers() &&
+        initRocksDBMetricsExport())) {
     _exit(EXIT_FAILURE);
   }
 }
@@ -643,11 +693,7 @@ bool Server::initListeners() {
     connection_listener_loop_ = std::make_unique<folly::EventBaseThread>(
         true,
         nullptr,
-        ConnectionListener::listenerTypeNames()
-            [ConnectionListener::ListenerType::DATA]);
-
-    command_listener_loop_ =
-        std::make_unique<folly::EventBaseThread>(true, nullptr, "ld:admin");
+        ConnectionListener::connectionKindToThreadName(ConnectionKind::DATA));
 
     connection_listener_ = initListener<ConnectionListener>(
         server_settings_->port,
@@ -655,14 +701,9 @@ bool Server::initListeners() {
         false,
         folly::getKeepAliveToken(connection_listener_loop_->getEventBase()),
         conn_shared_state,
-        ConnectionListener::ListenerType::DATA,
-        conn_budget_backlog_);
-    command_listener_ = initListener<CommandListener>(
-        server_settings_->command_port,
-        server_settings_->command_unix_socket,
-        false,
-        folly::getKeepAliveToken(command_listener_loop_->getEventBase()),
-        this);
+        ConnectionKind::DATA,
+        conn_budget_backlog_,
+        server_settings_->enable_dscp_reflection);
 
     auto nodes_configuration = updateable_config_->getNodesConfiguration();
     ld_check(nodes_configuration);
@@ -670,6 +711,16 @@ bool Server::initListeners() {
     const NodeServiceDiscovery* node_svc =
         nodes_configuration->getNodeServiceDiscovery(node_id.index());
     ld_check(node_svc);
+
+    // Validate certificates if needed
+    if (node_svc->ssl_address.has_value() ||
+        params_->getProcessorSettings().get()->ssl_on_gossip_port) {
+      if (!validateSSLCertificatesExist(
+              params_->getProcessorSettings().get())) {
+        // validateSSLCertificatesExist() should output the error
+        return false;
+      }
+    }
 
     // Gets UNIX socket or port number from a SocketAddress
     auto getSocketOrPort = [](const folly::SocketAddress& addr,
@@ -689,7 +740,7 @@ bool Server::initListeners() {
       return true;
     };
 
-    if (node_svc->ssl_address.hasValue()) {
+    if (node_svc->ssl_address.has_value()) {
       std::string ssl_unix_socket;
       int ssl_port = -1;
       if (!getSocketOrPort(node_svc->ssl_address.value().getSocketAddress(),
@@ -699,31 +750,20 @@ bool Server::initListeners() {
                  node_id.toString().c_str());
         return false;
       } else {
-        if (!validateSSLCertificatesExist(
-                params_->getProcessorSettings().get())) {
-          // validateSSLCertificatesExist() should output the error
-          return false;
-        }
-        ssl_connection_listener_loop_ =
-            std::make_unique<folly::EventBaseThread>(
-                true,
-                nullptr,
-                ConnectionListener::listenerTypeNames()
-                    [ConnectionListener::ListenerType::DATA_SSL]);
         ssl_connection_listener_ = initListener<ConnectionListener>(
             ssl_port,
             ssl_unix_socket,
             true,
-            folly::getKeepAliveToken(
-                ssl_connection_listener_loop_->getEventBase()),
+            folly::getKeepAliveToken(connection_listener_loop_->getEventBase()),
             conn_shared_state,
-            ConnectionListener::ListenerType::DATA_SSL,
-            conn_budget_backlog_);
+            ConnectionKind::DATA_SSL,
+            conn_budget_backlog_,
+            server_settings_->enable_dscp_reflection);
       }
     }
 
     auto gossip_sock_addr = node_svc->getGossipAddress().getSocketAddress();
-    auto hostStr = node_svc->address.toString();
+    auto hostStr = node_svc->default_client_data_address.toString();
     auto gossip_addr_str = node_svc->getGossipAddress().toString();
     if (gossip_addr_str != hostStr) {
       std::string gossip_unix_socket;
@@ -739,17 +779,11 @@ bool Server::initListeners() {
                 " since gossip-enabled is not set.");
       } else {
         ld_info("Initializing a gossip listener.");
-        if (params_->getProcessorSettings().get()->ssl_on_gossip_port &&
-            !validateSSLCertificatesExist(
-                params_->getProcessorSettings().get())) {
-          // validateSSLCertificatesExist() should output the error
-          return false;
-        }
         gossip_listener_loop_ = std::make_unique<folly::EventBaseThread>(
             true,
             nullptr,
-            ConnectionListener::listenerTypeNames()
-                [ConnectionListener::ListenerType::GOSSIP]);
+            ConnectionListener::connectionKindToThreadName(
+                ConnectionKind::GOSSIP));
 
         gossip_listener_ = initListener<ConnectionListener>(
             gossip_port,
@@ -757,8 +791,9 @@ bool Server::initListeners() {
             false,
             folly::getKeepAliveToken(gossip_listener_loop_->getEventBase()),
             conn_shared_state,
-            ConnectionListener::ListenerType::GOSSIP,
-            conn_budget_backlog_unlimited_);
+            ConnectionKind::GOSSIP,
+            conn_budget_backlog_unlimited_,
+            server_settings_->enable_dscp_reflection);
       }
     } else {
       ld_info("Gossip listener initialization not required"
@@ -766,12 +801,115 @@ bool Server::initListeners() {
               gossip_addr_str.c_str());
     }
 
+    folly::Optional<Sockaddr> server_to_server_addr_opt =
+        node_svc->server_to_server_address;
+    if (server_to_server_addr_opt.has_value()) {
+      std::string server_to_server_socket;
+      int server_to_server_port = -1;
+      if (!getSocketOrPort(server_to_server_addr_opt.value().getSocketAddress(),
+                           server_to_server_socket,
+                           server_to_server_port)) {
+        ld_error("Server-to-server port/address couldn't be parsed for this "
+                 "node(%s)",
+                 node_id.toString().c_str());
+        return false;
+      }
+
+      server_to_server_listener_loop_ =
+          std::make_unique<folly::EventBaseThread>(
+              /* autostart */ true,
+              /* eventBaseManager */ nullptr,
+              ConnectionListener::connectionKindToThreadName(
+                  ConnectionKind::SERVER_TO_SERVER));
+      server_to_server_listener_ = initListener<ConnectionListener>(
+          server_to_server_port,
+          server_to_server_socket,
+          /* ssl */ true,
+          folly::getKeepAliveToken(
+              server_to_server_listener_loop_->getEventBase()),
+          conn_shared_state,
+          ConnectionKind::SERVER_TO_SERVER,
+          conn_budget_backlog_unlimited_,
+          server_settings_->enable_dscp_reflection);
+    }
+
+    for (const auto& [priority, socket_addr] :
+         node_svc->addresses_per_priority) {
+      std::string socket_str;
+      int port = -1;
+      if (!getSocketOrPort(socket_addr.getSocketAddress(), socket_str, port)) {
+        ld_error("Node(%s): Cannot parse port/address for network priority %s",
+                 node_id.toString().c_str(),
+                 apache::thrift::util::enumNameSafe(priority).c_str());
+        return false;
+      }
+
+      auto listener = initListener<ConnectionListener>(
+          port,
+          socket_str,
+          /* ssl */ true,
+          folly::getKeepAliveToken(connection_listener_loop_->getEventBase()),
+          conn_shared_state,
+          priorityToConnectionKind(priority),
+          conn_budget_backlog_,
+          server_settings_->enable_dscp_reflection);
+
+      listeners_per_network_priority_.emplace(
+          std::piecewise_construct,
+          std::forward_as_tuple(priority),
+          std::forward_as_tuple(std::move(listener)));
+    };
   } catch (const ConstructorFailed&) {
     // failed to initialize listeners
     return false;
   }
 
   return true;
+}
+
+bool Server::initThriftServers() {
+  const auto server_settings = params_->getServerSettings();
+  auto nodes_configuration = updateable_config_->getNodesConfiguration();
+  ld_check(nodes_configuration);
+  NodeID node_id = params_->getMyNodeID().value();
+  const NodeServiceDiscovery* node_svc =
+      nodes_configuration->getNodeServiceDiscovery(node_id.index());
+  ld_check(node_svc);
+
+  s2s_thrift_api_handle_ =
+      initThriftServer("s2s-api", node_svc->server_thrift_api_address);
+
+  c2s_thrift_api_handle_ =
+      initThriftServer("c2s-api", node_svc->client_thrift_api_address);
+  return true;
+}
+
+std::unique_ptr<LogDeviceThriftServer>
+Server::initThriftServer(std::string name,
+                         const folly::Optional<Sockaddr>& address) {
+  if (!address) {
+    ld_info("%s Thrift API server disabled", name.c_str());
+    return nullptr;
+  }
+
+  auto handler =
+      std::make_shared<LogDeviceAPIThriftHandler>(name,
+                                                  processor_.get(),
+                                                  params_->getSettingsUpdater(),
+                                                  params_->getServerSettings(),
+                                                  params_->getStats());
+
+  auto factory_plugin =
+      params_->getPluginRegistry()->getSinglePlugin<ThriftServerFactory>(
+          PluginType::THRIFT_SERVER_FACTORY);
+
+  if (factory_plugin) {
+    return (*factory_plugin)(name, *address, std::move(handler));
+  } else {
+    // Fallback to built-in SimpleThriftApiServer
+    return std::make_unique<SimpleThriftServer>(
+        name, *address, std::move(handler));
+  }
 }
 
 bool Server::initStore() {
@@ -784,17 +922,75 @@ bool Server::initStore() {
                   "set ");
       return false;
     }
-    auto local_settings = params_->getProcessorSettings().get();
+    auto rocksdb_plugin =
+        params_->getPluginRegistry()->getSinglePlugin<RocksDBCustomiserFactory>(
+            PluginType::ROCKSDB_CUSTOMISER_FACTORY);
+
+    node_index_t node_index = params_->getMyNodeID()->index();
+    uint64_t node_version = updateable_config_->getNodesConfiguration()
+                                ->getNodeServiceDiscovery(node_index)
+                                ->version;
+
+    // If there's no plugin, use the default customiser.
+    std::unique_ptr<RocksDBCustomiser> rocksdb_customiser =
+        rocksdb_plugin == nullptr
+        ? std::make_unique<RocksDBCustomiser>()
+        : (*rocksdb_plugin)(
+              local_log_store_path,
+              updateable_config_->getServerConfig()->getClusterName(),
+              node_index,
+              node_version,
+              params_->getNumDBShards(),
+              params_->getRocksDBSettings());
+    ld_check(rocksdb_customiser);
+
+    if (server_settings_->wipe_storage_when_storage_state_none &&
+        !rocksdb_customiser->isDBLocal()) {
+      // Wiping remote rocksdb DBs is not implemented.
+      // Let's fail early if settings say that we may need to wipe DBs.
+      ld_critical("wipe-storage-when-storage-state-none is not supported with "
+                  "remote rocksdb.");
+      return false;
+    }
+
     try {
-      sharded_store_.reset(
-          new ShardedRocksDBLocalLogStore(local_log_store_path,
-                                          params_->getNumDBShards(),
-                                          *local_settings,
-                                          params_->getRocksDBSettings(),
-                                          params_->getRebuildingSettings(),
-                                          updateable_config_,
-                                          &g_rocksdb_caches,
-                                          params_->getStats()));
+      auto local_settings = params_->getProcessorSettings().get();
+      sharded_store_ = std::make_unique<ShardedRocksDBLocalLogStore>(
+          local_log_store_path,
+          params_->getNumDBShards(),
+          params_->getRocksDBSettings(),
+          std::move(rocksdb_customiser),
+          params_->getStats());
+
+      // Shards get automatically wiped when NCM marks them as
+      // storage state NONE and wipe_storage_when_storage_state_none is enabled
+      if (server_settings_->wipe_storage_when_storage_state_none &&
+          params_->getProcessorSettings()->enable_nodes_configuration_manager) {
+        std::vector<shard_index_t> shards_to_wipe;
+        auto shard_states =
+            updateable_config_->getNodesConfiguration()
+                ->getStorageMembership()
+                ->getShardStates(params_->getMyNodeID()->index());
+        for (const auto& kv : shard_states) {
+          if (kv.second.storage_state == membership::StorageState::NONE) {
+            shards_to_wipe.push_back(kv.first);
+          }
+        }
+        if (shards_to_wipe.size() > 0) {
+          ld_info("Wiping shards %s since their storage is NONE",
+                  toString(shards_to_wipe).c_str());
+
+          if (!sharded_store_->wipe(shards_to_wipe)) {
+            ld_critical("Failed to wipe log store while "
+                        "--wipe-storage-when-storage-state-none is enabled");
+            throw ConstructorFailed();
+          }
+        }
+      }
+      sharded_store_->init(*local_settings,
+                           params_->getRebuildingSettings(),
+                           updateable_config_,
+                           &g_rocksdb_caches);
       if (!server_settings_->ignore_cluster_marker &&
           !ClusterMarkerChecker::check(*sharded_store_,
                                        *server_config_,
@@ -804,98 +1000,52 @@ bool Server::initStore() {
       }
       auto& io_fault_injection = IOFaultInjection::instance();
       io_fault_injection.init(sharded_store_->numShards());
-      // Size the storage thread pool task queue to never fill up.
-      size_t task_queue_size = local_settings->num_workers *
-          local_settings->max_inflight_storage_tasks;
-      sharded_storage_thread_pool_.reset(
-          new ShardedStorageThreadPool(sharded_store_.get(),
-                                       server_settings_->storage_pool_params,
-                                       server_settings_,
-                                       params_->getProcessorSettings(),
-                                       task_queue_size,
-                                       params_->getStats(),
-                                       params_->getTraceLogger()));
     } catch (const ConstructorFailed& ex) {
       ld_critical("Failed to initialize local log store");
       return false;
     }
-    ld_info("Initialized sharded RocksDB instance at %s with %d shards",
-            local_log_store_path.c_str(),
-            sharded_store_->numShards());
   }
 
   return true;
 }
 
+bool Server::initStorageThreadPool() {
+  if (!params_->isStorageNode()) {
+    return true;
+  }
+  auto local_settings = params_->getProcessorSettings().get();
+  // Size the storage thread pool task queue to never fill up.
+  size_t task_queue_size =
+      local_settings->num_workers * local_settings->max_inflight_storage_tasks;
+  sharded_storage_thread_pool_.reset(
+      new ShardedStorageThreadPool(sharded_store_.get(),
+                                   server_settings_->storage_pool_params,
+                                   server_settings_,
+                                   params_->getProcessorSettings(),
+                                   task_queue_size,
+                                   params_->getStats(),
+                                   params_->getTraceLogger()));
+  return true;
+}
+
 bool Server::initProcessor() {
+  ld_check(!params_->isStorageNode() || log_storage_state_map_);
   try {
-    processor_ =
-        ServerProcessor::create(params_->getAuditLog(),
-                                sharded_storage_thread_pool_.get(),
-                                params_->getServerSettings(),
-                                params_->getGossipSettings(),
-                                params_->getAdminServerSettings(),
-                                updateable_config_,
-                                params_->getTraceLogger(),
-                                params_->getProcessorSettings(),
-                                params_->getStats(),
-                                params_->getPluginRegistry(),
-                                "",
-                                "",
-                                "ld:srv", // prefix of worker thread names
-                                params_->getMyNodeID());
-    if (params_->getProcessorSettings()->enable_nodes_configuration_manager) {
-      // create and initialize NodesConfigurationManager (NCM) and attach it to
-      // the Processor
-
-      auto my_node_id = params_->getMyNodeID().value();
-      auto node_svc_discovery =
-          updateable_config_->getNodesConfiguration()->getNodeServiceDiscovery(
-              my_node_id);
-      if (node_svc_discovery == nullptr) {
-        ld_critical(
-            "NodeID '%s' doesn't exist in the NodesConfiguration of %s",
-            my_node_id.toString().c_str(),
-            updateable_config_->getServerConfig()->getClusterName().c_str());
-        throw ConstructorFailed();
-      }
-      auto roleset = node_svc_discovery->getRoles();
-
-      // TODO: get NCS from NodesConfigurationInit instead
-      auto zk_client_factory = processor_->getPluginRegistry()
-                                   ->getSinglePlugin<ZookeeperClientFactory>(
-                                       PluginType::ZOOKEEPER_CLIENT_FACTORY);
-      auto ncm = configuration::nodes::NodesConfigurationManagerFactory::create(
-          processor_.get(), nullptr, roleset, std::move(zk_client_factory));
-      if (ncm == nullptr) {
-        ld_critical("Unable to create NodesConfigurationManager during server "
-                    "creation!");
-        throw ConstructorFailed();
-      }
-
-      auto initial_nc =
-          processor_->config_->getNodesConfigurationFromNCMSource();
-      if (!initial_nc) {
-        // Currently this should only happen in tests as our boostrapping
-        // workflow should always ensure the Processor has a valid
-        // NodesConfiguration before initializing NCM. In the future we will
-        // require a valid NC for Processor construction and will turn this into
-        // a ld_check.
-        ld_warning("NodesConfigurationManager initialized without a valid "
-                   "NodesConfiguration in its Processor context. This should "
-                   "only happen in tests.");
-        initial_nc = std::make_shared<const NodesConfiguration>();
-      }
-      if (!ncm->init(std::move(initial_nc))) {
-        ld_critical(
-            "Processing initial NodesConfiguration did not finish in time.");
-        throw ConstructorFailed();
-      }
-      if (params_->isStorageNode()) {
-        // Only storage nodes need to upgrade to being proposers.
-        ncm->upgradeToProposer();
-      }
-    }
+    processor_ = ServerProcessor::createWithoutStarting(
+        sharded_storage_thread_pool_.get(),
+        std::move(log_storage_state_map_),
+        params_->getServerSettings(),
+        params_->getGossipSettings(),
+        params_->getAdminServerSettings(),
+        updateable_config_,
+        params_->getTraceLogger(),
+        params_->getProcessorSettings(),
+        params_->getStats(),
+        params_->getPluginRegistry(),
+        "",
+        "",
+        "ld:srv", // prefix of worker thread names
+        params_->getMyNodeID());
 
     if (sharded_storage_thread_pool_) {
       sharded_storage_thread_pool_->setProcessor(processor_.get());
@@ -917,6 +1067,225 @@ bool Server::initProcessor() {
   return true;
 }
 
+bool Server::initLogStorageStateMap() {
+  if (!params_->isStorageNode()) {
+    return true;
+  }
+
+  shard_size_t nshards = sharded_store_->numShards();
+  log_storage_state_map_ = std::make_unique<LogStorageStateMap>(
+      nshards,
+      params_->getStats(),
+      params_->getProcessorSettings()->enable_record_cache,
+      params_->getProcessorSettings()->log_state_recovery_interval);
+
+  /*
+   * It is important to differentiate between the following cases
+   * while loading the `LogStorageState`.
+   *
+   * 1. The metadata is not present.
+   * 2. The metadata is present but could not be read due to some error.
+   *
+   * E.g. `TRIM_POINT` would be set to `LSN_INVALID` in both such
+   * cases.
+   *
+   * Case 1 is simple. However, case 2 needs some special handling as
+   * below.
+   *
+   * - If the `log_id` of the problematic metadata is known, the
+   *   `LogStorageState` could be marked in error with
+   *   `notePermanentError`. Any consumers of `LogStorageState` would
+   *   then check for the permanent error before trusting its
+   *   content.
+   *   This case could arise if the metadata `key` is intact but its
+   *   `value` is malformed.
+   *
+   * - If the `log_id` of the metadata could not be read, then the
+   *   contents for such UNKNOWN log in that shard cannot be served
+   *   correctly. Therefore, any future IO to that shard is disabled
+   *   by switching its storage backend to `FailingLocalLogStore`. It
+   *   is safe to switch the backend at this stage in the startup as
+   *   no one else has access to it.  If switching the backend fails
+   *   for some reason, the server startup is aborted.
+   */
+
+  auto make_traverser =
+      [& lsmap = log_storage_state_map_](
+          shard_index_t shard,
+          std::function<void(LogStorageState*, std::unique_ptr<LogMetadata>)>
+              fn) {
+        return [shard, fn, &lsmap](logid_t log_id,
+                                   std::unique_ptr<LogMetadata> meta,
+                                   Status status) {
+          auto log_state = lsmap->insertOrGet(log_id, shard);
+          if (log_state->hasPermanentError()) {
+            return;
+          }
+          if (status == E::OK) {
+            fn(log_state, std::move(meta));
+          } else {
+            ld_check_eq(status, E::MALFORMED_RECORD);
+            log_state->notePermanentError("Populating LogStorageState");
+          }
+        };
+      };
+
+  std::vector<std::future<bool>> futures;
+  for (shard_index_t shard = 0; shard < nshards; ++shard) {
+    futures.push_back(std::async(
+        std::launch::async,
+        [shard, &make_traverser, &sharded_store = sharded_store_]() {
+          ThreadID::set(ThreadID::UTILITY,
+                        folly::sformat("ld:populateLogState{}", shard));
+          auto store = sharded_store->getByIndex(shard);
+          auto trim_point_traverser = make_traverser(
+              shard,
+              [](LogStorageState* log_state,
+                 std::unique_ptr<LogMetadata> meta) {
+                log_state->updateTrimPoint(
+                    dynamic_cast<TrimMetadata*>(meta.get())->trim_point_);
+              });
+          auto lce_traverser = make_traverser(
+              shard,
+              [](LogStorageState* log_state,
+                 std::unique_ptr<LogMetadata> meta) {
+                log_state->updateLastCleanEpoch(
+                    dynamic_cast<LastCleanMetadata*>(meta.get())->epoch_);
+              });
+          auto last_released_traverser = make_traverser(
+              shard,
+              [](LogStorageState* log_state,
+                 std::unique_ptr<LogMetadata> meta) {
+                log_state->updateLastReleasedLSN(
+                    dynamic_cast<LastReleasedMetadata*>(meta.get())
+                        ->last_released_lsn_,
+                    LogStorageState::LastReleasedSource::LOCAL_LOG_STORE);
+              });
+          int rv = store->traverseLogsMetadata(
+              LogMetadataType::TRIM_POINT, trim_point_traverser);
+          if (rv != 0) {
+            ld_error("Failed to populate Trim Points from shard %d: %s.",
+                     shard,
+                     error_name(err));
+            goto out;
+          }
+
+          rv = store->traverseLogsMetadata(
+              LogMetadataType::LAST_CLEAN, lce_traverser);
+          if (rv != 0) {
+            ld_error("Failed to populate Last Clean Epochs from shard %d: %s",
+                     shard,
+                     error_name(err));
+            goto out;
+          }
+
+          rv = store->traverseLogsMetadata(
+              LogMetadataType::LAST_RELEASED, last_released_traverser);
+          if (rv != 0) {
+            ld_error("Failed to populate Last Released LSN from shard %d: %s",
+                     shard,
+                     error_name(err));
+          }
+
+        out:
+          if (rv != 0 && !sharded_store->switchToFailingLocalLogStore(shard)) {
+            ld_critical("Failed to disable shard %d.", shard);
+            return false;
+          }
+          return true;
+        }));
+  }
+
+  bool ret = true;
+  for (auto& f : futures) {
+    if (!f.get()) {
+      ret = false;
+    }
+  }
+  ld_info(
+      "Populating log storage state map %s.", ret ? "successful" : "failed");
+  return ret;
+}
+
+bool Server::initFailureDetector() {
+  if (params_->getGossipSettings()->enabled) {
+    try {
+      processor_->failure_detector_ = std::make_unique<FailureDetector>(
+          params_->getGossipSettings(), processor_.get(), params_->getStats());
+      if (processor_->getHealthMonitor()) {
+        processor_->getHealthMonitor()->setFailureDetector(
+            processor_->failure_detector_.get());
+      }
+    } catch (const ConstructorFailed&) {
+      ld_error(
+          "Failed to construct FailureDetector: %s", error_description(err));
+      return false;
+    }
+  } else {
+    ld_info("Not initializing gossip based failure detector,"
+            " since --gossip-enabled is not set");
+  }
+
+  return true;
+}
+
+bool Server::startWorkers() {
+  processor_->startRunning();
+  return true;
+}
+
+bool Server::initNCM() {
+  if (params_->getProcessorSettings()->enable_nodes_configuration_manager) {
+    // create and initialize NodesConfigurationManager (NCM) and attach it to
+    // the Processor
+
+    auto my_node_id = params_->getMyNodeID().value();
+    auto node_svc_discovery =
+        updateable_config_->getNodesConfiguration()->getNodeServiceDiscovery(
+            my_node_id);
+    if (node_svc_discovery == nullptr) {
+      ld_critical(
+          "NodeID '%s' doesn't exist in the NodesConfiguration of %s",
+          my_node_id.toString().c_str(),
+          updateable_config_->getServerConfig()->getClusterName().c_str());
+      return false;
+    }
+    auto roleset = node_svc_discovery->getRoles();
+
+    // TODO: get NCS from NodesConfigurationInit instead
+    auto zk_client_factory = processor_->getPluginRegistry()
+                                 ->getSinglePlugin<ZookeeperClientFactory>(
+                                     PluginType::ZOOKEEPER_CLIENT_FACTORY);
+    auto ncm = configuration::nodes::NodesConfigurationManagerFactory::create(
+        processor_.get(), nullptr, roleset, std::move(zk_client_factory));
+    if (ncm == nullptr) {
+      ld_critical("Unable to create NodesConfigurationManager during server "
+                  "creation!");
+      return false;
+    }
+    ncm->upgradeToProposer();
+
+    auto initial_nc = processor_->config_->getNodesConfiguration();
+    if (!initial_nc) {
+      // Currently this should only happen in tests as our boostrapping
+      // workflow should always ensure the Processor has a valid
+      // NodesConfiguration before initializing NCM. In the future we will
+      // require a valid NC for Processor construction and will turn this into
+      // a ld_check.
+      ld_warning("NodesConfigurationManager initialized without a valid "
+                 "NodesConfiguration in its Processor context. This should "
+                 "only happen in tests.");
+      initial_nc = std::make_shared<const NodesConfiguration>();
+    }
+    if (!ncm->init(std::move(initial_nc))) {
+      ld_critical(
+          "Processing initial NodesConfiguration did not finish in time.");
+      return false;
+    }
+  }
+  return true;
+}
+
 bool Server::repopulateRecordCaches() {
   if (!params_->isStorageNode()) {
     ld_info("Not repopulating record caches");
@@ -929,9 +1298,9 @@ bool Server::repopulateRecordCaches() {
     status_counts[status].push_back(shard_idx);
   };
 
-  // Start RecordCacheRepopulationRequest. Only try to deserialize record cache
-  // snapshot if record cache is enabled _and_ persisting record cache is
-  // allowed. Otherwise, just drop all previous snapshots.
+  // Start RecordCacheRepopulationRequest. Only try to deserialize record
+  // cache snapshot if record cache is enabled _and_ persisting record cache
+  // is allowed. Otherwise, just drop all previous snapshots.
   std::unique_ptr<Request> req =
       std::make_unique<RepopulateRecordCachesRequest>(
           callback, params_->getProcessorSettings()->enable_record_cache);
@@ -983,7 +1352,8 @@ bool Server::initSequencers() {
       ld_info("Initializing FileEpochStore");
       epoch_store = std::make_unique<FileEpochStore>(
           server_settings_->epoch_store_path,
-          processor_.get(),
+          processor_->getRequestExecutor(),
+          processor_->getOptionalMyNodeID(),
           updateable_config_->updateableNodesConfiguration());
     } catch (const ConstructorFailed&) {
       ld_error(
@@ -999,11 +1369,13 @@ bool Server::initSequencers() {
                   PluginType::ZOOKEEPER_CLIENT_FACTORY);
       epoch_store = std::make_unique<ZookeeperEpochStore>(
           server_config_->getClusterName(),
-          processor_.get(),
-          updateable_config_->updateableZookeeperConfig(),
+          processor_->getRequestExecutor(),
+          zk_client_factory->getClient(
+              *updateable_config_->updateableZookeeperConfig()->get()),
           updateable_config_->updateableNodesConfiguration(),
           processor_->updateableSettings(),
-          zk_client_factory);
+          processor_->getOptionalMyNodeID(),
+          processor_->stats_);
     } catch (const ConstructorFailed&) {
       ld_error("Failed to construct ZookeeperEpochStore: %s",
                error_description(err));
@@ -1018,9 +1390,24 @@ bool Server::initSequencers() {
 
 bool Server::initLogStoreMonitor() {
   if (params_->isStorageNode()) {
-    logstore_monitor_ = std::make_unique<LogStoreMonitor>(
-        processor_.get(), params_->getLocalLogStoreSettings());
+    logstore_monitor_ =
+        std::make_unique<LogStoreMonitor>(processor_.get(),
+                                          rebuilding_supervisor_.get(),
+                                          params_->getLocalLogStoreSettings());
     logstore_monitor_->start();
+  }
+
+  return true;
+}
+
+bool Server::initRocksDBMetricsExport() {
+  if (sharded_store_) {
+    auto registry = params_->getPluginRegistry();
+    auto metrics_export = registry->getSinglePlugin<RocksDBMetricsExport>(
+        PluginType::ROCKSDB_METRICS_EXPORT);
+    if (metrics_export) {
+      (*metrics_export)(sharded_store_.get(), processor_.get());
+    }
   }
 
   return true;
@@ -1073,11 +1460,25 @@ bool Server::initRebuildingCoordinator() {
              "an event log by populating the \"internal_logs\" section of the "
              "server config and restart this server");
   } else {
+    ld_info("Initializing EventLog RSM and RebuildingCoordinator");
     enable_rebuilding = true;
+    std::unique_ptr<RSMSnapshotStore> snapshot_store =
+        RsmServerSnapshotStoreFactory::create(
+            processor_.get(),
+            params_->getProcessorSettings()->rsm_snapshot_store_type,
+            params_->isStorageNode(),
+            std::to_string(configuration::InternalLogs::EVENT_LOG_DELTAS.val_));
+    auto workerType = EventLogStateMachine::workerType(processor_.get());
+    auto workerId = worker_id_t(EventLogStateMachine::getWorkerIdx(
+        processor_->getWorkerCount(workerType)));
     event_log_ =
-        std::make_unique<EventLogStateMachine>(params_->getProcessorSettings());
+        std::make_unique<EventLogStateMachine>(params_->getProcessorSettings(),
+                                               std::move(snapshot_store),
+                                               workerId,
+                                               workerType);
     event_log_->enableSendingUpdatesToWorkers();
     event_log_->setMyNodeID(params_->getMyNodeID().value());
+    enable_rebuilding = true;
   }
 
   if (sharded_store_) {
@@ -1096,7 +1497,6 @@ bool Server::initRebuildingCoordinator() {
           processor_.get(),
           params_->getRebuildingSettings(),
           params_->getAdminServerSettings());
-      processor_->rebuilding_supervisor_ = rebuilding_supervisor_.get();
       ld_info("Starting RebuildingSupervisor");
       rebuilding_supervisor_->start();
 
@@ -1104,9 +1504,12 @@ bool Server::initRebuildingCoordinator() {
           processor_->config_,
           event_log_.get(),
           processor_.get(),
+          rebuilding_supervisor_.get(),
           params_->getRebuildingSettings(),
           params_->getAdminServerSettings(),
-          sharded_store_.get());
+          sharded_store_.get(),
+          std::make_unique<maintenance::MaintenanceManagerTracer>(
+              params_->getTraceLogger()));
       ld_info("Starting RebuildingCoordinator");
       if (rebuilding_coordinator_->start() != 0) {
         return false;
@@ -1116,7 +1519,7 @@ bool Server::initRebuildingCoordinator() {
 
   if (event_log_) {
     std::unique_ptr<Request> req =
-        std::make_unique<StartEventLogStateMachineRequest>(event_log_.get(), 0);
+        std::make_unique<StartEventLogStateMachineRequest>(event_log_.get());
 
     const int rv = processor_->postRequest(req);
     if (rv != 0) {
@@ -1131,7 +1534,7 @@ bool Server::initRebuildingCoordinator() {
   return true;
 }
 
-bool Server::createAndAttachMaintenanceManager(AdminServer* admin_server) {
+bool Server::createAndAttachMaintenanceManager(AdminAPIHandler* handler) {
   // MaintenanceManager can generally be run on any server. However
   // MaintenanceManager lacks the leader election logic and hence
   // we cannot have multiple MaintenanceManager-s running for the
@@ -1143,16 +1546,18 @@ bool Server::createAndAttachMaintenanceManager(AdminServer* admin_server) {
   if (admin_settings->enable_maintenance_manager) {
     ld_check(cluster_maintenance_state_machine_);
     ld_check(event_log_);
-    ld_check(admin_server);
+    ld_check(handler);
     auto deps = std::make_unique<maintenance::MaintenanceManagerDependencies>(
         processor_.get(),
         admin_settings,
+        params_->getRebuildingSettings(),
         cluster_maintenance_state_machine_.get(),
         event_log_.get(),
         std::make_unique<maintenance::SafetyCheckScheduler>(
-            processor_.get(),
-            admin_settings,
-            admin_server->getSafetyChecker()));
+            processor_.get(), admin_settings, handler->getSafetyChecker()),
+        std::make_unique<maintenance::MaintenanceLogWriter>(processor_.get()),
+        std::make_unique<maintenance::MaintenanceManagerTracer>(
+            params_->getTraceLogger()));
     auto worker_idx = processor_->selectWorkerRandomly(
         configuration::InternalLogs::MAINTENANCE_LOG_DELTAS.val_ /*seed*/,
         maintenance::MaintenanceManager::workerType(processor_.get()));
@@ -1161,16 +1566,11 @@ bool Server::createAndAttachMaintenanceManager(AdminServer* admin_server) {
         maintenance::MaintenanceManager::workerType(processor_.get()));
     maintenance_manager_ =
         std::make_unique<maintenance::MaintenanceManager>(&w, std::move(deps));
-    admin_server->setMaintenanceManager(maintenance_manager_.get());
-    // Since this node is going to run MaintenanceManager, upgrade the
-    // NodesConfigManager to be a proposer
-    auto ncm = processor_->getNodesConfigurationManager();
-    ld_check(ncm);
-    ncm->upgradeToProposer();
+    handler->setMaintenanceManager(maintenance_manager_.get());
     maintenance_manager_->start();
   } else {
-    ld_info(
-        "Not initializing MaintenanceManager since it is disabled in settings");
+    ld_info("Not initializing MaintenanceManager since it is disabled in "
+            "settings");
   }
   return true;
 }
@@ -1181,7 +1581,7 @@ bool Server::initClusterMaintenanceStateMachine() {
       params_->getAdminServerSettings()->enable_maintenance_manager) {
     cluster_maintenance_state_machine_ =
         std::make_unique<maintenance::ClusterMaintenanceStateMachine>(
-            params_->getAdminServerSettings());
+            params_->getAdminServerSettings(), nullptr /* snapshot store */);
 
     std::unique_ptr<Request> req = std::make_unique<
         maintenance::StartClusterMaintenanceStateMachineRequest>(
@@ -1202,24 +1602,6 @@ bool Server::initClusterMaintenanceStateMachine() {
   return true;
 }
 
-bool Server::initFailureDetector() {
-  if (params_->getGossipSettings()->enabled) {
-    try {
-      processor_->failure_detector_ = std::make_unique<FailureDetector>(
-          params_->getGossipSettings(), processor_.get(), params_->getStats());
-    } catch (const ConstructorFailed&) {
-      ld_error(
-          "Failed to construct FailureDetector: %s", error_description(err));
-      return false;
-    }
-  } else {
-    ld_info("Not initializing gossip based failure detector,"
-            " since --gossip-enabled is not set");
-  }
-
-  return true;
-}
-
 bool Server::initUnreleasedRecordDetector() {
   if (params_->isStorageNode()) {
     unreleased_record_detector_ = std::make_shared<UnreleasedRecordDetector>(
@@ -1230,21 +1612,29 @@ bool Server::initUnreleasedRecordDetector() {
   return true;
 }
 
-bool Server::startCommandListener(std::unique_ptr<Listener>& handle) {
-  CommandListener* listener = checked_downcast<CommandListener*>(handle.get());
-  return listener->startAcceptingConnections().wait().value();
-}
-
 bool Server::startConnectionListener(std::unique_ptr<Listener>& handle) {
   ConnectionListener* listener =
       checked_downcast<ConnectionListener*>(handle.get());
   listener->setProcessor(processor_.get());
+  // Assign callback function to listener
+  if (processor_->getHealthMonitor()) {
+    listener->setConnectionLimitReachedCallback(
+        [& hm = *(processor_->getHealthMonitor())]() {
+          hm.reportConnectionLimitReached();
+        });
+  }
   return listener->startAcceptingConnections().wait().value();
 }
 
 bool Server::initLogsConfigManager() {
+  std::unique_ptr<RSMSnapshotStore> snapshot_store =
+      RsmServerSnapshotStoreFactory::create(
+          processor_.get(),
+          params_->getProcessorSettings().get()->rsm_snapshot_store_type,
+          params_->isStorageNode(),
+          std::to_string(configuration::InternalLogs::CONFIG_LOG_DELTAS.val_));
   return LogsConfigManager::createAndAttach(
-      *processor_, true /* is_writable */);
+      *processor_, std::move(snapshot_store), true /* is_writable */);
 }
 
 bool Server::initAdminServer() {
@@ -1253,10 +1643,6 @@ bool Server::initAdminServer() {
     auto server_config = updateable_config_->getServerConfig();
     ld_check(server_config);
 
-    auto adm_plugin =
-        params_->getPluginRegistry()->getSinglePlugin<AdminServerFactory>(
-            PluginType::ADMIN_SERVER_FACTORY);
-
     auto my_node_id = params_->getMyNodeID().value();
     auto svd =
         updateable_config_->getNodesConfiguration()->getNodeServiceDiscovery(
@@ -1264,7 +1650,7 @@ bool Server::initAdminServer() {
     ld_check(svd);
 
     auto admin_listen_addr = svd->admin_address;
-    if (!admin_listen_addr.hasValue()) {
+    if (!admin_listen_addr.has_value()) {
       const auto& admin_settings = params_->getAdminServerSettings();
       if (!admin_settings->admin_unix_socket.empty()) {
         admin_listen_addr = Sockaddr(admin_settings->admin_unix_socket);
@@ -1274,32 +1660,43 @@ bool Server::initAdminServer() {
       ld_warning(
           "The admin-enabled setting is true, but "
           "admin_address/admin_port are missing from the config. Will use "
-          "default address (%s) instead. Please consider setting a port in the "
+          "default address (%s) instead. Please consider setting a port in "
+          "the "
           "config",
           admin_listen_addr->toString().c_str());
     }
 
-    if (adm_plugin) {
-      admin_server_handle_ = (*adm_plugin)(admin_listen_addr.value(),
-                                           processor_.get(),
-                                           params_->getSettingsUpdater(),
-                                           params_->getServerSettings(),
-                                           params_->getAdminServerSettings(),
-                                           params_->getStats());
+    std::string name = "LogDevice Admin API Service";
+    auto handler =
+        std::make_shared<AdminAPIHandler>(name,
+                                          processor_.get(),
+                                          params_->getSettingsUpdater(),
+                                          params_->getServerSettings(),
+                                          params_->getAdminServerSettings(),
+                                          params_->getStats());
+
+    auto factory_plugin =
+        params_->getPluginRegistry()->getSinglePlugin<ThriftServerFactory>(
+            PluginType::THRIFT_SERVER_FACTORY);
+
+    auto address = admin_listen_addr.value();
+    if (factory_plugin) {
+      admin_server_handle_ = (*factory_plugin)(name, address, handler);
     } else {
-      // Use built-in SimpleAdminServer
+      // Fallback to built-in SimpleThriftApiServer
       admin_server_handle_ =
-          std::make_unique<SimpleAdminServer>(admin_listen_addr.value(),
-                                              processor_.get(),
-                                              params_->getSettingsUpdater(),
-                                              params_->getServerSettings(),
-                                              params_->getAdminServerSettings(),
-                                              params_->getStats());
+          std::make_unique<SimpleThriftServer>(name, address, handler);
     }
+
     if (sharded_store_) {
-      admin_server_handle_->setShardedRocksDBStore(sharded_store_.get());
+      handler->setShardedRocksDBStore(sharded_store_.get());
     }
-    createAndAttachMaintenanceManager(admin_server_handle_.get());
+    createAndAttachMaintenanceManager(handler.get());
+    handler->setAdminCommandHandler(
+        std::bind(&CommandProcessor::asyncProcessCommand,
+                  admin_command_processor_.get(),
+                  std::placeholders::_1,
+                  std::placeholders::_2));
   } else {
     ld_info("Not initializing Admin API,"
             " since admin-enabled server setting is set to false");
@@ -1317,8 +1714,21 @@ bool Server::startListening() {
     return false;
   }
 
-  if (ssl_connection_listener_loop_ &&
+  // Now that gossip listener is running, let's start gossiping.
+  if (processor_->failure_detector_ != nullptr) {
+    processor_->failure_detector_->start();
+  }
+
+  if (ssl_connection_listener_ &&
       !startConnectionListener(ssl_connection_listener_)) {
+    return false;
+  }
+
+  if (s2s_thrift_api_handle_ && !s2s_thrift_api_handle_->start()) {
+    return false;
+  }
+
+  if (c2s_thrift_api_handle_ && !c2s_thrift_api_handle_->start()) {
     return false;
   }
 
@@ -1326,11 +1736,15 @@ bool Server::startListening() {
     return false;
   }
 
-  // start command listener last, so that integration test framework
-  // cannot connect to the command port in the event that any other port
-  // failed to open.
-  if (!startCommandListener(command_listener_)) {
+  if (server_to_server_listener_loop_ &&
+      !startConnectionListener(server_to_server_listener_)) {
     return false;
+  }
+
+  for (auto& [_, listener] : listeners_per_network_priority_) {
+    if (!startConnectionListener(listener)) {
+      return false;
+    }
   }
 
   return true;
@@ -1344,15 +1758,19 @@ void Server::gracefulShutdown() {
   if (is_shut_down_.exchange(true)) {
     return;
   }
+
+  uint64_t shutdown_duration_ms = 0;
   shutdown_server(admin_server_handle_,
+                  s2s_thrift_api_handle_,
+                  c2s_thrift_api_handle_,
                   connection_listener_,
-                  command_listener_,
+                  listeners_per_network_priority_,
                   gossip_listener_,
                   ssl_connection_listener_,
+                  server_to_server_listener_,
                   connection_listener_loop_,
-                  command_listener_loop_,
                   gossip_listener_loop_,
-                  ssl_connection_listener_loop_,
+                  server_to_server_listener_loop_,
                   logstore_monitor_,
                   processor_,
                   sharded_storage_thread_pool_,
@@ -1363,7 +1781,10 @@ void Server::gracefulShutdown() {
                   rebuilding_supervisor_,
                   unreleased_record_detector_,
                   cluster_maintenance_state_machine_,
-                  params_->isFastShutdownEnabled());
+                  params_->isFastShutdownEnabled(),
+                  shutdown_duration_ms);
+  ld_info("Shutdown took %ld ms", shutdown_duration_ms);
+  STAT_ADD(params_->getStats(), shutdown_time_ms, shutdown_duration_ms);
 }
 
 void Server::shutdownWithTimeout() {
@@ -1405,19 +1826,15 @@ RebuildingCoordinator* Server::getRebuildingCoordinator() {
   return rebuilding_coordinator_.get();
 }
 
-maintenance::MaintenanceManager* Server::getMaintenanceManager() {
-  return maintenance_manager_.get();
+EventLogStateMachine* Server::getEventLogStateMachine() {
+  return event_log_.get();
 }
 
-void Server::rotateLocalLogs() {
-  auto audit_log = params_->getAuditLog();
-  if (audit_log) {
-    audit_log->reopen();
-  }
+maintenance::MaintenanceManager* Server::getMaintenanceManager() {
+  return maintenance_manager_.get();
 }
 
 Server::~Server() {
   shutdownWithTimeout();
 }
-
 }} // namespace facebook::logdevice

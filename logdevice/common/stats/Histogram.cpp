@@ -18,6 +18,7 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include <folly/Conv.h>
@@ -680,6 +681,7 @@ void CompactHistogram::assign(const HistogramInterface& other_if) {
     buckets_[i].store(other.buckets_[i].load(std::memory_order_relaxed),
                       std::memory_order_relaxed);
   }
+  publish_range_ = other.publish_range_;
 }
 void CompactHistogram::merge(const HistogramInterface& other_if) {
   auto& other = checked_cref_cast<CompactHistogram>(other_if);
@@ -830,6 +832,40 @@ void CompactHistogram::print(std::ostream& out) const {
   }
 }
 
+bool CompactHistogram::shouldPublishCumulativeFrequencyCounters() const {
+  return publish_range_.has_value() &&
+      publish_range_->to >= publish_range_->from &&
+      publish_range_->to < buckets_.size();
+}
+
+HistogramInterface::CumulativeFrequencyCounters
+CompactHistogram::getCumulativeFrequencyCounters() const {
+  ld_check(shouldPublishCumulativeFrequencyCounters());
+
+  const auto first_idx = publish_range_->from;
+  const auto last_idx = publish_range_->to;
+
+  CumulativeFrequencyCounters result;
+  auto& counters = result.counters;
+
+  uint64_t acc = 0;
+
+  for (int idx = buckets_.size() - 1; idx >= first_idx && idx > 0; idx--) {
+    acc += buckets_[idx];
+
+    if (idx <= last_idx) {
+      counters.emplace_back(std::make_pair(indexToValue(idx - 1), acc));
+    }
+  }
+
+  reverse(counters.begin(), counters.end());
+  return result;
+}
+
+int64_t CompactHistogram::indexToValue(int64_t index) const {
+  return 1ll << index;
+}
+
 std::string CompactHistogram::getUnitName() const {
   return units_ ? units_->at(0).name : "";
 }
@@ -905,8 +941,9 @@ bool CompactHistogram::fromShortString(folly::StringPiece s) {
   return true;
 }
 
-CompactHistogram::CompactHistogram(const std::vector<Unit>* units)
-    : units_(units) {}
+CompactHistogram::CompactHistogram(const std::vector<Unit>* units,
+                                   folly::Optional<PublishRange> publish_range)
+    : publish_range_(std::move(publish_range)), units_(units) {}
 
 CompactHistogram::CompactHistogram(const CompactHistogram& rhs)
     : units_(rhs.units_) {
@@ -917,15 +954,18 @@ CompactHistogram& CompactHistogram::operator=(const CompactHistogram& rhs) {
   return *this;
 }
 
-CompactLatencyHistogram::CompactLatencyHistogram()
-    : CompactHistogram([] {
-        static std::vector<Unit> units{{1l, "us"},
-                                       {1000l, "ms"},
-                                       {1000000l, "s"},
-                                       {60000000l, "min"},
-                                       {3600000000l, "hr"}};
-        return &units;
-      }()) {}
+CompactLatencyHistogram::CompactLatencyHistogram(
+    folly::Optional<PublishRange> publish_range)
+    : CompactHistogram(
+          [] {
+            static std::vector<Unit> units{{1l, "us"},
+                                           {1000l, "ms"},
+                                           {1000000l, "s"},
+                                           {60000000l, "min"},
+                                           {3600000000l, "hr"}};
+            return &units;
+          }(),
+          std::move(publish_range)) {}
 
 CompactSizeHistogram::CompactSizeHistogram()
     : CompactHistogram([] {
@@ -947,5 +987,4 @@ CompactNoUnitHistogram::CompactNoUnitHistogram()
                                        {1000000000000l, "T"}};
         return &units;
       }()) {}
-
 }} // namespace facebook::logdevice

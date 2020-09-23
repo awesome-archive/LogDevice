@@ -11,6 +11,7 @@
 #include <folly/Optional.h>
 #include <gtest/gtest.h>
 
+#include "logdevice/common/ClusterState.h"
 #include "logdevice/common/CrossDomainCopySetSelector.h"
 #include "logdevice/common/EpochMetaData.h"
 #include "logdevice/common/LinearCopySetSelector.h"
@@ -19,6 +20,7 @@
 #include "logdevice/common/configuration/LocalLogsConfig.h"
 #include "logdevice/common/test/MockBackoffTimer.h"
 #include "logdevice/common/test/NodeSetTestUtil.h"
+#include "logdevice/common/test/SenderTestProxy.h"
 #include "logdevice/include/Record.h"
 
 namespace facebook { namespace logdevice {
@@ -27,7 +29,7 @@ using namespace facebook::logdevice::NodeSetTestUtil;
 
 namespace {
 
-// Convenient shortcuts for writting ShardIDs.
+// Convenient shortcuts for writing ShardIDs.
 #define N0 ShardID(0, 0)
 #define N1 ShardID(1, 0)
 #define N2 ShardID(2, 0)
@@ -54,7 +56,7 @@ class MutatorTest : public ::testing::Test {
 
   bool hole_{false};
 
-  std::shared_ptr<Configuration> config_;
+  std::shared_ptr<const NodesConfiguration> nodes_config_;
   ReplicationProperty replication_{{NodeLocationScope::NODE, 3}};
   StorageSet shards_{N0, N1, N2, N3, N4, N5, N6, N7, N8};
   NodeID my_node_{NodeID(1)};
@@ -83,17 +85,17 @@ class MutatorTest : public ::testing::Test {
   std::unordered_map<node_index_t, SocketCallback*> socket_callbacks_;
 
   std::unique_ptr<Mutator> mutator_;
+  std::unordered_map<ShardID, ClusterStateNodeState> node_state_map_;
 
  public:
-  std::shared_ptr<Configuration> getConfig() const {
-    return config_;
-  }
-
   void initStoreHeaderAndExtras();
   void setUp();
   MUTATED_Header createMutatedHeader(uint32_t wave = 1,
                                      Status status = E::OK,
                                      Seal seal = Seal());
+  void setNodeState(ShardID shard, ClusterStateNodeState state) {
+    node_state_map_[shard] = state;
+  }
 };
 
 class TestCopySetSelectorDeps : public CopySetSelectorDependencies,
@@ -102,8 +104,7 @@ class TestCopySetSelectorDeps : public CopySetSelectorDependencies,
   NodeStatus checkNode(NodeSetState*,
                        ShardID shard,
                        StoreChainLink* destination_out,
-                       bool /*ignore_nodeset_state*/,
-                       bool /*allow_unencrypted_conections*/) const override {
+                       bool /*ignore_nodeset_state*/) const override {
     *destination_out = {shard, ClientID()};
     return NodeAvailabilityChecker::NodeStatus::AVAILABLE;
   }
@@ -131,8 +132,7 @@ class MockedNodeSetAccessor : public StorageSetAccessor {
       StorageSetAccessor::Property property)
       : StorageSetAccessor(test->LOG_ID,
                            test->shards_,
-                           test->config_->serverConfig()
-                               ->getNodesConfigurationFromServerConfigSource(),
+                           test->nodes_config_,
                            test->replication_,
                            node_access,
                            completion,
@@ -229,9 +229,7 @@ class MockMutator : public Mutator {
  protected:
   std::shared_ptr<const configuration::nodes::NodesConfiguration>
   getNodesConfiguration() const override {
-    return test_->getConfig()
-        ->serverConfig()
-        ->getNodesConfigurationFromServerConfigSource();
+    return test_->nodes_config_;
   }
 
   std::unique_ptr<StorageSetAccessor> createStorageSetAccessor(
@@ -257,6 +255,10 @@ class MockMutator : public Mutator {
   getMutationTimeout() const override {
     return chrono_interval_t<std::chrono::milliseconds>{
         std::chrono::milliseconds(1), std::chrono::milliseconds(1)};
+  }
+
+  bool isShardAlive(ShardID shard) const override {
+    return ClusterState::isAliveState(test_->node_state_map_[shard]);
   }
 
   void finalize(Status status, ShardID node_not_in_config) override {
@@ -300,25 +302,19 @@ void MutatorTest::setUp() {
   dbg::assertOnData = true;
 
   // initialize the cluster config
-  Configuration::Nodes nodes;
-  addNodes(&nodes, 1, 2, "rg0.dc0.cl0.ro0.rk0", 1);
-  addNodes(&nodes, 1, 2, "rg1.dc0.cl0.ro0.rk0", 1);
-  addNodes(&nodes, 2, 2, "rg1.dc0.cl0.ro0.rk1", 2);
-  addNodes(&nodes, 1, 2, "rg1.dc0.cl0.ro0.rk2", 1);
-  addNodes(&nodes, 2, 2, "rg1.dc0.cl0..", 1);
-  addNodes(&nodes, 1, 2, "rg2.dc0.cl0.ro0.rk0", 1);
-  addNodes(&nodes, 1, 2, "rg2.dc0.cl0.ro0.rk1", 1);
-  addNodes(&nodes, 2, 2, "....", 1);
+  nodes_config_ = std::make_shared<const NodesConfiguration>();
+  addNodes(nodes_config_, 1, 2, "rg0.dc0.cl0.ro0.rk0", 1);
+  addNodes(nodes_config_, 1, 2, "rg1.dc0.cl0.ro0.rk0", 1);
+  addNodes(nodes_config_, 2, 2, "rg1.dc0.cl0.ro0.rk1", 2);
+  addNodes(nodes_config_, 1, 2, "rg1.dc0.cl0.ro0.rk2", 1);
+  addNodes(nodes_config_, 2, 2, "rg1.dc0.cl0..", 1);
+  addNodes(nodes_config_, 1, 2, "rg2.dc0.cl0.ro0.rk0", 1);
+  addNodes(nodes_config_, 1, 2, "rg2.dc0.cl0.ro0.rk1", 1);
+  addNodes(nodes_config_, 2, 2, "....", 1);
 
-  const size_t nodeset_size = nodes.size();
-  Configuration::NodesConfig nodes_config(std::move(nodes));
-
-  auto logs_config = std::make_shared<configuration::LocalLogsConfig>();
-  addLog(logs_config.get(), LOG_ID, replication_, 0, nodeset_size, {});
-
-  config_ = std::make_shared<Configuration>(
-      ServerConfig::fromDataTest("mutator_test", std::move(nodes_config)),
-      std::move(logs_config));
+  for (ShardID shard : shards_) {
+    node_state_map_[shard] = ClusterStateNodeState::FULLY_STARTED;
+  }
 
   nodeset_state_ = std::make_shared<NodeSetState>(
       shards_, LOG_ID, NodeSetState::HealthCheck::DISABLED);
@@ -364,8 +360,8 @@ MUTATED_Header MutatorTest::createMutatedHeader(uint32_t wave,
     }                                                                      \
     if (hole_) {                                                           \
       expected_flags |= STORE_Header::HOLE;                                \
-      const auto& ph = (message)->getPayloadHolder();                      \
-      ASSERT_TRUE(ph == nullptr || ph->size() == 0);                       \
+      const PayloadHolder* ph = (message)->getPayloadHolder();             \
+      ASSERT_EQ(0, ph->size());                                            \
     } else {                                                               \
       expected_flags |= STORE_Header::OFFSET_WITHIN_EPOCH;                 \
     }                                                                      \
@@ -552,6 +548,85 @@ TEST_F(MutatorTest, MultipleWaves) {
         ShardID(kv.first.index(), 0), createMutatedHeader(2, E::OK));
   }
   ASSERT_EQ(E::OK, mutation_status_);
+}
+
+// If the target node dies just before sending the message, socket
+// disconnection callback won't get called. We'll still need to
+// restart the recovery
+
+TEST_F(MutatorTest, NodeFailureDuringMessaging) {
+  hole_ = true;
+  replication_.assign(
+      {{NodeLocationScope::NODE, 3}, {NodeLocationScope::REGION, 2}});
+  amend_metadata_ = std::set<ShardID>{N2};
+  conflict_copies_ = std::set<ShardID>{N3, N4};
+  setUp();
+
+  mutator_->start();
+  // not done yet
+  ASSERT_EQ(E::UNKNOWN, mutation_status_);
+
+  // should send to 4 nodes since 2, 3, 4 are in the same region
+  ASSERT_EQ(4, messages_.size());
+  for (auto s : StorageSet{N2, N3, N4}) {
+    ASSERT_EQ(1, messages_.count(NodeID(s.node())));
+  }
+  for (const auto& kv : messages_) {
+    CHECK_STORE_MSG((*kv.second), kv.first.index(), 1);
+  }
+
+  // Disconnect N3
+  setNodeState(N3, ClusterStateNodeState::DEAD);
+  for (const auto& kv : messages_) {
+    auto shard = ShardID(kv.first.index(), 0);
+    mutator_->onMessageSent(
+        shard,
+        shard == N3 ? E::TIMEDOUT : E::OK,
+        dynamic_cast<STORE_Message*>(kv.second.get())->getHeader());
+  }
+  ASSERT_EQ(E::DISABLED, mutation_status_);
+}
+
+// Test the scenario that a node dies before responding to STORE
+// message and it triggers the socket close callback.
+TEST_F(MutatorTest, NodeFailureDisconnection) {
+  hole_ = true;
+  replication_.assign(
+      {{NodeLocationScope::NODE, 3}, {NodeLocationScope::REGION, 2}});
+  amend_metadata_ = std::set<ShardID>{N2};
+  conflict_copies_ = std::set<ShardID>{N3, N4};
+  setUp();
+
+  mutator_->start();
+  // not done yet
+  ASSERT_EQ(E::UNKNOWN, mutation_status_);
+
+  // should send to 4 nodes since 2, 3, 4 are in the same region
+  ASSERT_EQ(4, messages_.size());
+  for (auto s : StorageSet{N2, N3, N4}) {
+    ASSERT_EQ(1, messages_.count(NodeID(s.node())));
+  }
+  for (const auto& kv : messages_) {
+    CHECK_STORE_MSG((*kv.second), kv.first.index(), 1);
+  }
+
+  for (const auto& kv : messages_) {
+    mutator_->onMessageSent(
+        ShardID(kv.first.index(), 0),
+        E::OK,
+        dynamic_cast<STORE_Message*>(kv.second.get())->getHeader());
+  }
+  ASSERT_EQ(E::UNKNOWN, mutation_status_);
+  for (auto s : StorageSet{N2, N3}) {
+    mutator_->onStored(s, createMutatedHeader(1, E::OK));
+  }
+  // N4 disconnects with E::TIMEDOUT
+  setNodeState(N4, ClusterStateNodeState::DEAD);
+  auto* callback = socket_callbacks_[4];
+  ASSERT_NE(nullptr, callback);
+  (*callback)(E::TIMEDOUT, Address(NodeID(4)));
+
+  ASSERT_EQ(E::DISABLED, mutation_status_);
 }
 
 } // namespace

@@ -93,7 +93,7 @@ struct SecurityConfig {
   /**
    * Defines the TTL for entries in the ACL Cache in seconds.
    */
-  std::chrono::seconds aclCacheTtl{ 180 };
+  std::chrono::seconds aclCacheTtl{180};
 
   /**
    * Defines the max size for the ACL Cache.
@@ -105,6 +105,14 @@ struct SecurityConfig {
    * USER:logdevice. Used by clients to verify server identity.
    */
   std::string clusterNodeIdentity;
+
+  /**
+   * if enabled, clients will verify the identity of servers during handshake
+   * and fail if the principal doesn't match clusterNodeIdentity. Otherwise,
+   * clients will just log a message if the identity does not match, but allow
+   * the handshake to proceed.
+   */
+  bool enforceClusterNodeIdentity{false};
 
   /**
    * Returns whether or not the "permissions" field is allowed in the

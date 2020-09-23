@@ -62,239 +62,19 @@ TEST(ConfigurationTest, SimpleValid) {
       Configuration::fromJsonFile(TEST_CONFIG_FILE("sample_valid.conf")));
   ASSERT_NE(config, nullptr);
 
-  const auto& nodes = config->serverConfig()->getNodes();
   ASSERT_EQ(
       true,
       (bool)std::dynamic_pointer_cast<LocalLogsConfig>(config->logsConfig()));
   ASSERT_TRUE(config->logsConfig()->isLocal());
   auto logs_config = config->localLogsConfig();
 
-  ASSERT_EQ(5, nodes.size());
-
-  // N0 and N5 are sequencer nodes. The list of sequencers is padded to size 43.
-  const auto& seq_locator_config =
-      config->serverConfig()
-          ->getNodesConfigurationFromServerConfigSource()
-          ->getSequencersConfig();
-  EXPECT_EQ(43, seq_locator_config.nodes.size());
-  EXPECT_EQ(43, seq_locator_config.weights.size());
-  for (int i = 0; i <= 42; ++i) {
-    if (i == 0) {
-      EXPECT_EQ(NodeID(0, 3), seq_locator_config.nodes[i]);
-      EXPECT_EQ(1, seq_locator_config.weights[i]);
-    } else if (i == 5) {
-      EXPECT_EQ(NodeID(5, 2), seq_locator_config.nodes[i]);
-      EXPECT_EQ(1, seq_locator_config.weights[i]);
-    } else if (i == 6) {
-      EXPECT_EQ(NodeID(6, 2), seq_locator_config.nodes[i]);
-      EXPECT_EQ(1, seq_locator_config.weights[i]);
-    } else if (i == 42) {
-      EXPECT_EQ(NodeID(42, 5), seq_locator_config.nodes[i]);
-      EXPECT_EQ(1, seq_locator_config.weights[i]);
-    } else {
-      EXPECT_EQ(NodeID(), seq_locator_config.nodes[i]);
-      EXPECT_EQ(0, seq_locator_config.weights[i]);
-    }
-  }
-
-  // LogTracer Default Sampling Rate (percentage)
-  ASSERT_FALSE(config->serverConfig()
-                   ->getTracerSamplePercentage("UNKNOWN_TRACER")
-                   .hasValue());
-  EXPECT_DOUBLE_EQ(20.0, config->serverConfig()->getDefaultSamplePercentage());
-
-  EXPECT_DOUBLE_EQ(
-      15.4,
-      config->serverConfig()->getTracerSamplePercentage("appender").value());
-
-  char buf[256];
-
-  {
-    const Configuration::Node& node = nodes.at(0);
-    EXPECT_EQ(AF_INET, node.address.family());
-
-    ASSERT_EQ("server-0", node.name);
-    struct sockaddr_storage ss;
-    int len = node.address.toStructSockaddr(&ss);
-    ASSERT_NE(len, -1);
-    auto aptr = reinterpret_cast<const sockaddr_in*>(&ss);
-    const char* result =
-        inet_ntop(aptr->sin_family, &aptr->sin_addr, buf, sizeof buf);
-    EXPECT_NE(result, nullptr);
-    EXPECT_STREQ("127.0.0.1", buf);
-    int expected_port = htons(4444);
-    EXPECT_EQ(expected_port, aptr->sin_port);
-
-    EXPECT_TRUE(node.ssl_address);
-    EXPECT_EQ(AF_INET, node.ssl_address->family());
-
-    len = node.ssl_address->toStructSockaddr(&ss);
-    ASSERT_NE(len, -1);
-    aptr = reinterpret_cast<const sockaddr_in*>(&ss);
-    result = inet_ntop(aptr->sin_family, &aptr->sin_addr, buf, sizeof buf);
-    EXPECT_NE(result, nullptr);
-    EXPECT_STREQ("127.0.0.1", buf);
-    expected_port = htons(4446);
-    EXPECT_EQ(expected_port, aptr->sin_port);
-
-    ASSERT_TRUE(node.admin_address.hasValue());
-    EXPECT_EQ("127.0.0.1:6440", node.admin_address->toString());
-
-    EXPECT_EQ(configuration::StorageState::READ_WRITE, node.getStorageState());
-    EXPECT_EQ(1, node.storage_attributes->capacity);
-    EXPECT_EQ(1, node.getWritableStorageCapacity());
-
-    EXPECT_EQ(3, node.generation);
-    EXPECT_TRUE(node.isSequencingEnabled());
-
-    EXPECT_TRUE(node.location.hasValue());
-    const NodeLocation& location = node.location.value();
-    EXPECT_EQ("ash", location.getLabel(NodeLocationScope::REGION));
-    EXPECT_EQ("ash2", location.getLabel(NodeLocationScope::DATA_CENTER));
-    EXPECT_EQ("08", location.getLabel(NodeLocationScope::CLUSTER));
-    EXPECT_EQ("k", location.getLabel(NodeLocationScope::ROW));
-    EXPECT_EQ("z", location.getLabel(NodeLocationScope::RACK));
-    EXPECT_EQ("ash.ash2.08.k.z", node.locationStr());
-  }
-
-  {
-    const Configuration::Node& node = nodes.at(1);
-    EXPECT_EQ(AF_INET6, node.address.family());
-
-    ASSERT_EQ("server-1", node.name);
-    struct sockaddr_storage ss;
-    int len = node.address.toStructSockaddr(&ss);
-    ASSERT_NE(len, -1);
-    auto aptr = reinterpret_cast<const sockaddr_in6*>(&ss);
-    const char* result =
-        inet_ntop(aptr->sin6_family, &aptr->sin6_addr, buf, sizeof buf);
-    EXPECT_NE(result, nullptr);
-    EXPECT_STREQ("::1", buf);
-    int expected_port = htons(6666);
-    EXPECT_EQ(expected_port, aptr->sin6_port);
-
-    EXPECT_TRUE(node.ssl_address);
-    EXPECT_EQ(AF_INET6, node.ssl_address->family());
-
-    len = node.ssl_address->toStructSockaddr(&ss);
-    ASSERT_NE(len, -1);
-    aptr = reinterpret_cast<const sockaddr_in6*>(&ss);
-    result = inet_ntop(aptr->sin6_family, &aptr->sin6_addr, buf, sizeof buf);
-    EXPECT_NE(result, nullptr);
-    EXPECT_STREQ("::1", buf);
-    expected_port = htons(6670);
-    EXPECT_EQ(expected_port, aptr->sin6_port);
-
-    ASSERT_TRUE(node.admin_address.hasValue());
-    EXPECT_EQ("[::1]:6440", node.admin_address->toString());
-
-    EXPECT_EQ(configuration::StorageState::READ_WRITE,
-              node.storage_attributes->state);
-    EXPECT_EQ(4, node.storage_attributes->capacity);
-    EXPECT_EQ(4, node.getWritableStorageCapacity());
-
-    EXPECT_EQ(6, node.generation);
-    EXPECT_FALSE(node.isSequencingEnabled());
-    EXPECT_FALSE(node.location.hasValue());
-
-    EXPECT_FALSE(node.hasRole(NodeRole::SEQUENCER));
-    EXPECT_TRUE(node.hasRole(NodeRole::STORAGE));
-  }
-
-  {
-    const Configuration::Node& node = nodes.at(5);
-    EXPECT_EQ(AF_INET6, node.address.family());
-
-    ASSERT_EQ("server-5", node.name);
-    struct sockaddr_storage ss;
-    int len = node.address.toStructSockaddr(&ss);
-    ASSERT_NE(len, -1);
-    auto aptr = reinterpret_cast<const sockaddr_in6*>(&ss);
-    const char* result =
-        inet_ntop(aptr->sin6_family, &aptr->sin6_addr, buf, sizeof buf);
-    EXPECT_NE(result, nullptr);
-    EXPECT_STREQ("::1", buf);
-    int expected_port = htons(6669);
-    EXPECT_EQ(expected_port, aptr->sin6_port);
-
-    EXPECT_TRUE(node.ssl_address);
-    EXPECT_EQ(AF_INET6, node.ssl_address->family());
-
-    len = node.ssl_address->toStructSockaddr(&ss);
-    ASSERT_NE(len, -1);
-    aptr = reinterpret_cast<const sockaddr_in6*>(&ss);
-    result = inet_ntop(aptr->sin6_family, &aptr->sin6_addr, buf, sizeof buf);
-    EXPECT_NE(result, nullptr);
-    EXPECT_STREQ("::1", buf);
-    expected_port = htons(6673);
-    EXPECT_EQ(expected_port, aptr->sin6_port);
-
-    EXPECT_FALSE(node.admin_address.hasValue());
-
-    EXPECT_EQ(configuration::StorageState::READ_WRITE,
-              node.storage_attributes->state);
-    EXPECT_EQ(2, node.storage_attributes->capacity);
-    EXPECT_EQ(2, node.getWritableStorageCapacity());
-
-    EXPECT_EQ(2, node.generation);
-    EXPECT_TRUE(node.isSequencingEnabled());
-
-    ASSERT_TRUE(node.location.hasValue());
-    EXPECT_EQ("ash.ash2.07.a.b", node.locationStr());
-
-    EXPECT_TRUE(node.hasRole(NodeRole::SEQUENCER));
-    EXPECT_TRUE(node.hasRole(NodeRole::STORAGE));
-  }
-
-  {
-    const Configuration::Node& node = nodes.at(42);
-    EXPECT_EQ(AF_INET6, node.address.family());
-
-    ASSERT_EQ("server-42", node.name);
-    struct sockaddr_storage ss;
-    int len = node.address.toStructSockaddr(&ss);
-    ASSERT_NE(len, -1);
-    auto aptr = reinterpret_cast<const sockaddr_in6*>(&ss);
-    const char* result =
-        inet_ntop(aptr->sin6_family, &aptr->sin6_addr, buf, sizeof buf);
-    EXPECT_NE(result, nullptr);
-    EXPECT_STREQ("::1", buf);
-    int expected_port = htons(6668);
-    EXPECT_EQ(expected_port, aptr->sin6_port);
-
-    EXPECT_TRUE(node.ssl_address);
-    EXPECT_EQ(AF_INET6, node.ssl_address->family());
-
-    len = node.ssl_address->toStructSockaddr(&ss);
-    ASSERT_NE(len, -1);
-    aptr = reinterpret_cast<const sockaddr_in6*>(&ss);
-    result = inet_ntop(aptr->sin6_family, &aptr->sin6_addr, buf, sizeof buf);
-    EXPECT_NE(result, nullptr);
-    EXPECT_STREQ("::1", buf);
-    expected_port = htons(6672);
-    EXPECT_EQ(expected_port, aptr->sin6_port);
-
-    EXPECT_FALSE(node.admin_address.hasValue());
-
-    EXPECT_EQ(configuration::StorageState::READ_WRITE,
-              node.storage_attributes->state);
-    EXPECT_EQ(4, node.storage_attributes->capacity);
-    EXPECT_EQ(4, node.getWritableStorageCapacity());
-    EXPECT_EQ(5, node.generation);
-    EXPECT_TRUE(node.isSequencingEnabled());
-
-    ASSERT_TRUE(node.location.hasValue());
-    EXPECT_EQ("ash.ash2.07.a.b", node.locationStr());
-  }
-
   EXPECT_EQ(nullptr, config->getLogGroupByIDShared(logid_t(7)));
   EXPECT_FALSE(config->logsConfig()->logExists(logid_t(7)));
   {
     Semaphore sem;
-    std::shared_ptr<const LogsConfig::LogGroupNode> async_log_cfg;
+    LogsConfig::LogGroupNodePtr async_log_cfg;
     config->getLogGroupByIDAsync(
-        logid_t(7),
-        [&](const std::shared_ptr<const LogsConfig::LogGroupNode> log) {
+        logid_t(7), [&](const LogsConfig::LogGroupNodePtr log) {
           async_log_cfg = log;
           sem.post();
         });
@@ -302,8 +82,7 @@ TEST(ConfigurationTest, SimpleValid) {
     EXPECT_EQ(nullptr, async_log_cfg);
   }
 
-  const std::shared_ptr<LogsConfig::LogGroupNode> log =
-      config->getLogGroupByIDShared(logid_t(3));
+  const auto log = config->getLogGroupByIDShared(logid_t(3));
   EXPECT_TRUE(log);
   auto log_shared = config->getLogGroupByIDShared(logid_t(3));
   ASSERT_NE(log, nullptr);
@@ -312,10 +91,9 @@ TEST(ConfigurationTest, SimpleValid) {
   ASSERT_TRUE(config->logsConfig()->logExists(logid_t(3)));
   {
     Semaphore sem;
-    std::shared_ptr<const LogsConfig::LogGroupNode> async_log_cfg;
+    LogsConfig::LogGroupNodePtr async_log_cfg;
     config->getLogGroupByIDAsync(
-        logid_t(3),
-        [&](const std::shared_ptr<const LogsConfig::LogGroupNode> clog) {
+        logid_t(3), [&](const LogsConfig::LogGroupNodePtr clog) {
           async_log_cfg = clog;
           sem.post();
         });
@@ -335,7 +113,7 @@ TEST(ConfigurationTest, SimpleValid) {
   auto check_log = [&](logid_t::raw_type log,
                        const logsconfig::LogGroupInDirectory& gid_log) {
     const Configuration::LogAttributes& log_attrs = gid_log.log_group->attrs();
-    EXPECT_FALSE(log_attrs.backlogDuration().value().hasValue());
+    EXPECT_FALSE(log_attrs.backlogDuration().value().has_value());
     EXPECT_EQ(log >= 11, log_attrs.replicateAcross().hasValue());
     if (log >= 8 && log <= 10) {
       EXPECT_EQ(3, log_attrs.replicationFactor());
@@ -427,7 +205,7 @@ TEST(ConfigurationTest, SimpleValid) {
     EXPECT_EQ(
         NodeLocationScope::CLUSTER, meta_attrs.syncReplicationScope().value());
     auto& ml_conf = config->serverConfig()->getMetaDataLogsConfig();
-    EXPECT_TRUE(ml_conf.metadata_version_to_write.hasValue());
+    EXPECT_TRUE(ml_conf.metadata_version_to_write.has_value());
     EXPECT_EQ(1, ml_conf.metadata_version_to_write.value());
     EXPECT_EQ(NodeSetSelectorType::SELECT_ALL, ml_conf.nodeset_selector_type);
   }
@@ -448,7 +226,7 @@ TEST(ConfigurationTest, SimpleValid) {
       folly::dynamic::object("custom_field_for_testing", "custom_value");
   EXPECT_EQ(config->serverConfig()->getCustomFields(), fields);
   auto timestamp = config->serverConfig()->getClusterCreationTime();
-  EXPECT_TRUE(timestamp.hasValue());
+  EXPECT_TRUE(timestamp.has_value());
   EXPECT_EQ(timestamp.value().count(), 1467928224);
 }
 
@@ -475,178 +253,12 @@ TEST(ConfigurationTest, OverlappingLogIdRanges) {
   EXPECT_EQ(err, E::INVALID_CONFIG);
 }
 
-/**
- * Attempts to load configs with invalid roles config and checks that
- * they fail with E::INVALID_CONFIG.
- */
-TEST(ConfigurationTest, InvalidRolesConfig) {
-  using facebook::logdevice::E;
-  using facebook::logdevice::err;
-
-  std::shared_ptr<Configuration> config;
-
-  config =
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("invalid_roles_empty.conf"));
-  EXPECT_EQ(err, E::INVALID_CONFIG);
-
-  config = Configuration::fromJsonFile(
-      TEST_CONFIG_FILE("invalid_roles_unknown.conf"));
-  EXPECT_EQ(err, E::INVALID_CONFIG);
-
-  config = Configuration::fromJsonFile(
-      TEST_CONFIG_FILE("invalid_roles_not_array.conf"));
-  EXPECT_EQ(err, E::INVALID_CONFIG);
-
-  config = Configuration::fromJsonFile(
-      TEST_CONFIG_FILE("invalid_generation_with_non_storage_role.conf"));
-  EXPECT_EQ(err, E::INVALID_CONFIG);
-}
-
-/**
- * Attempts to load configs with properties that are only available
- * for some roles and ensure they fail with E::INVALID_CONFIG.
- */
-TEST(ConfigurationTest, InvalidPropertiesRoles) {
-  using facebook::logdevice::E;
-  using facebook::logdevice::err;
-
-  std::shared_ptr<Configuration> config;
-
-  config = Configuration::fromJsonFile(
-      TEST_CONFIG_FILE("invalid_properties_storage1.conf"));
-  EXPECT_EQ(err, E::INVALID_CONFIG);
-}
-
-/**
- * Exercises getNode().
- */
-TEST(ConfigurationTest, LookupNodeByID) {
-  std::shared_ptr<Configuration> config(
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("sample_valid.conf")));
+TEST(ConfigurationTest, NoNodesNoMetadata) {
+  std::shared_ptr<Configuration> config(Configuration::fromJsonFile(
+      TEST_CONFIG_FILE("no_nodes_no_metadata.conf")));
   ASSERT_NE(config, nullptr);
-
-  using facebook::logdevice::E;
-  using facebook::logdevice::err;
-
-  const Configuration::Node* node;
-
-  // Search for the first node (index=0).  Lookup should succeed with the
-  // right generation.
-  node = config->serverConfig()->getNode(NodeID(0, 3));
-  EXPECT_NE(node, nullptr);
-  EXPECT_EQ(
-      configuration::StorageState::READ_WRITE, node->storage_attributes->state);
-  EXPECT_EQ(1, node->storage_attributes->capacity);
-  EXPECT_EQ(1, node->getWritableStorageCapacity());
-  EXPECT_EQ(nullptr, config->serverConfig()->getNode(NodeID(0, 2)));
-  EXPECT_EQ(E::NOTFOUND, err);
-  EXPECT_EQ(nullptr, config->serverConfig()->getNode(NodeID(0, 4)));
-  EXPECT_EQ(E::NOTFOUND, err);
-
-  // Same for the second node
-  node = config->serverConfig()->getNode(NodeID(1, 6));
-  EXPECT_NE(node, nullptr);
-  EXPECT_EQ(
-      configuration::StorageState::READ_WRITE, node->storage_attributes->state);
-  EXPECT_EQ(4, node->storage_attributes->capacity);
-  EXPECT_EQ(4, node->getWritableStorageCapacity());
-  EXPECT_EQ(nullptr, config->serverConfig()->getNode(NodeID(1, 5)));
-  EXPECT_EQ(E::NOTFOUND, err);
-  EXPECT_EQ(nullptr, config->serverConfig()->getNode(NodeID(1, 7)));
-  EXPECT_EQ(E::NOTFOUND, err);
-
-  node = config->serverConfig()->getNode(NodeID(5, 2));
-  EXPECT_NE(node, nullptr);
-  EXPECT_EQ(
-      configuration::StorageState::READ_WRITE, node->storage_attributes->state);
-  EXPECT_EQ(2, node->storage_attributes->capacity);
-  EXPECT_EQ(2, node->getWritableStorageCapacity());
-  EXPECT_EQ(nullptr, config->serverConfig()->getNode(NodeID(5, 1)));
-  EXPECT_EQ(E::NOTFOUND, err);
-  EXPECT_EQ(nullptr, config->serverConfig()->getNode(NodeID(5, 100)));
-  EXPECT_EQ(E::NOTFOUND, err);
-
-  node = config->serverConfig()->getNode(42);
-  EXPECT_NE(node, nullptr);
-  EXPECT_EQ(
-      configuration::StorageState::READ_WRITE, node->storage_attributes->state);
-  EXPECT_EQ(4, node->storage_attributes->capacity);
-  EXPECT_EQ(4, node->getWritableStorageCapacity());
-}
-
-TEST(ConfigurationTest, SSLNodeToNode) {
-  std::shared_ptr<Configuration> config(
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("sample_valid.conf")));
-  ASSERT_NE(config, nullptr);
-
-// The int conversions below are used to circumvent an issue where
-// ASSERT_EQ(<bool>, ...) doesn't build on gcc
-#define TEST_NODE_TO_NODE_SSL(scope, exp_result)                               \
-  do {                                                                         \
-    const auto& nodes = config->serverConfig()->getNodes();                    \
-    NodeID nid0 = NodeID(0, nodes.at(0).generation);                           \
-    NodeID nid2 = NodeID(5, nodes.at(5).generation);                           \
-    const auto nc =                                                            \
-        config->serverConfig()->getNodesConfigurationFromServerConfigSource(); \
-    ASSERT_EQ((int)exp_result,                                                 \
-              configuration::nodes::getNodeSSL(                                \
-                  *nc, nodes.at(0).location, nid2.index(), scope));            \
-    ASSERT_EQ((int)exp_result,                                                 \
-              configuration::nodes::getNodeSSL(                                \
-                  *nc, nodes.at(5).location, nid0.index(), scope));            \
-  } while (0)
-
-  const auto& nodes = config->serverConfig()->getNodes();
-
-  // Nodes in the same data center
-  EXPECT_EQ("ash.ash2.08.k.z", nodes.at(0).locationStr());
-  EXPECT_EQ("ash.ash2.07.a.b", nodes.at(5).locationStr());
-
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::NODE, true);
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::RACK, true);
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::ROW, true);
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::CLUSTER, true);
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::DATA_CENTER, false);
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::REGION, false);
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::ROOT, false);
-
-  // Nodes in different regions
-  EXPECT_EQ(0,
-            const_cast<NodeLocation&>(*nodes.at(5).location)
-                .fromDomainString("lla.lla1.08.k.z"));
-
-  auto recompute_config = [&]() {
-    auto sc = config->serverConfig();
-    config =
-        std::make_shared<Configuration>(sc->withNodes(sc->getNodesConfig()),
-                                        config->logsConfig(),
-                                        config->zookeeperConfig());
-    ld_check(config != nullptr);
-  };
-
-  recompute_config();
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::NODE, true);
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::RACK, true);
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::ROW, true);
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::CLUSTER, true);
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::DATA_CENTER, true);
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::REGION, true);
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::ROOT, false);
-
-  // Nodes in the same rack
-  EXPECT_EQ(0,
-            const_cast<NodeLocation&>(
-                *config->serverConfig()->getNodes().at(5).location)
-                .fromDomainString("ash.ash2.08.k.z"));
-
-  recompute_config();
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::NODE, true);
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::RACK, false);
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::ROW, false);
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::CLUSTER, false);
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::DATA_CENTER, false);
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::REGION, false);
-  TEST_NODE_TO_NODE_SSL(NodeLocationScope::ROOT, false);
+  // Assert that serializing the config back doesn't crash.
+  config->toString();
 }
 
 namespace facebook { namespace logdevice { namespace configuration {
@@ -686,40 +298,6 @@ TEST(ConfigurationTest, ParseIpPort) {
   EXPECT_EQ(strpair(), parseIpPort("123.123.0.0]:12345")); // no open bracket
   EXPECT_EQ(strpair(), parseIpPort("[123::abc:123"));      // no closing bracket
   EXPECT_EQ(strpair(), parseIpPort("[123::abc]:"));        // no port
-}
-
-TEST(ConfigurationTest, Sockaddr) {
-  std::shared_ptr<Configuration> config(
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("sample_valid.conf")));
-  ASSERT_NE(nullptr, config);
-
-  const auto& nodes = config->serverConfig()->getNodes();
-
-  ASSERT_TRUE(nodes.at(0).address.valid());
-  ASSERT_TRUE(nodes.at(1).address.valid());
-
-  EXPECT_EQ(4444, nodes.at(0).address.port());
-  EXPECT_EQ(6666, nodes.at(1).address.port());
-
-  EXPECT_EQ("127.0.0.1:4444", nodes.at(0).address.toString());
-  EXPECT_EQ("[::1]:6666", nodes.at(1).address.toString());
-}
-
-TEST(ConfigurationTest, SockaddrFromString) {
-  std::shared_ptr<Configuration> config(
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("sample_valid.conf")));
-  ASSERT_NE(nullptr, config);
-
-  const auto& nodes = config->serverConfig()->getNodes();
-  auto check_address = [](const facebook::logdevice::Sockaddr& a) {
-    auto r = facebook::logdevice::Sockaddr::fromString(a.toString());
-    EXPECT_TRUE(r.hasValue());
-    EXPECT_EQ(a, r);
-  };
-
-  for (const auto& kv : nodes) {
-    check_address(kv.second.address);
-  }
 }
 
 TEST(ConfigurationTest, SockaddrDefaultConstructor) {
@@ -780,24 +358,6 @@ TEST(ConfigurationTest, DuplicateRangeNames) {
   EXPECT_EQ(err, E::INVALID_CONFIG);
 }
 
-TEST(ConfigurationTest, DuplicateHost) {
-  using namespace facebook::logdevice;
-
-  std::shared_ptr<Configuration> config(
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("duphost.conf")));
-  ASSERT_EQ(nullptr, config);
-  EXPECT_EQ(err, E::INVALID_CONFIG);
-}
-
-TEST(ConfigurationTest, DuplicateName) {
-  using namespace facebook::logdevice;
-
-  std::shared_ptr<Configuration> config(
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("dup_server_name.conf")));
-  ASSERT_EQ(nullptr, config);
-  EXPECT_EQ(err, E::INVALID_CONFIG);
-}
-
 TEST(ConfigurationTest, NegativeReplicationFactor) {
   using namespace facebook::logdevice;
 
@@ -826,22 +386,6 @@ TEST(ConfigurationTest, DupMetaNodes) {
   EXPECT_EQ(err, E::INVALID_CONFIG);
 }
 
-TEST(ConfigurationTest, InvalidMetaDataNodeSet) {
-  using namespace facebook::logdevice;
-  std::shared_ptr<Configuration> config(Configuration::fromJsonFile(
-      TEST_CONFIG_FILE("invalid_metadata_logs.conf")));
-  EXPECT_EQ(err, E::INVALID_CONFIG);
-  ASSERT_EQ(nullptr, config->logsConfig());
-}
-
-TEST(ConfigurationTest, InvalidNodeInMetaDataNodeSet) {
-  using namespace facebook::logdevice;
-  std::shared_ptr<Configuration> config(
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("bad_metadata_id.conf")));
-  EXPECT_EQ(err, E::INVALID_CONFIG);
-  ASSERT_EQ(nullptr, config->logsConfig());
-}
-
 TEST(ConfigurationTest, Defaults) {
   using namespace facebook::logdevice;
 
@@ -849,13 +393,7 @@ TEST(ConfigurationTest, Defaults) {
       Configuration::fromJsonFile(TEST_CONFIG_FILE("defaults.conf")));
 
   ASSERT_NE(nullptr, config);
-  std::shared_ptr<LogsConfig::LogGroupNode> log;
-
-  // rate with no default override in cfg at all
-  ASSERT_FALSE(config->serverConfig()
-                   ->getTracerSamplePercentage("UNKNOWN_TRACER")
-                   .hasValue());
-  EXPECT_DOUBLE_EQ(0.1, config->serverConfig()->getDefaultSamplePercentage());
+  LogsConfig::LogGroupNodePtr log;
 
   log = config->getLogGroupByIDShared(logid_t(1));
   ASSERT_NE(nullptr, log);
@@ -867,7 +405,7 @@ TEST(ConfigurationTest, Defaults) {
   EXPECT_EQ(1000, *attrs.maxWritesInFlight());
   EXPECT_EQ(0, *attrs.singleWriter());
   EXPECT_EQ(NodeLocationScope::RACK, *attrs.syncReplicationScope());
-  EXPECT_FALSE(attrs.backlogDuration().value().hasValue());
+  EXPECT_FALSE(attrs.backlogDuration().value().has_value());
   EXPECT_EQ(3, *attrs.nodeSetSize());
   EXPECT_EQ(std::chrono::milliseconds(10), *attrs.deliveryLatency());
   EXPECT_TRUE(*attrs.scdEnabled());
@@ -878,7 +416,7 @@ TEST(ConfigurationTest, Defaults) {
 
   log = config->getLogGroupByIDShared(logid_t(2));
   const auto& attrs2 = log->attrs();
-  EXPECT_TRUE(attrs2.backlogDuration().value().hasValue());
+  EXPECT_TRUE(attrs2.backlogDuration().value().has_value());
   EXPECT_EQ(std::chrono::seconds(3600 * 24 * 4),
             attrs2.backlogDuration().value().value());
 
@@ -897,7 +435,7 @@ TEST(ConfigurationTest, Defaults) {
   EXPECT_NE(config->serverConfig()->getCustomFields(), nullptr);
   EXPECT_EQ(config->serverConfig()->getCustomFields().size(), 0);
   auto timestamp = config->serverConfig()->getClusterCreationTime();
-  EXPECT_FALSE(timestamp.hasValue());
+  EXPECT_FALSE(timestamp.has_value());
 }
 
 TEST(ConfigurationTest, BadID) {
@@ -910,74 +448,6 @@ TEST(ConfigurationTest, BadID) {
   EXPECT_EQ(err, E::INVALID_CONFIG);
 }
 
-TEST(ConfigurationTest, SequencerWeights) {
-  using namespace facebook::logdevice;
-
-  std::shared_ptr<Configuration> config(
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("sequencer_weights.conf")));
-  ASSERT_NE(nullptr, config.get());
-  ASSERT_EQ(8, config->serverConfig()->getNodes().size());
-
-  {
-    // Validating the SequencerNodeAttributes structs
-    std::vector<SequencerNodeAttributes> expected{
-        {false, 0},
-        {true, 1},
-        {true, 2},
-        {true, 4},
-        {false, 8},
-        {false, 8},
-        {true, 1},
-        {true, 0},
-    };
-
-    std::vector<SequencerNodeAttributes> got;
-    const auto& nodes = config->serverConfig()->getNodes();
-    for (short i = 0; i <= config->getNodesConfigurationFromServerConfigSource()
-                               ->getMaxNodeIndex();
-         i++) {
-      node_index_t idx{i};
-      if (nodes.find(idx) == nodes.end()) {
-        continue;
-      }
-      got.push_back(*nodes.at(idx).sequencer_attributes);
-    }
-
-    EXPECT_EQ(expected, got);
-  }
-
-  {
-    // Validating that SequencersConfig is properly calculated.
-    const auto& seq_config = config->serverConfig()
-                                 ->getNodesConfigurationFromServerConfigSource()
-                                 ->getSequencersConfig();
-
-    // check padded node IDs
-    EXPECT_EQ(std::vector<NodeID>({NodeID(),
-                                   NodeID(1, 1),
-                                   NodeID(2, 1),
-                                   NodeID(3, 1),
-                                   NodeID(),
-                                   NodeID(),
-                                   NodeID(6, 1),
-                                   NodeID()}),
-              seq_config.nodes);
-
-    // check normalized weights
-    EXPECT_EQ(std::vector<double>({0, .25, .5, 1, 0, 0, 0.25, 0}),
-              seq_config.weights);
-
-    EXPECT_FALSE(config->serverConfig()->getNode(0)->isSequencingEnabled());
-    EXPECT_TRUE(config->serverConfig()->getNode(1)->isSequencingEnabled());
-    EXPECT_TRUE(config->serverConfig()->getNode(2)->isSequencingEnabled());
-    EXPECT_TRUE(config->serverConfig()->getNode(3)->isSequencingEnabled());
-    EXPECT_FALSE(config->serverConfig()->getNode(4)->isSequencingEnabled());
-    EXPECT_FALSE(config->serverConfig()->getNode(5)->isSequencingEnabled());
-    EXPECT_TRUE(config->serverConfig()->getNode(6)->isSequencingEnabled());
-    EXPECT_FALSE(config->serverConfig()->getNode(7)->isSequencingEnabled());
-  }
-}
-
 TEST(ConfigurationTest, Serialization) {
   std::string read_str =
       parser::readFileIntoString(TEST_CONFIG_FILE("serialization_test.conf"));
@@ -985,138 +455,6 @@ TEST(ConfigurationTest, Serialization) {
       Configuration::fromJsonFile(TEST_CONFIG_FILE("serialization_test.conf")));
   auto serialized_str = config->toString();
   FOLLY_EXPECT_JSON_EQ(read_str, serialized_str);
-}
-
-/**
- * Reads configs/included_logs.conf and checks if the log list from
- * configs/included_logs.inc was included.
- */
-TEST(ConfigurationTest, IncludeLogs) {
-  std::shared_ptr<Configuration> config(
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("included_logs.conf")));
-  ASSERT_NE(nullptr, config);
-
-  ASSERT_EQ(
-      true,
-      (bool)std::dynamic_pointer_cast<LocalLogsConfig>(config->logsConfig()));
-  ASSERT_TRUE(config->logsConfig()->isLocal());
-  auto& logs_config = config->localLogsConfig();
-  {
-    const int NLOGS = 6;
-    logid_t::raw_type logids[NLOGS] = {1, 2, 3, 8, 9, 10};
-    int i = 0;
-
-    for (auto it = logs_config->logsBegin(); it != logs_config->logsEnd();
-         ++it) {
-      ASSERT_LT(i, NLOGS);
-      EXPECT_EQ(it->first, logids[i]);
-
-      if (logids[i] >= 8 && logids[i] <= 10) {
-        const logsconfig::LogGroupInDirectory& log = it->second;
-        const Configuration::LogAttributes& log_attrs = log.log_group->attrs();
-        EXPECT_EQ(3, log_attrs.replicationFactor());
-        EXPECT_EQ(2, log_attrs.extraCopies());
-        EXPECT_EQ(0, log_attrs.syncedCopies());
-        EXPECT_EQ(10, log_attrs.maxWritesInFlight());
-      }
-
-      i++;
-    }
-    ASSERT_EQ(NLOGS, i);
-  }
-
-  EXPECT_NE(config->serverConfig()->getCustomFields(), nullptr);
-  EXPECT_EQ(config->serverConfig()->getCustomFields().size(), 0);
-  auto timestamp = config->serverConfig()->getClusterCreationTime();
-  EXPECT_FALSE(timestamp.hasValue());
-}
-
-/*
- * Reads configs/included_logs.conf but doesn't include the log list.
- */
-
-using RangeLookupMap = LogsConfig::NamespaceRangeLookupMap;
-
-class TestLogsConfigStub : public LogsConfig {
-  bool isLocal() const override {
-    return false;
-  }
-
-  std::shared_ptr<LogsConfig::LogGroupNode>
-  getLogGroupByIDShared(logid_t /* unused */) const override {
-    return nullptr;
-  }
-
-  void getLogGroupByIDAsync(
-      logid_t /* unused */,
-      std::function<void(std::shared_ptr<LogsConfig::LogGroupNode>)> cb)
-      const override {
-    cb(nullptr);
-  }
-
-  bool logExists(logid_t /*id*/) const override {
-    return false;
-  }
-
-  void getLogRangeByNameAsync(
-      std::string,
-      std::function<void(Status, std::pair<logid_t, logid_t>)> cb)
-      const override {
-    cb(E::NOTFOUND, std::make_pair(logid_t(0), logid_t(0)));
-  }
-
-  std::shared_ptr<logsconfig::LogGroupNode>
-  getLogGroup(const std::string& /*path*/) const override {
-    err = E::NOTFOUND;
-    return nullptr;
-  };
-
-  void getLogRangesByNamespaceAsync(
-      const std::string&,
-      std::function<void(Status, RangeLookupMap)> cb) const override {
-    cb(E::NOTFOUND, RangeLookupMap());
-  }
-
-  std::unique_ptr<LogsConfig> copy() const override {
-    return std::unique_ptr<LogsConfig>(new TestLogsConfigStub(*this));
-  }
-};
-
-TEST(ConfigurationTest, SkipIncludeLogs) {
-  std::unique_ptr<LogsConfig> logs_config(new TestLogsConfigStub());
-  std::shared_ptr<Configuration> config(Configuration::fromJsonFile(
-      TEST_CONFIG_FILE("included_logs.conf"), std::move(logs_config)));
-  ASSERT_NE(nullptr, config);
-  ASSERT_FALSE(
-      (bool)std::dynamic_pointer_cast<LocalLogsConfig>(config->logsConfig()));
-  ASSERT_FALSE(config->logsConfig()->isLocal());
-
-  bool callback_called = false;
-  // This will actually get called synchronously
-  config->getLogGroupByIDAsync(
-      logid_t(1), [&](const std::shared_ptr<LogsConfig::LogGroupNode> ptr) {
-        callback_called = true;
-        ASSERT_EQ(nullptr, ptr.get());
-      });
-  ASSERT_TRUE(callback_called);
-}
-
-/**
- * Reads configs/invalid_included_logs1.conf and checks that the test fails
- */
-TEST(ConfigurationTest, DoubleLogSpec) {
-  std::shared_ptr<Configuration> config(Configuration::fromJsonFile(
-      TEST_CONFIG_FILE("invalid_included_logs1.conf")));
-  ASSERT_EQ(nullptr, config->logsConfig());
-}
-
-/**
- * Reads configs/invalid_included_logs2.conf and checks that the test fails
- */
-TEST(ConfigurationTest, NonExistentIncludeLog) {
-  std::shared_ptr<Configuration> config(Configuration::fromJsonFile(
-      TEST_CONFIG_FILE("invalid_included_logs2.conf")));
-  ASSERT_EQ(nullptr, config->logsConfig());
 }
 
 /**
@@ -1198,7 +536,7 @@ TEST(ConfigurationTest, LogsWithNamespaces) {
   EXPECT_NE(config->serverConfig()->getCustomFields(), nullptr);
   EXPECT_EQ(config->serverConfig()->getCustomFields().size(), 0);
   auto timestamp = config->serverConfig()->getClusterCreationTime();
-  EXPECT_FALSE(timestamp.hasValue());
+  EXPECT_FALSE(timestamp.has_value());
 }
 
 /**
@@ -1211,8 +549,7 @@ TEST(ConfigurationTest, CustomFields) {
       Configuration::fromJsonFile(TEST_CONFIG_FILE("custom_fields.conf")));
   ASSERT_NE(nullptr, config);
 
-  std::shared_ptr<LogsConfig::LogGroupNode> log =
-      config->getLogGroupByIDShared(logid_t(1));
+  auto log = config->getLogGroupByIDShared(logid_t(1));
   ASSERT_NE(nullptr, log);
   ASSERT_EQ(1, log->attrs().extras().value().size());
 
@@ -1231,7 +568,7 @@ TEST(ConfigurationTest, CustomFields) {
       "custom_field_test4", folly::dynamic::array("value_at_0", "value_at_1"));
   EXPECT_EQ(config->serverConfig()->getCustomFields(), customFields);
   auto timestamp = config->serverConfig()->getClusterCreationTime();
-  EXPECT_FALSE(timestamp.hasValue());
+  EXPECT_FALSE(timestamp.has_value());
 }
 
 template <typename T>
@@ -1299,25 +636,6 @@ TEST(ConfigurationTest, LogsConfigSerialization) {
 }
 
 /**
- * Reads a config that has both ssl_host and ssl_port set for a node - should
- * fail.
- */
-TEST(ConfigurationTest, NodeSSLDoubleConfigFail) {
-  std::shared_ptr<Configuration> config(
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("ssl_double_fail.conf")));
-  ASSERT_EQ(nullptr, config);
-}
-
-/**
- * Config with ssl set only for some of the hosts. Should fail.
- */
-TEST(ConfigurationTest, PartialSSLNodes) {
-  std::shared_ptr<Configuration> config(
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("partial_ssl_nodes.conf")));
-  ASSERT_EQ(nullptr, config);
-}
-
-/**
  * Tests that parsing a valid config with security_info and permissions set
  */
 TEST(ConfigurationTest, SecurityAndPermissionInfo) {
@@ -1338,8 +656,7 @@ TEST(ConfigurationTest, SecurityAndPermissionInfo) {
             config->serverConfig()->getSecurityConfig().aclCacheTtl);
 
   ASSERT_TRUE(config->logsConfig()->logExists(logid_t(1)));
-  const std::shared_ptr<LogsConfig::LogGroupNode> log =
-      config->getLogGroupByIDShared(logid_t(1));
+  const auto log = config->getLogGroupByIDShared(logid_t(1));
   ASSERT_NE(nullptr, log);
   const auto& permissions = log->attrs().permissions().value();
 
@@ -1380,8 +697,7 @@ TEST(ConfigurationTest, SecurityAndPermissionInfo) {
   // check that for logs that did not set any permissions, default permissions
   // propergate to them
   ASSERT_TRUE(config->logsConfig()->logExists(logid_t(11)));
-  const std::shared_ptr<LogsConfig::LogGroupNode> log2 =
-      config->getLogGroupByIDShared(logid_t(11));
+  const auto log2 = config->getLogGroupByIDShared(logid_t(11));
   ASSERT_NE(nullptr, log2);
 
   const auto& permissions2 = log2->attrs().permissions().value();
@@ -1419,7 +735,7 @@ TEST(ConfigurationTest, SecurityAndPermissionInfo) {
   EXPECT_NE(config->serverConfig()->getCustomFields(), nullptr);
   EXPECT_EQ(config->serverConfig()->getCustomFields().size(), 0);
   auto timestamp = config->serverConfig()->getClusterCreationTime();
-  EXPECT_FALSE(timestamp.hasValue());
+  EXPECT_FALSE(timestamp.has_value());
 }
 
 /**
@@ -1557,7 +873,7 @@ TEST(ConfigurationTest, InvalidUseOfPermissionDefault) {
 TEST(ConfigurationTest, InvalidUseOfPermissionLog) {
   std::shared_ptr<Configuration> config(Configuration::fromJsonFile(
       TEST_CONFIG_FILE("invalid_use_of_permission2.conf")));
-  ASSERT_EQ(nullptr, config);
+  ASSERT_EQ(nullptr, config->logsConfig());
 }
 
 /**
@@ -1568,24 +884,6 @@ TEST(ConfigurationTest, InvalidActionInPermissions) {
   std::shared_ptr<Configuration> config(Configuration::fromJsonFile(
       TEST_CONFIG_FILE("config_permission_invalid_action.conf")));
   ASSERT_EQ(nullptr, config->logsConfig());
-}
-
-/**
- * Node has no node_id.
- */
-TEST(ConfigurationTest, NoID) {
-  std::shared_ptr<Configuration> config(
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("noid.conf")));
-  ASSERT_EQ(nullptr, config);
-}
-
-/**
- * Two nodes have the same node_id.
- */
-TEST(ConfigurationTest, DupID) {
-  std::shared_ptr<Configuration> config(
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("dupid.conf")));
-  ASSERT_EQ(nullptr, config);
 }
 
 /**
@@ -1681,8 +979,7 @@ TEST(ConfigurationTest, MetaDataLogsConfig) {
       auto json = parser::parseJson(str);
       // Make sure the parsed string is actually an object
       ld_check(json.isObject());
-      return Configuration::fromJson(
-          json, nullptr, nullptr, ConfigParserOptions());
+      return Configuration::fromJson(json, nullptr, ConfigParserOptions());
     };
     auto config = config_from_json_str(conf_str);
     if (!config) {
@@ -1702,7 +999,7 @@ TEST(ConfigurationTest, MetaDataLogsConfig) {
     auto cfg = get_config("");
     ASSERT_NE(cfg, nullptr);
     auto& ml_config = cfg->serverConfig()->getMetaDataLogsConfig();
-    ASSERT_FALSE(ml_config.metadata_version_to_write.hasValue());
+    ASSERT_FALSE(ml_config.metadata_version_to_write.has_value());
     EXPECT_EQ(NodeSetSelectorType::CONSISTENT_HASHING,
               ml_config.nodeset_selector_type);
     ASSERT_EQ(epoch_metadata_version::CURRENT,
@@ -1712,7 +1009,7 @@ TEST(ConfigurationTest, MetaDataLogsConfig) {
     auto cfg = get_config("\"metadata_version\": 1");
     ASSERT_NE(cfg, nullptr);
     auto& ml_config = cfg->serverConfig()->getMetaDataLogsConfig();
-    ASSERT_TRUE(ml_config.metadata_version_to_write.hasValue());
+    ASSERT_TRUE(ml_config.metadata_version_to_write.has_value());
     ASSERT_EQ(1, ml_config.metadata_version_to_write.value());
     ASSERT_EQ(1, epoch_metadata_version::versionToWrite(cfg->serverConfig()));
     EXPECT_EQ(NodeSetSelectorType::CONSISTENT_HASHING,
@@ -1722,7 +1019,7 @@ TEST(ConfigurationTest, MetaDataLogsConfig) {
     auto cfg = get_config("\"nodeset_selector\": \"random-crossdomain\"");
     ASSERT_NE(cfg, nullptr);
     auto& ml_config = cfg->serverConfig()->getMetaDataLogsConfig();
-    ASSERT_FALSE(ml_config.metadata_version_to_write.hasValue());
+    ASSERT_FALSE(ml_config.metadata_version_to_write.has_value());
     ASSERT_EQ(epoch_metadata_version::CURRENT,
               epoch_metadata_version::versionToWrite(cfg->serverConfig()));
     EXPECT_EQ(NodeSetSelectorType::RANDOM_CROSSDOMAIN,
@@ -1732,7 +1029,7 @@ TEST(ConfigurationTest, MetaDataLogsConfig) {
     auto cfg = get_config("\"nodeset_selector\": \"random\"");
     ASSERT_NE(cfg, nullptr);
     auto& ml_config = cfg->serverConfig()->getMetaDataLogsConfig();
-    ASSERT_FALSE(ml_config.metadata_version_to_write.hasValue());
+    ASSERT_FALSE(ml_config.metadata_version_to_write.has_value());
     ASSERT_EQ(epoch_metadata_version::CURRENT,
               epoch_metadata_version::versionToWrite(cfg->serverConfig()));
     EXPECT_EQ(NodeSetSelectorType::RANDOM, ml_config.nodeset_selector_type);
@@ -1741,7 +1038,7 @@ TEST(ConfigurationTest, MetaDataLogsConfig) {
     auto cfg = get_config("\"nodeset_selector\": \"select-all\"");
     ASSERT_NE(cfg, nullptr);
     auto& ml_config = cfg->serverConfig()->getMetaDataLogsConfig();
-    ASSERT_FALSE(ml_config.metadata_version_to_write.hasValue());
+    ASSERT_FALSE(ml_config.metadata_version_to_write.has_value());
     ASSERT_EQ(epoch_metadata_version::CURRENT,
               epoch_metadata_version::versionToWrite(cfg->serverConfig()));
     EXPECT_EQ(NodeSetSelectorType::SELECT_ALL, ml_config.nodeset_selector_type);
@@ -1808,8 +1105,7 @@ TEST(ConfigurationTest, ACLS) {
   std::shared_ptr<Configuration> config(Configuration::fromJsonFile(
       TEST_CONFIG_FILE("conf_permission_acl_test.conf")));
   ASSERT_NE(nullptr, config);
-  const std::shared_ptr<LogsConfig::LogGroupNode> log =
-      config->getLogGroupByIDShared(logid_t(1));
+  const auto log = config->getLogGroupByIDShared(logid_t(1));
   ASSERT_NE(log, nullptr);
   const Configuration::LogAttributes& log_attrs = log->attrs();
 
@@ -1829,8 +1125,7 @@ TEST(ConfigurationTest, SequencerAffinity) {
   std::shared_ptr<Configuration> config = Configuration::fromJsonFile(
       TEST_CONFIG_FILE("sequencer_affinity_2nodes.conf"));
   ASSERT_NE(config, nullptr);
-  const std::shared_ptr<LogsConfig::LogGroupNode> log =
-      config->getLogGroupByIDShared(logid_t(1));
+  const auto log = config->getLogGroupByIDShared(logid_t(1));
   ASSERT_NE(log, nullptr);
   const Configuration::LogAttributes& log_attrs = log->attrs();
   ASSERT_TRUE(log_attrs.sequencerAffinity().hasValue());
@@ -1842,106 +1137,4 @@ TEST(ConfigurationTest, SequencerAffinity) {
       TEST_CONFIG_FILE("invalid_sequencer_affinity.conf"));
   EXPECT_EQ(config->logsConfig(), nullptr);
   EXPECT_EQ(err, E::INVALID_CONFIG);
-}
-
-// Tests various combinations of storage_capacity, storage and weight attributes
-TEST(ConfigurationTest, StorageCapacityVsWeight) {
-  using facebook::logdevice::configuration::StorageState;
-
-  // Configs with storage_capacity or weight specified for writable nodes
-  std::string path(TEST_CONFIG_FILE("storage_capacity_success1.conf"));
-  ld_info("Loading %s, expecting it to succeed", path.c_str());
-  auto config = Configuration::fromJsonFile(path.c_str());
-  ASSERT_NE(config, nullptr);
-
-  auto verify_node = [&](node_index_t node_id,
-                         StorageState state,
-                         double storage_capacity,
-                         int weight,
-                         bool exclude_from_nodesets) {
-    ld_info("Verifying node %d", node_id);
-    auto const node = config->serverConfig()->getNode(node_id);
-    EXPECT_NE(nullptr, node);
-    if (node->storage_attributes != nullptr) {
-      EXPECT_EQ(state, node->storage_attributes->state);
-      EXPECT_EQ(storage_capacity, node->storage_attributes->capacity);
-      EXPECT_EQ(exclude_from_nodesets,
-                node->storage_attributes->exclude_from_nodesets);
-    } else {
-      EXPECT_EQ(state, configuration::StorageState::DISABLED);
-      EXPECT_EQ(storage_capacity, 0);
-    }
-
-    double expected_capacity = storage_capacity;
-    if (state != StorageState::READ_WRITE) {
-      expected_capacity = 0;
-    }
-    EXPECT_EQ(expected_capacity, node->getWritableStorageCapacity());
-    EXPECT_EQ(weight, node->getLegacyWeight());
-  };
-
-  verify_node(1, StorageState::READ_WRITE, 1, 1, true);
-  verify_node(2, StorageState::READ_ONLY, 1, 0, false);
-  verify_node(3, StorageState::DISABLED, 1, -1, false);
-  verify_node(4, StorageState::READ_WRITE, 0.2, 1, false);
-  verify_node(5, StorageState::READ_ONLY, 0, 0, true);
-  verify_node(6, StorageState::READ_ONLY, 1.2, 0, false);
-  verify_node(7, StorageState::DISABLED, 5.7, -1, true);
-  verify_node(8, StorageState::READ_WRITE, 1.8, 2, false);
-  verify_node(9, StorageState::READ_ONLY, 0, 0, false);
-  verify_node(10, StorageState::READ_ONLY, 1, 0, false);
-  verify_node(11, StorageState::DISABLED, 1, -1, false);
-  verify_node(12, StorageState::READ_WRITE, 2, 2, false);
-  verify_node(13, StorageState::READ_ONLY, 1, 0, false);
-  verify_node(14, StorageState::DISABLED, 1, -1, false);
-  verify_node(18, StorageState::READ_WRITE, 2, 2, false);
-  verify_node(19, StorageState::READ_ONLY, 2, 0, false);
-  verify_node(20, StorageState::READ_ONLY, 0, 0, false);
-  verify_node(21, StorageState::DISABLED, 0, -1, false);
-
-  // Configs with storage_capacity/weight not specified for writable nodes
-  path = TEST_CONFIG_FILE("storage_capacity_success2.conf");
-  ld_info("Loading %s, expecting it to succeed", path.c_str());
-  config = Configuration::fromJsonFile(path.c_str());
-  ASSERT_NE(config, nullptr);
-
-  verify_node(0, StorageState::DISABLED, 0, -1, false);
-  verify_node(2, StorageState::READ_ONLY, 1, 0, false);
-  verify_node(3, StorageState::DISABLED, 1, -1, false);
-  verify_node(5, StorageState::READ_ONLY, 1, 0, true);
-  verify_node(13, StorageState::READ_ONLY, 1, 0, false);
-  verify_node(14, StorageState::DISABLED, 1, -1, false);
-  verify_node(15, StorageState::READ_WRITE, 1, 1, false);
-  verify_node(16, StorageState::READ_ONLY, 1, 0, false);
-  verify_node(17, StorageState::DISABLED, 1, -1, false);
-
-  std::vector<std::string> failing_configs = {
-      // weight: -1 and storage_state: read-write
-      TEST_CONFIG_FILE("storage_capacity_fail2.conf"),
-      // weight: 0 and storage_state: read-write
-      TEST_CONFIG_FILE("storage_capacity_fail3.conf"),
-      // weight: 1 and storage_state: none
-      TEST_CONFIG_FILE("storage_capacity_fail4.conf"),
-      // weight: 1 and storage_state: read-only
-      TEST_CONFIG_FILE("storage_capacity_fail5.conf"),
-      // weight: 1 and storage_capacity: 1.6
-      TEST_CONFIG_FILE("storage_capacity_fail6.conf"),
-  };
-  for (auto& config_path : failing_configs) {
-    ld_info("Loading %s, expecting it to fail", config_path.c_str());
-    config = Configuration::fromJsonFile(config_path.c_str());
-    ASSERT_EQ(config, nullptr);
-  }
-}
-
-TEST(ConfigurationTest, AlternativeTraceConfigSection) {
-  std::shared_ptr<Configuration> config(
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("valid_trace_logger.conf")));
-  ASSERT_NE(config, nullptr);
-
-  ASSERT_TRUE(
-      config->serverConfig()->getTracerSamplePercentage("appender").hasValue());
-
-  ASSERT_EQ(
-      15.4, *config->serverConfig()->getTracerSamplePercentage("appender"));
 }

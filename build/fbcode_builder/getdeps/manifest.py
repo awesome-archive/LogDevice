@@ -1,10 +1,7 @@
-#!/usr/bin/env python
-# Copyright (c) 2019-present, Facebook, Inc.
-# All rights reserved.
+# Copyright (c) Facebook, Inc. and its affiliates.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree. An additional grant
-# of patent rights can be found in the PATENTS file in the same directory.
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
 
 from __future__ import absolute_import, division, print_function, unicode_literals
 
@@ -14,11 +11,13 @@ import os
 from .builder import (
     AutoconfBuilder,
     Boost,
+    CargoBuilder,
     CMakeBuilder,
     Iproute2Builder,
     MakeBuilder,
     NinjaBootstrap,
     NopBuilder,
+    OpenNSABuilder,
     OpenSSLBuilder,
     SqliteBuilder,
 )
@@ -26,8 +25,10 @@ from .expr import parse_expr
 from .fetcher import (
     ArchiveFetcher,
     GitFetcher,
+    PreinstalledNopFetcher,
     ShipitTransformerFetcher,
     SimpleShipitTransformerFetcher,
+    SystemPackageFetcher,
 )
 from .py_wheel_builder import PythonWheelBuilder
 
@@ -51,6 +52,7 @@ SCHEMA = {
         },
     },
     "dependencies": {"optional_section": True, "allow_values": False},
+    "depends.environment": {"optional_section": True},
     "git": {
         "optional_section": True,
         "fields": {"repo_url": REQUIRED, "rev": OPTIONAL, "depth": OPTIONAL},
@@ -65,13 +67,27 @@ SCHEMA = {
             "builder": REQUIRED,
             "subdir": OPTIONAL,
             "build_in_src_dir": OPTIONAL,
+            "disable_env_override_pkgconfig": OPTIONAL,
+            "disable_env_override_path": OPTIONAL,
         },
     },
     "msbuild": {"optional_section": True, "fields": {"project": REQUIRED}},
+    "cargo": {
+        "optional_section": True,
+        "fields": {
+            "build_doc": OPTIONAL,
+            "workspace_dir": OPTIONAL,
+            "manifests_to_build": OPTIONAL,
+        },
+    },
     "cmake.defines": {"optional_section": True},
     "autoconf.args": {"optional_section": True},
+    "rpms": {"optional_section": True},
+    "debs": {"optional_section": True},
+    "preinstalled.env": {"optional_section": True},
     "b2.args": {"optional_section": True},
-    "make.args": {"optional_section": True},
+    "make.build_args": {"optional_section": True},
+    "make.install_args": {"optional_section": True},
     "header-only": {"optional_section": True, "fields": {"includedir": REQUIRED}},
     "shipit.pathmap": {"optional_section": True},
     "shipit.strip": {"optional_section": True},
@@ -85,7 +101,8 @@ ALLOWED_EXPR_SECTIONS = [
     "build",
     "cmake.defines",
     "dependencies",
-    "make.args",
+    "make.build_args",
+    "make.install_args",
     "b2.args",
     "download",
     "git",
@@ -168,13 +185,13 @@ class ManifestParser(object):
 
         if fp is None:
             with open(file_name, "r") as fp:
-                config.readfp(fp)
+                config.read_file(fp)
         elif isinstance(fp, type("")):
             # For testing purposes, parse from a string (str
             # or unicode)
-            config.readfp(io.StringIO(fp))
+            config.read_file(io.StringIO(fp))
         else:
-            config.readfp(fp)
+            config.read_file(fp)
 
         # validate against the schema
         seen_sections = set()
@@ -225,8 +242,8 @@ class ManifestParser(object):
         return defval
 
     def get_section_as_args(self, section, ctx=None):
-        """ Intended for use with the make.args and autoconf.args
-        sections, this method collects the entries and returns an
+        """ Intended for use with the make.[build_args/install_args] and
+        autoconf.args sections, this method collects the entries and returns an
         array of strings.
         If the manifest contains conditional sections, ctx is used to
         evaluate the condition and merge in the values.
@@ -314,6 +331,27 @@ class ManifestParser(object):
         """ returns true if this is an FB first-party project """
         return self.shipit_project is not None
 
+    def get_required_system_packages(self, ctx):
+        """ Returns dictionary of packager system -> list of packages """
+        return {
+            "rpm": self.get_section_as_args("rpms", ctx),
+            "deb": self.get_section_as_args("debs", ctx),
+        }
+
+    def _is_satisfied_by_preinstalled_environment(self, ctx):
+        envs = self.get_section_as_args("preinstalled.env", ctx)
+        if not envs:
+            return False
+        for key in envs:
+            val = os.environ.get(key, None)
+            print(f"Testing ENV[{key}]: {repr(val)}")
+            if val is None:
+                return False
+            if len(val) == 0:
+                return False
+
+        return True
+
     def create_fetcher(self, build_options, ctx):
         use_real_shipit = (
             ShipitTransformerFetcher.available() and build_options.use_shipit
@@ -334,6 +372,16 @@ class ManifestParser(object):
         ):
             # We can use the code from fbsource
             return ShipitTransformerFetcher(build_options, self.shipit_project)
+
+        # Can we satisfy this dep with system packages?
+        if build_options.allow_system_packages:
+            if self._is_satisfied_by_preinstalled_environment(ctx):
+                return PreinstalledNopFetcher()
+
+            packages = self.get_required_system_packages(ctx)
+            package_fetcher = SystemPackageFetcher(build_options, packages)
+            if package_fetcher.packages_are_installed():
+                return package_fetcher
 
         repo_url = self.get("git", "repo_url", ctx=ctx)
         if repo_url:
@@ -362,7 +410,16 @@ class ManifestParser(object):
             "project %s has no fetcher configuration matching %s" % (self.name, ctx)
         )
 
-    def create_builder(self, build_options, src_dir, build_dir, inst_dir, ctx):
+    def create_builder(  # noqa:C901
+        self,
+        build_options,
+        src_dir,
+        build_dir,
+        inst_dir,
+        ctx,
+        loader,
+        final_install_prefix=None,
+    ):
         builder = self.get("build", "builder", ctx=ctx)
         if not builder:
             raise Exception("project %s has no builder for %r" % (self.name, ctx))
@@ -372,8 +429,18 @@ class ManifestParser(object):
             print("build_dir is %s" % build_dir)  # just to quiet lint
 
         if builder == "make":
-            args = self.get_section_as_args("make.args", ctx)
-            return MakeBuilder(build_options, ctx, self, src_dir, None, inst_dir, args)
+            build_args = self.get_section_as_args("make.build_args", ctx)
+            install_args = self.get_section_as_args("make.install_args", ctx)
+            return MakeBuilder(
+                build_options,
+                ctx,
+                self,
+                src_dir,
+                None,
+                inst_dir,
+                build_args,
+                install_args,
+            )
 
         if builder == "autoconf":
             args = self.get_section_as_args("autoconf.args", ctx)
@@ -388,7 +455,14 @@ class ManifestParser(object):
         if builder == "cmake":
             defines = self.get_section_as_dict("cmake.defines", ctx)
             return CMakeBuilder(
-                build_options, ctx, self, src_dir, build_dir, inst_dir, defines
+                build_options,
+                ctx,
+                self,
+                src_dir,
+                build_dir,
+                inst_dir,
+                defines,
+                final_install_prefix,
             )
 
         if builder == "python-wheel":
@@ -416,6 +490,26 @@ class ManifestParser(object):
             return Iproute2Builder(
                 build_options, ctx, self, src_dir, build_dir, inst_dir
             )
+
+        if builder == "cargo":
+            build_doc = self.get("cargo", "build_doc", False, ctx)
+            workspace_dir = self.get("cargo", "workspace_dir", None, ctx)
+            manifests_to_build = self.get("cargo", "manifests_to_build", None, ctx)
+            return CargoBuilder(
+                build_options,
+                ctx,
+                self,
+                src_dir,
+                build_dir,
+                inst_dir,
+                build_doc,
+                workspace_dir,
+                manifests_to_build,
+                loader,
+            )
+
+        if builder == "OpenNSA":
+            return OpenNSABuilder(build_options, ctx, self, src_dir, inst_dir)
 
         raise KeyError("project %s has no known builder" % (self.name))
 

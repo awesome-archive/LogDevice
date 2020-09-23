@@ -14,10 +14,10 @@
 
 #include "logdevice/common/AdminCommandTable.h"
 #include "logdevice/common/AllSequencers.h"
-#include "logdevice/common/DataRecordOwnsPayload.h"
 #include "logdevice/common/LogRecoveryRequest.h"
 #include "logdevice/common/MetaDataLogWriter.h"
 #include "logdevice/common/Processor.h"
+#include "logdevice/common/RawDataRecord.h"
 #include "logdevice/common/Sender.h"
 #include "logdevice/common/SimpleEnumMap.h"
 #include "logdevice/common/SocketCallback.h"
@@ -35,7 +35,7 @@ EpochRecovery::EpochRecovery(
     logid_t log_id,
     epoch_t epoch,
     const EpochMetaData& epoch_metadata,
-    const std::shared_ptr<const NodesConfiguration>& nodes_configuration,
+    std::shared_ptr<UpdateableNodesConfiguration> nodes_configuration,
     std::unique_ptr<EpochRecoveryDependencies> deps,
     bool tail_optimized)
     : log_id_(log_id),
@@ -47,18 +47,19 @@ EpochRecovery::EpochRecovery(
       last_restart_timestamp_(creation_timestamp_),
       tail_optimized_(tail_optimized),
       state_(State::SEAL_OR_INACTIVE),
-      recovery_set_(epoch_metadata, nodes_configuration, this),
+      recovery_set_(epoch_metadata, nodes_configuration->get(), this),
       digest_(log_id,
               epoch,
               epoch_metadata,
               deps_->getSealEpoch(),
-              nodes_configuration,
+              nodes_configuration->get(),
               {// write bridge record even for empty epoch if
                // settings allow _and_ log id is not a metadata log
                !MetaDataLog::isMetaDataLog(log_id_) &&
                deps_->getSettings().bridge_record_in_empty_epoch}),
       grace_period_(deps_->createTimer([this] { onGracePeriodExpired(); })),
-      mutation_and_cleaning_(deps_->createTimer([this] { onTimeout(); })) {
+      mutation_and_cleaning_(deps_->createTimer([this] { onTimeout(); })),
+      nodes_config_(std::move(nodes_configuration)) {
   ld_check(log_id_ != LOGID_INVALID);
   ld_check(epoch_ != EPOCH_INVALID);
   ld_check(deps_ != nullptr);
@@ -92,7 +93,7 @@ bool EpochRecovery::onSealed(ShardID from,
            lng.val_,
            max_seen_esn.val_,
            epoch_size.toString().c_str(),
-           tail.hasValue() ? tail.value().toString().c_str() : "n/a");
+           tail.has_value() ? tail.value().toString().c_str() : "n/a");
   recovery_set_.transition(from, RecoveryNode::State::SEALED);
 
   // It's ok to update lng_ even if we already sent some START messages and
@@ -108,7 +109,7 @@ bool EpochRecovery::onSealed(ShardID from,
 
   uint64_t last_timestamp = 0;
 
-  if (tail.hasValue() &&
+  if (tail.has_value() &&
       (!tail_record_from_sealed_.isValid() ||
        tail_record_from_sealed_.header.lsn < tail.value().header.lsn)) {
     ld_check(tail.value().containOffsetWithinEpoch());
@@ -185,10 +186,9 @@ bool EpochRecovery::setNodeAuthoritativeStatus(ShardID shard,
   return false;
 }
 
-void EpochRecovery::onDigestRecord(
-    ShardID from,
-    read_stream_id_t rsid,
-    std::unique_ptr<DataRecordOwnsPayload> record) {
+void EpochRecovery::onDigestRecord(ShardID from,
+                                   read_stream_id_t rsid,
+                                   std::unique_ptr<RawDataRecord> record) {
   ld_check(record);
   ld_check(record->logid == getLogID());
   ld_check(rsid != READ_STREAM_ID_INVALID);
@@ -231,14 +231,14 @@ void EpochRecovery::onDigestRecord(
     return;
   }
 
-  if (record->invalid_checksum_) {
+  if (record->invalid_checksum) {
     RATELIMIT_ERROR(std::chrono::seconds(10),
                     10,
                     "Got a digest record %s (flags %s) with bad checksum "
                     "from %s for read stream %lu. Current active epoch "
                     "recovery: %s. Reporting as a gap.",
                     rid.toString().c_str(),
-                    RECORD_Message::flagsToString(record->flags_).c_str(),
+                    RECORD_Message::flagsToString(record->flags).c_str(),
                     from.toString().c_str(),
                     rsid.val_,
                     identify().c_str());
@@ -376,7 +376,7 @@ bool EpochRecovery::onDigestComplete() {
   auto digested_shards =
       recovery_set_.getNodesInState(RecoveryNode::State::DIGESTED);
   for (const auto& digested_shard : digested_shards) {
-    if (deps_->canMutateShard(digested_shard)) {
+    if (canMutateShard(digested_shard)) {
       recovery_set_.transition(digested_shard, RecoveryNode::State::MUTATABLE);
     }
   }
@@ -605,7 +605,7 @@ void EpochRecovery::updateEpochTailRecord() {
          flags,
          {}},
         OffsetMap(),
-        std::shared_ptr<PayloadHolder>());
+        PayloadHolder());
   };
 
   if (tail_esn_ < digest_start_esn_) {
@@ -667,11 +667,11 @@ void EpochRecovery::updateEpochTailRecord() {
         STAT_INCR(deps_->getStats(), epoch_recovery_tail_record_hole_plug);
       } else {
         OffsetMap offsets_within_epoch;
-        if ((tail_entry->record->flags_ &
+        if ((tail_entry->record->flags &
              RECORD_Header::INCLUDE_OFFSET_WITHIN_EPOCH) &&
-            tail_entry->record->extra_metadata_ != nullptr) {
+            tail_entry->record->extra_metadata != nullptr) {
           offsets_within_epoch =
-              tail_entry->record->extra_metadata_->offsets_within_epoch;
+              tail_entry->record->extra_metadata->offsets_within_epoch;
         }
 
         TailRecordHeader::flags_t flags = TailRecordHeader::OFFSET_WITHIN_EPOCH;
@@ -680,13 +680,11 @@ void EpochRecovery::updateEpochTailRecord() {
         if (deps_->getSettings().enable_offset_map) {
           flags |= TailRecordHeader::OFFSET_MAP;
         }
-        std::shared_ptr<PayloadHolder> ph;
+        PayloadHolder ph;
         if (tail_optimized_) {
           // TODO T9899761: use PayloadHolder when deserializing RECORD to avoid
           // this copy
-          auto dup_payload = tail_entry->getPayload().dup();
-          ph = std::make_shared<PayloadHolder>(
-              dup_payload.data(), dup_payload.size());
+          ph = PayloadHolder::copyPayload(tail_entry->getPayload());
           flags |= TailRecordHeader::HAS_PAYLOAD;
           // TODO T31241526: support checksum flags in tail record
           flags |= TailRecordHeader::CHECKSUM_PARITY;
@@ -805,7 +803,7 @@ bool EpochRecovery::mutateEpoch(const std::set<ShardID>& mutation_set,
       mutation_flags |= STORE_Header::BRIDGE;
     }
 
-    DataRecordOwnsPayload* record = nullptr;
+    RawDataRecord* record = nullptr;
     Payload payload;
     std::set<ShardID> successfully_stored;
     std::set<ShardID> amend_metadata;
@@ -1006,23 +1004,26 @@ std::pair<STORE_Header, STORE_Extra>
 EpochRecovery::createMutationHeader(esn_t esn,
                                     uint64_t timestamp,
                                     STORE_flags_t flags,
-                                    DataRecordOwnsPayload* record) const {
+                                    RawDataRecord* record) const {
   OffsetMap offsets_within_epoch;
   NodeID my_node_id = deps_->getMyNodeID();
 
   if (record != nullptr) {
-    if (record->flags_ & RECORD_Header::BUFFERED_WRITER_BLOB) {
+    if (record->flags & RECORD_Header::BUFFERED_WRITER_BLOB) {
       flags |= STORE_Header::BUFFERED_WRITER_BLOB;
     }
-    if (record->flags_ & RECORD_Header::INCLUDE_OFFSET_WITHIN_EPOCH) {
+    if (record->flags & RECORD_Header::PAYLOAD_GROUP) {
+      flags |= STORE_Header::PAYLOAD_GROUP;
+    }
+    if (record->flags & RECORD_Header::INCLUDE_OFFSET_WITHIN_EPOCH) {
       flags |= STORE_Header::OFFSET_WITHIN_EPOCH;
       // TODO (T35832374) : remove if condition when all servers support
       // OffsetMap
       if (deps_->getSettings().enable_offset_map) {
         flags |= STORE_Header::OFFSET_MAP;
       }
-      if (record->extra_metadata_) {
-        offsets_within_epoch = record->extra_metadata_->offsets_within_epoch;
+      if (record->extra_metadata) {
+        offsets_within_epoch = record->extra_metadata->offsets_within_epoch;
       }
     }
   }
@@ -1098,6 +1099,26 @@ void EpochRecovery::startMutationAndCleaningTimer() {
 
   ld_check(recovery_timeout > std::chrono::milliseconds::zero());
   mutation_and_cleaning_->activate(recovery_timeout);
+}
+
+bool EpochRecovery::onRecoveryNodeFailure(const ShardID shard) {
+  if (!recovery_set_.nodeIsInMutationAndCleaningSet(shard)) {
+    return false;
+  }
+  STAT_INCR(deps_->getStats(), epoch_recovery_restarts_on_node_failure);
+  RATELIMIT_WARNING(std::chrono::seconds(10),
+                    10,
+                    "Restarting the recovery for %s as shard %s "
+                    "failed. State: %s, nodes: %s",
+                    identify().c_str(),
+                    shard.toString().c_str(),
+                    toString(state_).c_str(),
+                    recoveryState().c_str());
+
+  ld_check(mutation_and_cleaning_->isActive());
+  mutation_and_cleaning_->cancel();
+  restart();
+  return true;
 }
 
 void EpochRecovery::onTimeout() {
@@ -1350,7 +1371,7 @@ void EpochRecovery::onDigestStreamEndReached(ShardID from) {
 
   recovery_set_.transition(from, RecoveryNode::State::DIGESTED);
 
-  if (deps_->canMutateShard(from)) {
+  if (canMutateShard(from)) {
     // If the node is considered as eligible for mutation at this point of time,
     // transition its state to State::MUTATABLE so that it will be included in
     // the mutation and cleaning set. If our local view is stale and the node
@@ -1516,6 +1537,11 @@ void EpochRecovery::onMutationComplete(esn_t esn, Status st, ShardID shard) {
       deps_->onEpochRecovered(
           epoch_, TailRecord(), Status::PREEMPTED, preempted_seal);
       // this EpochRecovery object no longer exists
+      return;
+
+    case E::DISABLED:
+      // Restart the recovery.
+      onRecoveryNodeFailure(shard);
       return;
 
     default:
@@ -1849,6 +1875,11 @@ void EpochRecovery::getDebugInfo(InfoRecoveriesTable& table) const {
       .set<16>(num_restarts_);
 }
 
+bool EpochRecovery::canMutateShard(ShardID shard) const {
+  auto nc = nodes_config_->get();
+  return nc->getStorageMembership()->canWriteToShard(shard);
+}
+
 ////// Dependencies ////////////
 
 EpochRecoveryDependencies::EpochRecoveryDependencies(LogRecoveryRequest* driver)
@@ -1873,17 +1904,6 @@ void EpochRecoveryDependencies::onEpochRecovered(epoch_t epoch,
 
 void EpochRecoveryDependencies::onShardRemovedFromConfig(ShardID shard) {
   return driver_->onShardRemovedFromConfig(shard);
-}
-
-bool EpochRecoveryDependencies::canMutateShard(ShardID shard) const {
-  auto rebuilding_set =
-      Worker::onThisThread()->processor_->rebuilding_set_.get();
-
-  // the shard is not writable if it is in the current rebuilding set.
-  // (note: we do not count time-range rebuilding)
-  return !rebuilding_set ||
-      (rebuilding_set->isRebuildingFullShard(shard.node(), shard.shard()) ==
-       folly::none);
 }
 
 NodeID EpochRecoveryDependencies::getMyNodeID() const {
@@ -1913,9 +1933,9 @@ EpochRecoveryDependencies::createTimer(std::function<void()> cb) {
   return timer;
 }
 
-int EpochRecoveryDependencies::registerOnSocketClosed(const Address& addr,
-                                                      SocketCallback& cb) {
-  return Worker::onThisThread()->sender().registerOnSocketClosed(addr, cb);
+int EpochRecoveryDependencies::registerOnConnectionClosed(const Address& addr,
+                                                          SocketCallback& cb) {
+  return Worker::onThisThread()->sender().registerOnConnectionClosed(addr, cb);
 }
 
 int EpochRecoveryDependencies::setLastCleanEpoch(logid_t logid,
@@ -1957,6 +1977,10 @@ StatsHolder* EpochRecoveryDependencies::getStats() const {
 
 logid_t EpochRecoveryDependencies::getLogID() const {
   return driver_->getLogID();
+}
+
+bool EpochRecoveryDependencies::isShardAlive(ShardID shard) const {
+  return Worker::onThisThread()->getClusterState()->isNodeAlive(shard.node());
 }
 
 namespace {

@@ -60,6 +60,7 @@ class HistogramInterface;
 struct ClientHistograms;
 struct PerShardHistograms;
 struct ServerHistograms;
+struct PerMonitoringTagHistograms;
 
 /**
  * How to combine two Stats objects.
@@ -167,6 +168,27 @@ struct PerTrafficClassStats {
 
 #define STAT_DEFINE(name, _) StatsCounter name{};
 #include "logdevice/common/stats/per_traffic_class_stats.inc" // nolint
+};
+
+struct PerMonitoringTagStats {
+  PerMonitoringTagStats();
+  PerMonitoringTagStats(const PerMonitoringTagStats&);
+
+  /**
+   * Add values from @param other.
+   */
+  void aggregate(PerMonitoringTagStats const& other,
+                 StatsAggOptional agg_override);
+
+  /**
+   * Reset most counters to their initial values.
+   */
+  void reset();
+
+#define STAT_DEFINE(name, _) StatsCounter name{};
+#include "logdevice/common/stats/per_monitoring_tag_stats.inc" // nolint
+
+  std::unique_ptr<PerMonitoringTagHistograms> histograms;
 };
 
 struct PerShapingPriorityStats {
@@ -451,13 +473,6 @@ struct StatsParams {
     return !is_server && stats_set == StatsSet::DEFAULT;
   }
 
-  // TODO(T40896662) stop supporting this, see task
-  folly::Optional<std::string> additional_entity_suffix{folly::none};
-  StatsParams& addAdditionalEntitySuffix(std::string suffix) {
-    additional_entity_suffix = suffix;
-    return *this;
-  }
-
   /**
    * Below are parameters which can be defined in settings
    * The reason for not passing the settings object is to not have Stats depend
@@ -631,14 +646,6 @@ struct Stats final {
   }
 
   /**
-   * Returns an additional entity suffix, that stats should also be pushed to.
-   * TODO(T40896662): get rid of this.
-   */
-  folly::Optional<std::string> getAdditionalEntitySuffix() const {
-    return params->get()->additional_entity_suffix;
-  }
-
-  /**
    * Take a read-lock and make a deep copy of a some map wrapped in a
    * folly::Synchronized, such as per_log_stats.
    */
@@ -659,6 +666,10 @@ struct Stats final {
   // per-traffic class stats
   std::array<PerTrafficClassStats, static_cast<int>(TrafficClass::MAX)>
       per_traffic_class_stats = {};
+
+  // per-monitoring tag stats
+  folly::Synchronized<folly::F14FastMap<std::string, PerMonitoringTagStats>>
+      per_monitoring_tag_stats;
 
   // per-flow group stats
   // For Network Traffic Shaping
@@ -812,6 +823,9 @@ class Stats::EnumerationCallbacks {
                     NodeLocationScope flow_group,
                     Priority,
                     int64_t val) = 0;
+  virtual void statWithTag(const std::string& name,
+                           const std::string& tag,
+                           int64_t val) = 0;
   // Per-msg-priority stats (totals of the previous one).
   virtual void stat(const std::string& name, Priority, int64_t val) = 0;
   // Per-request-type stats.
@@ -835,6 +849,9 @@ class Stats::EnumerationCallbacks {
   virtual void histogram(const std::string& name,
                          shard_index_t shard,
                          const HistogramInterface& hist) = 0;
+  virtual void histogramWithTag(const std::string& name,
+                                const std::string& tag,
+                                const HistogramInterface& hist) = 0;
 };
 
 /**
@@ -1225,6 +1242,18 @@ class PerShardStatToken {
     }                                                                         \
   } while (0)
 
+#define TAGGED_HISTOGRAM_ADD(stats_struct, name, tags, usecs)   \
+  do {                                                          \
+    if (stats_struct) {                                         \
+      for (const auto& tag : tags) {                            \
+        stats_struct->get().per_monitoring_tag_stats.withWLock( \
+            [&tag, val = (usecs)](auto& stats) {                \
+              stats[tag].histograms->name.add(val);             \
+            });                                                 \
+      }                                                         \
+    }                                                           \
+  } while (0);
+
 #define HISTOGRAM_ADD(stats_struct, name, usecs)                   \
   do {                                                             \
     if (stats_struct && (stats_struct)->get().server_histograms) { \
@@ -1238,6 +1267,31 @@ class PerShardStatToken {
       (stats_struct)->get().client.histograms->name.add(usecs); \
     }                                                           \
   } while (0)
+
+#define INCR_FOR_LATENCY_THRESHOLD(stats_struct, threshold, value)          \
+  do {                                                                      \
+    constexpr int usInMs = 1000;                                            \
+    if ((value) >= ((threshold)*usInMs)) {                                  \
+      STAT_INCR(stats_struct, client.append_requests_over_##threshold##ms); \
+    }                                                                       \
+  } while (0)
+
+#define CLIENT_LATENCY_COUNTERS(stats_struct, value)       \
+  do {                                                     \
+    INCR_FOR_LATENCY_THRESHOLD(stats_struct, 2, value);    \
+    INCR_FOR_LATENCY_THRESHOLD(stats_struct, 4, value);    \
+    INCR_FOR_LATENCY_THRESHOLD(stats_struct, 8, value);    \
+    INCR_FOR_LATENCY_THRESHOLD(stats_struct, 16, value);   \
+    INCR_FOR_LATENCY_THRESHOLD(stats_struct, 32, value);   \
+    INCR_FOR_LATENCY_THRESHOLD(stats_struct, 64, value);   \
+    INCR_FOR_LATENCY_THRESHOLD(stats_struct, 128, value);  \
+    INCR_FOR_LATENCY_THRESHOLD(stats_struct, 256, value);  \
+    INCR_FOR_LATENCY_THRESHOLD(stats_struct, 512, value);  \
+    INCR_FOR_LATENCY_THRESHOLD(stats_struct, 1024, value); \
+    INCR_FOR_LATENCY_THRESHOLD(stats_struct, 2048, value); \
+    INCR_FOR_LATENCY_THRESHOLD(stats_struct, 4096, value); \
+    INCR_FOR_LATENCY_THRESHOLD(stats_struct, 8192, value); \
+  } while (0);
 
 #define PER_SHARD_STAT_OP(stats_struct, name, shard, value, op)         \
   do {                                                                  \
@@ -1344,6 +1398,28 @@ class PerShardStatToken {
           ->addLoad(load);                                        \
     }                                                             \
   } while (0)
+
+#define TAGGED_STAT_ADD(stats_struct_expr, tags, name, value) \
+  do {                                                        \
+    auto val = (value);                                       \
+    const auto& tags_ref = (tags);                            \
+    auto* stats_struct = (stats_struct_expr);                 \
+    if (stats_struct) {                                       \
+      stats_struct->get().per_monitoring_tag_stats.withWLock( \
+          [&tags_ref, &val](auto& stats) {                    \
+            for (auto& tag : tags_ref) {                      \
+              stats[tag].name += val;                         \
+            }                                                 \
+          });                                                 \
+    }                                                         \
+    STAT_ADD(stats_struct, name, val);                        \
+  } while (0)
+
+#define TAGGED_STAT_INCR(stats_struct, tags, name) \
+  TAGGED_STAT_ADD(stats_struct, tags, name, +1);
+
+#define TAGGED_STAT_DECR(stats_struct, tags, name) \
+  TAGGED_STAT_ADD(stats_struct, tags, name, -1);
 
 // expects name to be {AppendSuccess, AppendFail}
 #define PER_NODE_STAT_ADD(stats_struct, node_id, name)                  \

@@ -41,7 +41,7 @@ void InternalAppendRequest::onReplyReceived(
 folly::Optional<APPENDED_Header>
 runInternalAppend(logid_t logid,
                   AppendAttributes attrs,
-                  PayloadHolder payload,
+                  PayloadHolder&& payload,
                   InternalAppendRequest::Callback callback,
                   APPEND_flags_t flags,
                   int checksum_bits,
@@ -77,7 +77,7 @@ runInternalAppend(logid_t logid,
       .setAcceptableEpoch(acceptable_epoch)
       .execute();
 
-  if (req->getReply().hasValue()) {
+  if (req->getReply().has_value()) {
     // Uh oh, AppenderPrep::execute() failed synchronously and invoked the
     // callback with an error code. Return it to the caller.
     return req->getReply();
@@ -89,27 +89,6 @@ runInternalAppend(logid_t logid,
   req->setAppenderRunning();
   req.release();
   return folly::none;
-}
-
-folly::Optional<APPENDED_Header>
-runInternalAppend(logid_t logid,
-                  AppendAttributes attrs,
-                  const Payload& payload,
-                  InternalAppendRequest::Callback callback,
-                  APPEND_flags_t flags,
-                  int checksum_bits,
-                  uint32_t timeout_ms,
-                  uint32_t append_message_count,
-                  folly::Optional<epoch_t> acceptable_epoch) {
-  return runInternalAppend(logid,
-                           std::move(attrs),
-                           PayloadHolder(payload, PayloadHolder::UNOWNED),
-                           std::move(callback),
-                           flags,
-                           checksum_bits,
-                           timeout_ms,
-                           append_message_count,
-                           acceptable_epoch);
 }
 
 }} // namespace facebook::logdevice

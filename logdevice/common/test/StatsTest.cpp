@@ -119,56 +119,54 @@ TEST(StatsTest, MultipleThreadsTest) {
 TEST(StatsTest, LatencyPercentileTest) {
   FastUpdateableSharedPtr<StatsParams> params(std::make_shared<StatsParams>());
   Stats s(&params);
-  int64_t p;
-
   auto& h = s.client.histograms->append_latency;
+  {
+    int64_t p;
 
-  p = h.estimatePercentile(.5);
-  EXPECT_EQ(0, p);
+    p = h.estimatePercentile(.5);
+    EXPECT_EQ(0, p);
 
-  h.add(85);
-  p = h.estimatePercentile(.5);
-  EXPECT_GT(p, 10);
-  EXPECT_LT(p, 100);
+    h.add(85);
+    p = h.estimatePercentile(.5);
+    EXPECT_GE(p, 1ll << 6); // 64
+    EXPECT_LE(p, 1ll << 7); // 128
 
-  // 5000s
-  h.add((int64_t)5e9);
-  p = h.estimatePercentile(.99);
-  EXPECT_GT(p, (int64_t)1e9);
-  EXPECT_LT(p, (int64_t)1e10);
+    h.add(5ll << 30); // 5000s
+    p = h.estimatePercentile(.99);
+    EXPECT_GE(p, 1ll << 32);
+    EXPECT_LE(p, 1ll << 33);
 
-  // ~5 years
-  h.add((int64_t)16e13);
-  p = h.estimatePercentile(.99);
-  EXPECT_GT(p, (int64_t)1e14);
-  EXPECT_LT(p, (int64_t)1e15);
+    h.add(1ll << 50); // ~5 years
+    p = h.estimatePercentile(.99);
+    EXPECT_GE(p, 1ll << 50);
+    EXPECT_LE(p, 1ll << 51);
 
-  // min and max percentile
-  p = h.estimatePercentile(0.);
-  EXPECT_EQ(p, 80);
-  p = h.estimatePercentile(1.);
-  EXPECT_EQ(p, (int64_t)2e14);
+    // min and max percentile
+    p = h.estimatePercentile(0.);
+    EXPECT_GE(p, 1ll << 6); // 64
+    EXPECT_LE(p, 1ll << 7); // 128
+    p = h.estimatePercentile(1.);
+    EXPECT_GE(p, 1ll << 50);
+    EXPECT_LE(p, 1ll << 51);
+  }
 
   // estimate percentiles in batch
   const double pcts[] = {0., .01, .1, .25, .5, .75, .9, .99, 1.};
   constexpr size_t npcts = sizeof(pcts) / sizeof(pcts[0]);
   int64_t samples[npcts];
   h.estimatePercentiles(pcts, npcts, samples);
-  EXPECT_EQ(samples[0], 80);
-  EXPECT_EQ(samples[1], 80);
-  EXPECT_GT(samples[2], 80);
-  EXPECT_LT(samples[2], 90);
-  EXPECT_GT(samples[3], 80);
-  EXPECT_LT(samples[3], 90);
-  EXPECT_GT(samples[4], (int64_t)1e9);
-  EXPECT_LT(samples[4], (int64_t)1e10);
-  EXPECT_GT(samples[5], (int64_t)1e14);
-  EXPECT_LT(samples[5], (int64_t)2e14);
-  EXPECT_GT(samples[6], (int64_t)1e14);
-  EXPECT_LT(samples[6], (int64_t)2e14);
-  EXPECT_GT(samples[7], (int64_t)1e14);
-  EXPECT_LT(samples[7], (int64_t)2e14);
-  EXPECT_EQ(samples[8], (int64_t)2e14);
+  for (auto p : {samples[0], samples[1], samples[2], samples[3]}) {
+    EXPECT_GE(p, 1ll << 6); // 64
+    EXPECT_LE(p, 1ll << 7); // 128
+  }
+  for (auto p : {samples[4]}) {
+    EXPECT_GE(p, 1ll << 32);
+    EXPECT_LE(p, 1ll << 33);
+  }
+  for (auto p : {samples[5], samples[6], samples[7], samples[8]}) {
+    EXPECT_GE(p, 1ll << 50);
+    EXPECT_LE(p, 1ll << 51);
+  }
 }
 
 TEST(StatsTest, HistogramConcurrencyTest) {
@@ -244,6 +242,72 @@ TEST(StatsTest, HistogramConcurrencyTest) {
     ASSERT_EQ(cs.first, ADDS_PER_THREAD);
     ASSERT_EQ(cs.second, sums[i].load());
   }
+}
+
+TEST(StatsTest, CompactLatencyHistogramShouldGetCumulativeFrequencyCounters) {
+  const auto min_bucket_to_publish = 10;
+  const auto max_bucket_to_publish = 20;
+  const auto max_bucket = 59;
+
+  CompactLatencyHistogram hist{CompactHistogram::PublishRange{
+      min_bucket_to_publish, max_bucket_to_publish}};
+
+  CompactLatencyHistogram default_hist;
+
+  for (int64_t idx = 0; idx <= max_bucket; idx++) {
+    // bucket at index `idx` should have count = idx+1
+    int times = idx + 1;
+    while (times--) {
+      hist.add((1l << idx) - 1);
+    }
+  }
+
+  ASSERT_TRUE(hist.shouldPublishCumulativeFrequencyCounters());
+  ASSERT_FALSE(default_hist.shouldPublishCumulativeFrequencyCounters());
+
+  auto frequency_counters = hist.getCumulativeFrequencyCounters().counters;
+  std::sort(frequency_counters.begin(), frequency_counters.end());
+
+  // Build expected result
+  std::vector<std::pair<int64_t, uint64_t>> expected_result;
+  int acc = 0;
+  for (int idx = max_bucket; idx >= min_bucket_to_publish; idx--) {
+    acc += idx + 1;
+    if (idx <= max_bucket_to_publish) {
+      expected_result.push_back(std::make_pair(1l << (idx - 1), acc));
+    }
+  }
+
+  std::sort(expected_result.begin(), expected_result.end());
+
+  ASSERT_EQ(expected_result, frequency_counters)
+      << "Unexpected result of method getFrequencyCounters()";
+
+  // now with numbers
+  CompactLatencyHistogram hist2{CompactHistogram::PublishRange{
+      min_bucket_to_publish, max_bucket_to_publish}};
+
+  for (int i = min_bucket_to_publish; i <= max_bucket_to_publish; ++i) {
+    hist2.add((1l << i) - 1);
+  }
+
+  auto frequency_counters2 = hist2.getCumulativeFrequencyCounters().counters;
+  std::sort(frequency_counters2.begin(), frequency_counters2.end());
+
+  std::vector<std::pair<int64_t, uint64_t>> expected_result2 = {
+      {1l << (10 - 1), 11}, // note that  lower bound of bucket i is 2**(1-i)
+      {1l << (11 - 1), 10},
+      {1l << (12 - 1), 9},
+      {1l << (13 - 1), 8},
+      {1l << (14 - 1), 7},
+      {1l << (15 - 1), 6},
+      {1l << (16 - 1), 5},
+      {1l << (17 - 1), 4},
+      {1l << (18 - 1), 3},
+      {1l << (19 - 1), 2},
+      {1l << (20 - 1), 1}};
+
+  ASSERT_EQ(expected_result2, frequency_counters2);
 }
 
 TEST(StatsTest, PerNodeTimeSeriesSingleThread) {

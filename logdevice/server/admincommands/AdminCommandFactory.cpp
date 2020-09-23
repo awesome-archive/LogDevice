@@ -22,6 +22,7 @@
 #include "logdevice/server/admincommands/DeprecatedStats.h"
 #include "logdevice/server/admincommands/DumpQueuedMessages.h"
 #include "logdevice/server/admincommands/Failsafe.h"
+#include "logdevice/server/admincommands/Fill.h"
 #include "logdevice/server/admincommands/GossipBlacklist.h"
 #include "logdevice/server/admincommands/Info.h"
 #include "logdevice/server/admincommands/InfoAppendOutliers.h"
@@ -43,6 +44,7 @@
 #include "logdevice/server/admincommands/InfoRecordCache.h"
 #include "logdevice/server/admincommands/InfoRecoveries.h"
 #include "logdevice/server/admincommands/InfoReplication.h"
+#include "logdevice/server/admincommands/InfoRsm.h"
 #include "logdevice/server/admincommands/InfoSST.h"
 #include "logdevice/server/admincommands/InfoSequencers.h"
 #include "logdevice/server/admincommands/InfoSettings.h"
@@ -60,6 +62,7 @@
 #include "logdevice/server/admincommands/Partitions.h"
 #include "logdevice/server/admincommands/PauseOrUnpauseFileEpochStore.h"
 #include "logdevice/server/admincommands/PrintLogsDBDirectories.h"
+#include "logdevice/server/admincommands/RSMTrim.h"
 #include "logdevice/server/admincommands/RSMWriteSnapshot.h"
 #include "logdevice/server/admincommands/Rebuilding.h"
 #include "logdevice/server/admincommands/Record.h"
@@ -82,6 +85,7 @@ TestAdminCommandFactory::TestAdminCommandFactory() : AdminCommandFactory() {
   using Restriction = AdminCommand::RestrictionLevel;
   selector_.add<commands::EraseRecord>(
       "record erase", Restriction::LOCALHOST_ONLY);
+  selector_.add<commands::Fill>("fill");
 }
 
 AdminCommandFactory::AdminCommandFactory() {
@@ -116,6 +120,7 @@ AdminCommandFactory::AdminCommandFactory() {
   selector_.add<commands::InfoLogsDBMetadata>("info logsdb metadata");
   selector_.add<commands::InfoWriteMetaDataRecord>(
       "info write_metadata_record");
+  selector_.add<commands::InfoRsm>("info rsm");
   selector_.add<commands::ListOrEraseMetadata>("info metadata",
                                                /* erase */ false);
   selector_.add<commands::ListOrEraseMetadata>("delete metadata",
@@ -237,6 +242,7 @@ AdminCommandFactory::AdminCommandFactory() {
   // Can be used for emergency situations when there is data loss
   // in the delta log.
   selector_.add<commands::RSMWriteSnapShot>("rsm write-snapshot");
+  selector_.add<commands::RSMTrim>("rsm trim");
 
   selector_.add<commands::PauseOrUnpauseFileEpochStore>(
       "pause_file_epoch_store", true);

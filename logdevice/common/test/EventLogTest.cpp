@@ -17,6 +17,7 @@
 #include "logdevice/common/event_log/EventLogStateMachine.h"
 #include "logdevice/common/settings/SettingsUpdater.h"
 #include "logdevice/common/test/NodeSetTestUtil.h"
+#include "logdevice/common/test/NodesConfigurationTestUtil.h"
 #include "logdevice/common/util.h"
 
 namespace facebook { namespace logdevice {
@@ -105,18 +106,17 @@ class Subscriber {
 std::shared_ptr<UpdateableConfig> buildConfig() {
   configuration::Nodes nodes;
   for (node_index_t nid = 0; nid < kNumNodes; ++nid) {
-    Configuration::Node& node = nodes[nid];
-    node.address = Sockaddr("::1", folly::to<std::string>(4440 + nid));
-    node.generation = 1;
-    node.addSequencerRole();
-    node.addStorageRole(kNumShards);
+    nodes[nid] = configuration::Node::withTestDefaults(nid)
+                     .setIsMetadataNode(true)
+                     .addStorageRole(kNumShards);
   }
-  Configuration::NodesConfig nodes_config(std::move(nodes));
-  Configuration::MetaDataLogsConfig meta_config =
-      createMetaDataLogsConfig(nodes_config, nodes_config.getNodes().size(), 2);
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes), ReplicationProperty{{NodeLocationScope::NODE, 2}});
   auto config = std::make_shared<UpdateableConfig>();
   config->updateableServerConfig()->update(
-      ServerConfig::fromDataTest(__FILE__, nodes_config, meta_config));
+      ServerConfig::fromDataTest(__FILE__));
+  config->updateableNodesConfiguration()->update(
+      std::move(nodes_configuration));
   return config;
 }
 
@@ -126,7 +126,7 @@ class MockEventLogStateMachine : public EventLogStateMachine {
  public:
   explicit MockEventLogStateMachine(EventLogTest* owner,
                                     UpdateableSettings<Settings> settings)
-      : EventLogStateMachine(settings) {
+      : EventLogStateMachine(settings, nullptr) {
     config_ = buildConfig();
     owner_ = owner;
     writeDeltaHeader();
@@ -138,7 +138,7 @@ class MockEventLogStateMachine : public EventLogStateMachine {
 
   std::shared_ptr<const configuration::nodes::NodesConfiguration>
   getNodesConfiguration() const override {
-    return config_->getNodesConfigurationFromServerConfigSource();
+    return config_->getNodesConfiguration();
   }
 
   void getDeltaLogTailLSN() override;
@@ -153,9 +153,10 @@ class MockEventLogStateMachine : public EventLogStateMachine {
     return read_stream_id_t{1};
   }
   void resumeReadStream(read_stream_id_t /*id*/) override {}
+  void scheduleStop() override {}
   void updateWorkerShardStatusMap() override {}
   void publishRebuildingSet() override {}
-  void trim() override {}
+  void trim(trim_cb_t /* unused */) override {}
   void trimNotSnapshotted(lsn_t /*lsn*/) override {}
   void postRequestWithRetrying(std::unique_ptr<Request>& /*rq*/) override {}
   void postAppendRequest(logid_t logid,
@@ -222,12 +223,9 @@ class EventLogTest : public ::testing::TestWithParam<bool> {
     std::copy(uuid.begin(), uuid.end(), std::begin(h.uuid));
     std::string delta_payload = evlog_->createDeltaPayload(std::move(buf), h);
 
-    void* malloced = malloc(delta_payload.size());
-    memcpy(malloced, &delta_payload[0], delta_payload.size());
-
     return std::make_unique<DataRecordOwnsPayload>(
         configuration::InternalLogs::EVENT_LOG_DELTAS,
-        Payload(malloced, delta_payload.size()),
+        PayloadHolder::copyString(delta_payload),
         lsn,
         std::chrono::milliseconds{100},
         0 // flags
@@ -236,14 +234,12 @@ class EventLogTest : public ::testing::TestWithParam<bool> {
 
   std::unique_ptr<DataRecord>
   genSnapshotRecord(const EventLogRebuildingSet& set, lsn_t v, lsn_t lsn) {
-    auto buf = evlog_->createSnapshotPayload(
+    std::string buf = evlog_->createSnapshotPayload(
         set, v, settings_->rsm_include_read_pointer_in_snapshot);
-    void* malloced = malloc(buf.size());
-    memcpy(malloced, &buf[0], buf.size());
 
     return std::make_unique<DataRecordOwnsPayload>(
         configuration::InternalLogs::EVENT_LOG_SNAPSHOTS,
-        Payload(malloced, buf.size()),
+        PayloadHolder::copyString(buf),
         lsn,
         std::chrono::milliseconds{100},
         0 // flags
@@ -256,7 +252,7 @@ class EventLogTest : public ::testing::TestWithParam<bool> {
 
   std::shared_ptr<const configuration::nodes::NodesConfiguration>
   getNodesConfiguration() const {
-    return config_->getNodesConfigurationFromServerConfigSource();
+    return config_->getNodesConfiguration();
   }
 
   struct DeltaAppendHandle {
@@ -290,12 +286,13 @@ class EventLogTest : public ::testing::TestWithParam<bool> {
     }
 
     void assertCallbackNotCalled() {
-      ASSERT_FALSE(result.hasValue()) << error_name(result.value().first) << " "
-                                      << lsn_to_string(result.value().second);
+      ASSERT_FALSE(result.has_value())
+          << error_name(result.value().first) << " "
+          << lsn_to_string(result.value().second);
     }
 
     void assertCallbackCalled(Status st, lsn_t lsn) {
-      ASSERT_TRUE(result.hasValue());
+      ASSERT_TRUE(result.has_value());
       ASSERT_EQ(st, result.value().first) << error_name(result.value().first);
       ASSERT_EQ(lsn, result.value().second)
           << lsn_to_string(result.value().second);
@@ -439,9 +436,7 @@ bool MockEventLogStateMachine::isGracePeriodForFastForwardActive() {
 
 #define ASSERT_SHARD_STATUS(set, nid, sid, status)                        \
   {                                                                       \
-    const auto nc = buildConfig()                                         \
-                        ->getServerConfig()                               \
-                        ->getNodesConfigurationFromServerConfigSource();  \
+    const auto nc = buildConfig()->getNodesConfiguration();               \
     auto map = set.toShardStatusMap(*nc);                                 \
     EXPECT_EQ(AuthoritativeStatus::status, map.getShardStatus(nid, sid)); \
   }

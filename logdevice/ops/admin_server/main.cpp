@@ -13,6 +13,7 @@
 #include <boost/program_options.hpp>
 #include <folly/Singleton.h>
 
+#include "logdevice/admin/maintenance/ClusterMaintenanceStateMachine.h"
 #include "logdevice/common/BuildInfo.h"
 #include "logdevice/common/ThreadID.h"
 #include "logdevice/common/commandline_util.h"
@@ -27,6 +28,7 @@
 #include "logdevice/include/types.h"
 #include "logdevice/ops/admin_server/StandaloneAdminServer.h"
 #include "logdevice/server/fatalsignal.h"
+#include "logdevice/server/thrift/LogDeviceThriftServer.h"
 
 using namespace facebook::logdevice;
 using namespace facebook::logdevice::admin;
@@ -74,9 +76,6 @@ static void setup_signal_handler(int signum, void (*handler)(int)) {
 
 static boost::program_options::options_description
 get_options(const char* program_name) {
-  using boost::program_options::bool_switch;
-  using boost::program_options::value;
-
   boost::program_options::options_description all_options(
       folly::format("Usage: {} [options]\n\nOptions", program_name).str());
 

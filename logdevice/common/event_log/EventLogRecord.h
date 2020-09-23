@@ -10,9 +10,9 @@
 #include <memory>
 #include <type_traits>
 
-#include <folly/Demangle.h>
 #include <folly/Memory.h>
 #include <folly/Portability.h>
+#include <folly/lang/CString.h>
 
 #include "logdevice/common/Metadata.h"
 #include "logdevice/common/NodeID.h"
@@ -81,7 +81,12 @@ class EventLogRecord {
  */
 template <class Header,
           EventType Type,
-          event_log_record_version_t FormatVersion = INITIAL_VERSION>
+          // Default version number to write to payload.
+          event_log_record_version_t FormatVersion = INITIAL_VERSION,
+          // Number of first bytes of Header that must be present for payload
+          // to be considered valid. Can be used for backwards compatibility.
+          // The remaining fields of Header, if any, are default-initialized.
+          size_t MinAllowedSize = sizeof(Header)>
 class FixedEventLogRecord : public EventLogRecord {
  public:
   explicit FixedEventLogRecord(
@@ -101,7 +106,8 @@ class FixedEventLogRecord : public EventLogRecord {
                          std::unique_ptr<EventLogRecord>& out);
   int toPayload(void* payload, size_t size) const override;
   bool operator==(
-      const FixedEventLogRecord<Header, Type, FormatVersion>& other) const;
+      const FixedEventLogRecord<Header, Type, FormatVersion, MinAllowedSize>&
+          other) const;
   std::string describe() const override {
     return header.describe();
   }
@@ -111,7 +117,7 @@ class FixedEventLogRecord : public EventLogRecord {
 
 /**
  * SHARD_NEEDS_REBUILD:
- * Written by external remediation scripts when they detect that shard
+ * Written by the control plane when they detect that shard
  * `shardIdx` of node `nodeIdx` needs to be rebuilt.
  */
 
@@ -162,9 +168,13 @@ struct SHARD_NEEDS_REBUILD_Header {
 
   // Flags.
 
-  // Allow this node to also be a donor. This option should be used when this
-  // node is expected to still have data. The node must remain up and running
-  // during the rebuilding process otherwise rebuilding will get stuck.
+  // DEPRECATED. We should not be using this flag anymore, instead, please use
+  // FORCE_RESTORE to indicate whether you need rebuilding to be in RESTORE mode
+  // or not.
+  //
+  // Allow this node to also be a donor. This option should be used when
+  // this node is expected to still have data. The node must remain up and
+  // running during the rebuilding process otherwise rebuilding will get stuck.
   static constexpr SHARD_NEEDS_REBUILD_flags_t RELOCATE = (unsigned)1 << 0;
 
   // Rebuild this shard unconditionally until there is a SHARD_UNDRAIN message.
@@ -173,6 +183,9 @@ struct SHARD_NEEDS_REBUILD_Header {
   // This record includes per-data class, time range information.
   static constexpr SHARD_NEEDS_REBUILD_flags_t TIME_RANGED = (unsigned)1 << 2;
 
+  // DEPRECATED. This is currently unused and since we have never had the need
+  // to use this feature, we are planning to remove this flag.
+  //
   // If the shard is already AUTHORITATIVE_EMPTY, or if the shard is already
   // being rebuilt with the same flags, restart rebuilding regardless.
   static constexpr SHARD_NEEDS_REBUILD_flags_t FORCE_RESTART = (unsigned)1 << 3;
@@ -186,6 +199,10 @@ struct SHARD_NEEDS_REBUILD_Header {
   // 3x replication).
   static constexpr SHARD_NEEDS_REBUILD_flags_t FILTER_RELOCATE_SHARDS =
       (unsigned)1 << 5;
+
+  // Forces rebuilding to be in RESTORE mode regardless of the value of the
+  // DRAIN flag.
+  static constexpr SHARD_NEEDS_REBUILD_flags_t FORCE_RESTORE = (unsigned)1 << 6;
 
   // When adding new flags, don't forget to add them to describe().
 
@@ -296,12 +313,27 @@ struct SHARD_DONOR_PROGRESS_Header {
   uint32_t shardIdx;
   int64_t nextTimestamp;
   lsn_t version;
+
+  SHARD_IS_REBUILT_flags_t flags = 0;
+
+  // This donor is rebuilding in new-to-old order, so the `nextTimestamp`
+  // reported by it will be decreasing rather than increasing over time.
+  // In steady state all donors have the same value of this flag. Donors are
+  // only expected to disagree briefly during a restart after an update or
+  // settings change; during this period, if global window is enabled,
+  // rebuilding stalls waiting for donors to converge on one direction.
+  static const SHARD_DONOR_PROGRESS_flags_t FLAG_NEW_TO_OLD = 1 << 0;
+
   std::string describe() const;
 } __attribute__((__packed__));
 
 using SHARD_DONOR_PROGRESS_Event =
     FixedEventLogRecord<SHARD_DONOR_PROGRESS_Header,
-                        EventType::SHARD_DONOR_PROGRESS>;
+                        EventType::SHARD_DONOR_PROGRESS,
+                        INITIAL_VERSION,
+                        // `flags` field was added recently; older versions
+                        // of the server may not write it
+                        offsetof(SHARD_DONOR_PROGRESS_Header, flags)>;
 
 /**
  * SHARD_UNDRAIN

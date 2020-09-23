@@ -17,7 +17,6 @@
 #include "logdevice/common/DataRecordOwnsPayload.h"
 #include "logdevice/common/FlowGroup.h"
 #include "logdevice/common/LocalLogStoreRecordFormat.h"
-#include "logdevice/common/Sender.h"
 #include "logdevice/common/protocol/Compatibility.h"
 #include "logdevice/common/protocol/GAP_Message.h"
 #include "logdevice/common/protocol/Message.h"
@@ -28,6 +27,7 @@
 #include "logdevice/common/stats/Stats.h"
 #include "logdevice/common/test/MockBackoffTimer.h"
 #include "logdevice/common/test/MockTimer.h"
+#include "logdevice/common/test/SenderTestProxy.h"
 #include "logdevice/server/ServerRecordFilterFactory.h"
 #include "logdevice/server/read_path/AllServerReadStreams.h"
 #include "logdevice/server/read_path/LogStorageStateMap.h"
@@ -107,7 +107,7 @@ class MockCatchupQueueDependencies;
 class CatchupQueueTest : public ::testing::Test {
  public:
   CatchupQueueTest()
-      : log_storage_state_map_(1),
+      : log_storage_state_map_(1, /*stats*/ nullptr, /*record_cache*/ false),
         streams_(&log_storage_state_map_, &tasks_),
         flow_group_(std::make_unique<FlowGroup>(
             std::make_unique<NwShapingFlowGroupDeps>(nullptr, nullptr))) {
@@ -236,24 +236,23 @@ class CatchupQueueTest : public ::testing::Test {
                      /* owned payload */ true);
   }
 
-  RECORD_Message* createFakeRecordMessage(read_stream_id_t id,
-                                          lsn_t lsn,
-                                          size_t payload_size) const {
+  std::unique_ptr<RECORD_Message>
+  createFakeRecordMessage(read_stream_id_t id,
+                          lsn_t lsn,
+                          size_t payload_size) const {
     RECORD_Header header{log_id_, id, lsn, 0};
-    auto msg = new RECORD_Message(header,
-                                  TrafficClass::READ_TAIL,
-                                  Payload(nullptr, payload_size),
-                                  nullptr);
-    return msg;
+    folly::IOBuf payload(folly::IOBuf::CREATE, payload_size);
+    payload.append(payload_size);
+    return std::make_unique<RECORD_Message>(header,
+                                            TrafficClass::READ_TAIL,
+                                            PayloadHolder(std::move(payload)),
+                                            nullptr);
   }
 
   // Takes advantage of friend declaration in RECORD_Message to expose header
   // and payload
   const RECORD_Header& getHeader(const RECORD_Message& msg) {
     return msg.header_;
-  }
-  const Payload& getPayload(const RECORD_Message& msg) {
-    return msg.payload_;
   }
 
   std::unique_ptr<GAP_Message> createFakeGapMessage(read_stream_id_t id,
@@ -568,8 +567,8 @@ TEST_F(CatchupQueueTest, LargeRecordPauses) {
   SteadyTimestamp enqueue_time = SteadyTimestamp::now();
   auto msg = createFakeStartedMessage(id1, filter_version_t(0), E::OK);
   streams_.onStartedSent(client_id_, *msg, enqueue_time);
-  std::unique_ptr<RECORD_Message> msg1(createFakeRecordMessage(id1, 100, 5000));
-  std::unique_ptr<RECORD_Message> msg2(createFakeRecordMessage(id1, 101, 5000));
+  auto msg1 = createFakeRecordMessage(id1, 100, 5000);
+  auto msg2 = createFakeRecordMessage(id1, 101, 5000);
   streams_.onRecordSent(client_id_, *msg1, enqueue_time);
   ASSERT_EQ(0, tasks_.size()); // still nothing until we drain both
 
@@ -614,8 +613,7 @@ TEST_F(CatchupQueueTest, RecordBytesQueuedCounterPersists) {
   auto msg =
       createFakeStartedMessage(read_stream_id, filter_version_t(0), E::OK);
   streams_.onStartedSent(client_id_, *msg, enqueue_time);
-  std::unique_ptr<RECORD_Message> msg1(
-      createFakeRecordMessage(read_stream_id, 1, 1000));
+  auto msg1 = createFakeRecordMessage(read_stream_id, 1, 1000);
   streams_.onRecordSent(client_id_, *msg1, enqueue_time);
 
   // Check that the CatchupQueue instance still exists and that
@@ -663,8 +661,7 @@ TEST_F(CatchupQueueTest, ByteLimitReachedButOutputBufferEmptied) {
   auto msg =
       createFakeStartedMessage(read_stream_id, filter_version_t(0), E::OK);
   streams_.onStartedSent(client_id_, *msg, enqueue_time);
-  std::unique_ptr<RECORD_Message> msg1(
-      createFakeRecordMessage(read_stream_id, 1, 100000));
+  auto msg1 = createFakeRecordMessage(read_stream_id, 1, 100000);
   streams_.onRecordSent(client_id_, *msg1, enqueue_time);
 
   // Suppose the storage thread couldn't read any records without exceeding
@@ -1261,10 +1258,8 @@ TEST_F(CatchupQueueTest, SendMessageFailed) {
   auto msg =
       createFakeStartedMessage(read_stream_id, filter_version_t(0), E::OK);
   streams_.onStartedSent(client_id_, *msg, enqueue_time);
-  std::unique_ptr<RECORD_Message> msg1(
-      createFakeRecordMessage(read_stream_id, 100, 1000));
-  std::unique_ptr<RECORD_Message> msg2(
-      createFakeRecordMessage(read_stream_id, 101, 2000));
+  auto msg1 = createFakeRecordMessage(read_stream_id, 100, 1000);
+  auto msg2 = createFakeRecordMessage(read_stream_id, 101, 2000);
   streams_.onRecordSent(client_id_, *msg1, enqueue_time);
   streams_.onRecordSent(client_id_, *msg2, enqueue_time);
 
@@ -2122,7 +2117,7 @@ TEST_F(CatchupQueueTest, StreamValidations) {
     streams_.onReadTaskDone(*task);
     ASSERT_EQ(1, messages_.size());
     enqueue_time = SteadyTimestamp::now();
-    std::unique_ptr<RECORD_Message> msg(createFakeRecordMessage(id1, 1, 100));
+    auto msg = createFakeRecordMessage(id1, 1, 100);
     streams_.onRecordSent(client_id_, *msg, enqueue_time);
     ASSERT_EQ(1, stats.read_stream_record_violations);
   }

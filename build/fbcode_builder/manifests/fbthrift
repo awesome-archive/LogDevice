@@ -15,19 +15,12 @@ bison
 flex
 folly
 wangle
-rsocket-cpp
 fizz
 fmt
 googletest
 libsodium
 python-six
 zstd
-
-[cmake.defines.test=on]
-BUILD_TESTS=ON
-
-[cmake.defines.test=off]
-BUILD_TESTS=OFF
 
 [shipit.pathmap]
 fbcode/thrift/public_tld = .

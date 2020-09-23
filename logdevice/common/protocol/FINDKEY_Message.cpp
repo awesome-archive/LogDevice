@@ -19,7 +19,7 @@ namespace facebook { namespace logdevice {
 void FINDKEY_Message::serialize(ProtocolWriter& writer) const {
   writer.write(header_);
   if (header_.flags & FINDKEY_Header::USER_KEY) {
-    ld_check(key_.hasValue());
+    ld_check(key_.has_value());
     ld_check(key_.value().size() <= std::numeric_limits<uint16_t>::max());
 
     uint16_t key_length = key_.value().size();
@@ -62,6 +62,14 @@ void FINDKEY_Message::onSent(Status status, const Address& to) const {
     it->second->onMessageSent(
         ShardID(to.id_.node_.index(), header_.shard), status);
   }
+}
+
+PermissionParams FINDKEY_Message::getPermissionParams() const {
+  PermissionParams params;
+  params.requiresPermission = true;
+  params.action = ACTION::READ;
+  params.log_id = header_.log_id;
+  return params;
 }
 
 }} // namespace facebook::logdevice

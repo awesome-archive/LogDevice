@@ -18,6 +18,7 @@
 
 #include "logdevice/common/Address.h"
 #include "logdevice/common/ConnectThrottle.h"
+#include "logdevice/common/ConnectionKind.h"
 #include "logdevice/common/NoopTraceLogger.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/Sender.h"
@@ -26,6 +27,7 @@
 #include "logdevice/common/configuration/Configuration.h"
 #include "logdevice/common/debug.h"
 #include "logdevice/common/protocol/HELLO_Message.h"
+#include "logdevice/common/test/NodesConfigurationTestUtil.h"
 #include "logdevice/common/test/TestUtil.h"
 
 namespace facebook { namespace logdevice {
@@ -48,6 +50,7 @@ Message::Disposition DUMMY_Message::onReceived(const Address& /*from*/) {
 template <>
 void DUMMY_Message::onSent(Status, const Address& to) const {
   if (header_.send_another) {
+    ld_info("Dummy message on sent invoked.");
     auto msg = std::make_unique<DUMMY_Message>(DUMMY_Header{false});
     Worker::onThisThread()->sender().sendMessage(std::move(msg), to);
     // shouldn't trip an assert
@@ -135,7 +138,7 @@ TEST(MessagingTest, EventLoop) {
   EXPECT_EQ(0, processor->postRequest(rq));
   EXPECT_EQ(nullptr, rq.get());
 
-  ASSERT_NE(std::this_thread::get_id(), l->getThread().get_id());
+  ASSERT_FALSE(l->getThread().isCurrentThread());
 
   // since no EventLoop is running on this thread
   ASSERT_EQ(nullptr, EventLoop::onThisThread());
@@ -362,20 +365,24 @@ class OnClientCloseTestRequest : public Request {
                                    Sockaddr("127.0.0.1", port),
                                    ResourceBudget::Token(),
                                    SocketType::DATA,
-                                   ConnectionType::PLAIN);
+                                   ConnectionType::PLAIN,
+                                   ConnectionKind::DATA);
     EXPECT_EQ(0, rv);
 
-    rv = w->sender().registerOnSocketClosed(Address(cid_), *(new OnClose()));
+    rv =
+        w->sender().registerOnConnectionClosed(Address(cid_), *(new OnClose()));
     EXPECT_EQ(0, rv);
 
-    rv = w->sender().registerOnSocketClosed(Address(cid_), *(new OnClose()));
+    rv =
+        w->sender().registerOnConnectionClosed(Address(cid_), *(new OnClose()));
     EXPECT_EQ(0, rv);
 
     const ClientID nonexisting_client(100);
 
     OnClose* cb2 = new OnClose();
 
-    rv = w->sender().registerOnSocketClosed(Address(nonexisting_client), *cb2);
+    rv = w->sender().registerOnConnectionClosed(
+        Address(nonexisting_client), *cb2);
 
     delete cb2;
 
@@ -450,13 +457,17 @@ TEST(MessagingTest, SendFromCallback) {
   node.address = Sockaddr("127.0.0.1", "65534"),
   node.gossip_address = Sockaddr("127.0.0.1", "65535"), node.generation = 1;
   node.addStorageRole();
+  node.addSequencerRole();
 
-  Configuration::NodesConfig nodes({{0, std::move(node)}});
-  auto config =
-      std::make_shared<UpdateableConfig>(std::make_shared<Configuration>(
-          ServerConfig::fromDataTest(
-              __FILE__, nodes, Configuration::MetaDataLogsConfig()),
-          nullptr));
+  configuration::Nodes nodes({{0, std::move(node)}});
+
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes));
+
+  auto config = std::make_shared<UpdateableConfig>(
+      std::make_shared<Configuration>(ServerConfig::fromDataTest(__FILE__),
+                                      nullptr,
+                                      std::move(nodes_configuration)));
 
   struct SendRequest : public Request {
     explicit SendRequest(NodeID node)
@@ -509,7 +520,8 @@ TEST(MessagingTest, ConnectionLimit) {
           Sockaddr("127.0.0.1", folly::to<std::string>(fd_).c_str()),
           std::move(token_),
           SocketType::DATA,
-          ConnectionType::PLAIN);
+          ConnectionType::PLAIN,
+          ConnectionKind::DATA);
       EXPECT_EQ(0, rv);
       sem_.post();
       return Execution::COMPLETE;

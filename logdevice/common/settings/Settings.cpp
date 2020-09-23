@@ -15,8 +15,10 @@
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/program_options.hpp>
 #include <boost/thread/thread.hpp>
+#include <folly/Format.h>
 #include <folly/String.h>
 
+#include "logdevice/common/SnapshotStoreTypes.h"
 #include "logdevice/common/Sockaddr.h"
 #include "logdevice/common/commandline_util_chrono.h"
 #include "logdevice/common/debug.h"
@@ -220,7 +222,7 @@ static SockaddrSet parse_sockaddrs(const std::string& val) {
 
 dbg::Level parse_log_level(const std::string& val) {
   const auto level = dbg::tryParseLoglevel(val.c_str());
-  if (!level.hasValue()) {
+  if (!level.has_value()) {
     std::array<char, 1024> buf;
     snprintf(buf.data(),
              buf.size(),
@@ -393,6 +395,22 @@ parse_authoritative_status_overrides(const std::string& value) {
   return res;
 }
 
+static SnapshotStoreType validate_rsm_snapshot_store(const std::string& value) {
+  if (value == "legacy") {
+    return SnapshotStoreType::LEGACY;
+  } else if (value == "log") {
+    return SnapshotStoreType::LOG;
+  } else if (value == "message") {
+    return SnapshotStoreType::MESSAGE;
+  } else if (value == "local-store") {
+    return SnapshotStoreType::LOCAL_STORE;
+  } else {
+    throw boost::program_options::error(
+        "Invalid value for snapshot store: " + value +
+        ". Expected one of 'legacy', 'log', 'message', 'local-store'.");
+  }
+}
+
 void Settings::defineSettings(SettingEasyInit& init) {
   using namespace SettingFlag;
 
@@ -410,7 +428,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "false",
        nullptr, // no validation
        "if true, the Processor with this Settings object is only used to "
-       "perform bootstraping and will be destroyed after bootstrapping is "
+       "perform bootstrapping and will be destroyed after bootstrapping is "
        "completed. This isn't set by any parsed setting, but is only set "
        "directly internally",
        INTERNAL_ONLY);
@@ -463,8 +481,11 @@ void Settings::defineSettings(SettingEasyInit& init) {
        &message_error_injection_status,
        "NOBUFS",
        nullptr, // no validation
-       "status that should be returned for a simulated message transmission "
-       "error",
+       "Status that should be returned for a simulated message transmission "
+       "error. Some values are treated in special ways: CBREGISTERED pretends "
+       "that the message was delayed by traffic shaping (only if traffic "
+       "shaping is enabled); DROPPED makes Sender to pretend that the message "
+       "is in-flight indefinitely, without ever sending it.",
        SERVER | CLIENT | REQUIRES_RESTART,
        SettingsCategory::Testing);
   init("disable-trace-logger",
@@ -520,6 +541,27 @@ void Settings::defineSettings(SettingEasyInit& init) {
       "only to newly created ones", // TODO (t13429319): fix this
       SERVER | CLIENT,
       SettingsCategory::Network);
+  init("outbufs-limit-per-peer-type",
+       &outbufs_limit_per_peer_type_enabled,
+       "true",
+       nullptr, // no validation
+       "If enabled, the outbytes-mb limit is split in half between "
+       "client-to-server and server-to-server connections. If disabled, the "
+       "limit is shared; in particular, a few misbehaving clients may cause "
+       "the server to use up all its outbytes-mb and become unable to send to "
+       "other servers.",
+       SERVER,
+       SettingsCategory::Network);
+  init("outbuf-socket-min-kb",
+       &outbuf_socket_min_kb,
+       "1",
+       parse_positive<ssize_t>(),
+       "Minimum outstanding bytes per socket in kb. Global sender's budget "
+       "will be ignored if socket's outstanding bytes is less than this value. "
+       "Changing this setting on-the-fly will not apply it to existing "
+       "sockets, only to newly created ones", // TODO (t13429319): fix this
+       SERVER,
+       SettingsCategory::Network);
   init("output-max-records-kb",
        &output_max_records_kb,
        "1024",
@@ -531,9 +573,70 @@ void Settings::defineSettings(SettingEasyInit& init) {
        &max_time_to_allow_socket_drain,
        "3min",
        validate_positive<ssize_t>(),
-       "After hitting NOBUFS, amount of time a socket is allowed to "
-       "successfully send a single message before it is closed.",
+       "If a socket does not drain a complete message for "
+       "max-time-to-allow-socket-drain. Then the socket is closed.",
        SERVER | CLIENT,
+       SettingsCategory::Network);
+  init("socket-idle-threshold",
+       &socket_idle_threshold,
+       "1000000",
+       validate_positive<ssize_t>(),
+       "A socket is considered idle if number of bytes pending in the socket "
+       "is below or equal to this threshold. This is used along with "
+       "min_socket_idle_threshold_percent to find active socket and select "
+       "them for health check. Check socket-health-check-period for more "
+       "details.",
+       SERVER | CLIENT,
+       SettingsCategory::Network);
+  init("min-socket-idle-threshold-percent",
+       &min_socket_idle_threshold_percent,
+       "50",
+       validate_positive<ssize_t>(),
+       "A socket is considered active if it had bytes pending in the socket "
+       "above socket-idle-threshold for greater than "
+       "min-socket-idle-threshold-percent of socket-health-check-period.",
+       SERVER | CLIENT,
+       SettingsCategory::Network);
+  init("min-bytes-to-drain-per-second",
+       &min_bytes_to_drain_per_second,
+       "1000000",
+       validate_positive<ssize_t>(),
+       "Refer socket-health-check-period for details.",
+       SERVER | CLIENT,
+       SettingsCategory::Network);
+  init("socket-health-check-period",
+       &socket_health_check_period,
+       "1min",
+       validate_positive<ssize_t>(),
+       "Time between consecutive socket health check. Every "
+       "socket-health-check-period, a socket is closed, if it was not draining "
+       "for max-time-to-allow-socket-drain or it was active but the throughput "
+       "during the time it was active dropped below"
+       "min-bytes-to-drain-per-second due to network congestion.",
+       SERVER | CLIENT,
+       SettingsCategory::Network);
+  init("rate-limit-socket-closed",
+       &rate_limit_socket_closed,
+       "1",
+       validate_positive<ssize_t>(),
+       "Max number of sockets closed in a socket health check period.",
+       SERVER | CLIENT,
+       SettingsCategory::Network);
+  init("idle-connection-keep-alive",
+       &idle_connection_keep_alive,
+       "5min",
+       validate_positive<ssize_t>(),
+       "How long inactive client-to-server connection will stay open before "
+       "being shut down automatically.",
+       CLIENT,
+       SettingsCategory::Network);
+  init("rate-limit-idle-connection-closed",
+       &rate_limit_idle_connection_closed,
+       "10",
+       validate_nonnegative<ssize_t>(),
+       "Max number of idle connections closed in single round of socket healh "
+       "check. Set to 0 to disable closing of idle connections completely.",
+       CLIENT,
        SettingsCategory::Network);
   init("max-cached-digest-record-queued-kb",
        &max_cached_digest_record_queued_kb,
@@ -610,13 +713,13 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "this false ignores per request and per message ExecutorPriority.",
        SERVER | CLIENT | REQUIRES_RESTART,
        SettingsCategory::Execution);
-  init("use-legacy-evenbase",
+  init("use-legacy-eventbase",
        &use_legacy_eventbase,
-       "true",
+       "false",
        nullptr,
        "Use libevent2 based event base to create EventLoop threadpool in "
-       "logdevice.",
-       SERVER | CLIENT | REQUIRES_RESTART,
+       "logdevice. DEPRECATED as libevent2 is being removed from codebase",
+       SERVER | CLIENT | REQUIRES_RESTART | DEPRECATED,
        SettingsCategory::Execution);
   init("request-exec-threshold",
        &request_execution_delay_threshold,
@@ -664,13 +767,6 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "maximum byte limit of unprocessed messages within the system.",
        SERVER | CLIENT | REQUIRES_RESTART,
        SettingsCategory::Network);
-  init("payload-inline",
-       &max_payload_inline,
-       "1024",
-       parse_positive<ssize_t>(),
-       "max message payload size that we store in a flat buffer after header",
-       SERVER | CLIENT,
-       SettingsCategory::WritePath);
   init("max-inflight-storage-tasks",
        &max_inflight_storage_tasks,
        "4096",
@@ -776,7 +872,32 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "Maximum allowed rate of printing backtraces.",
        SERVER | CLIENT | REQUIRES_RESTART /* Passed to WatchDogThread ctor */,
        SettingsCategory::Monitoring);
-
+  init("maximum-percent-unhealthy-seq-nodes-hbsp",
+       &maximum_percent_unhealthy_seq_nodes,
+       "0.5",
+       validate_range<double>(0, 1.0),
+       "Percent of UNHEALTHY nodes in the cluster at which HealthBasedHashing "
+       "is no longer a viable option. This value MUST be the same on client "
+       "and server to ensure correct conditions for health based sequencer "
+       "placement.",
+       SERVER | CLIENT /* used in ClusterState */,
+       SettingsCategory::Sequencer);
+  init("enable-health-based-sequencer-placement",
+       &enable_health_based_sequencer_placement,
+       "false",
+       nullptr,
+       "Toggle use of HealthMonitor determined node status in sequencer "
+       "location. This value MUST be the same on client and server to ensure "
+       "correct conditions for health based sequencer placement.",
+       SERVER | CLIENT /* used in HashBasedSequencerLocator  */,
+       SettingsCategory::Sequencer);
+  init("enable-health-monitor",
+       &enable_health_monitor,
+       "true",
+       nullptr,
+       "Toggle use of HealthMonitor to determine node status on server-side.",
+       SERVER | REQUIRES_RESTART /* used in ServerProcessor init */,
+       SettingsCategory::Monitoring);
   init("health-monitor-poll-interval",
        &health_monitor_poll_interval_ms,
        "500ms",
@@ -784,15 +905,125 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "Interval after which health monitor detects issues on node.",
        SERVER | REQUIRES_RESTART /* used in ServerProcessor init */,
        SettingsCategory::Monitoring);
+  init("health-monitor-max-delay",
+       &health_monitor_max_delay,
+       "50ms",
+       validate_positive<ssize_t>(),
+       "Maximum tolerated delay inbetween health monitor loops.",
+       SERVER | REQUIRES_RESTART /* used in ServerProcessor init */,
+       SettingsCategory::Monitoring);
+  init(
+      "health-monitor-max-queue-stalls-avg",
+      &health_monitor_max_queue_stalls_avg_ms,
+      "100ms",
+      validate_positive<ssize_t>(),
+      "Maximum average of queue stalls in health-monitor-poll-interval-ms that "
+      "are not counted towards overload even if their sum exceeds "
+      "health-monitor-max_queue-stall-duration.",
+      SERVER | REQUIRES_RESTART /* used in ServerProcessor init */,
+      SettingsCategory::Monitoring);
+
+  init("health-monitor-max-queue-stall-duration",
+       &health_monitor_max_queue_stall_duration_ms,
+       "200ms",
+       validate_positive<ssize_t>(),
+       "Value of summed queue stalls over a period of "
+       "health-monitor-poll-interval-ms that if generated by less than "
+       "health-monitor-max-queue-stalls queued requests results in worker "
+       "being counted as overloaded by health monitor ",
+       SERVER | REQUIRES_RESTART /* used in ServerProcessor init */,
+       SettingsCategory::Monitoring);
+
+  init("health-monitor-max-overloaded-worker-percentage",
+       &health_monitor_max_overloaded_worker_percentage,
+       "0.3",
+       validate_range<double>(0, 1.1),
+       "Maximum tolarable percent of HM detected overloaded workers. If the "
+       "percentage of overloaded workers rises above this value the whole node "
+       "transitions into an overloaded state in the HM. Setting this "
+       "percentage to a value greater than 1.0 ensures that overloaded workers "
+       "are excluded from HM decision-making.",
+       SERVER | REQUIRES_RESTART /* used in ServerProcessor init */,
+       SettingsCategory::Monitoring);
+
+  init("health-monitor-max-stalls-avg",
+       &health_monitor_max_stalls_avg_ms,
+       "90ms",
+       validate_positive<ssize_t>(),
+       "Maximum average of worker stalls in health-monitor-poll-interval-ms "
+       "that are not counted towards UNHEALTHY.",
+       SERVER | REQUIRES_RESTART /* used in ServerProcessor init */,
+       SettingsCategory::Monitoring);
+
+  init("health-monitor-max-stalled-worker-percentage",
+       &health_monitor_max_stalled_worker_percentage,
+       "0.2",
+       validate_range<double>(0, 1.1),
+       "Maximum tolarable percent of HM detected stalled workers. If the "
+       "percentage of stalled workers rises above this value the whole node "
+       "transitions into an UNDEALTHY state in the HM. Setting this percentage "
+       "to a value greater than 1.0 ensures that stalled workers are excluded "
+       "from HM decision-making.",
+       SERVER | REQUIRES_RESTART /* used in ServerProcessor init */,
+       SettingsCategory::Monitoring);
+
+  init("worker-stall-error-injection-chance",
+       &worker_stall_error_injection_chance,
+       "0",
+       validate_range<double>(0, 100),
+       "Percentage chance of delayed request execution in a worker thread. "
+       "Used to exercise error handling paths in Health Monitor.",
+       SERVER | REQUIRES_RESTART,
+       SettingsCategory::Testing);
+
+  init("worker-queue-stall-error-injection-chance",
+       &worker_queue_stall_error_injection_chance,
+       "0",
+       validate_range<double>(0, 100),
+       "Percentage chance of delayed request queuing in a worker thread. "
+       "Used to exercise error handling paths in Health Monitor.",
+       SERVER | REQUIRES_RESTART,
+       SettingsCategory::Testing);
+
+  init("watchdog-detected-worker-stall-error-injection-chance",
+       &watchdog_detected_worker_stall_error_injection_chance,
+       "0",
+       validate_range<double>(0, 100),
+       "Percentage chance of detection of stalled workers in watchdog thread. "
+       "Used to exercise error handling paths in Health Monitor.",
+       SERVER | REQUIRES_RESTART,
+       SettingsCategory::Testing);
+
+  init("block-logsconfig-rsm",
+       &block_logsconfig_rsm,
+       "false",
+       nullptr,
+       "If true, the LogsConfig replicated state machine will not publish any "
+       "state updates. This simulates the case where we cannot finish loading "
+       "the state on startup. Changing the value will cause the RSM to publish "
+       "the state immediately if it can.",
+       SERVER | CLIENT,
+       SettingsCategory::Testing);
+
+  init("block-eventlog-rsm",
+       &block_eventlog_rsm,
+       "false",
+       nullptr,
+       "If true, the EventLog replicated state machine will not publish any "
+       "state updates. This simulates the case where we cannot finish loading "
+       "the state on startup. Changing the value will cause the RSM to publish "
+       "the state immediately if it can.",
+       SERVER,
+       SettingsCategory::Testing);
 
   init("purging-use-metadata-log-only",
        &purging_use_metadata_log_only,
        "false",
        nullptr,
-       "If true, the NodeSetFinder within PurgeUncleanEpochs will use"
+       "If true, the NodeSetFinder within PurgeUncleanEpochs will use "
        "only the metadata log as source for fetching historical metadata."
        "used only for migration",
-       SERVER,
+       SERVER | DEPRECATED,
        SettingsCategory::Recovery);
   init(
       "send-to-gossip-port",
@@ -822,7 +1053,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
        parse_positive<ssize_t>(),
        "Number of preallocated nodes in the cluster. Used for sizing "
        "data structures of the failure detector.",
-       SERVER | REQUIRES_RESTART,
+       SERVER | REQUIRES_RESTART | DEPRECATED,
        SettingsCategory::Core);
   init("sbr-node-threshold",
        &space_based_retention_node_threshold,
@@ -1019,6 +1250,13 @@ void Settings::defineSettings(SettingEasyInit& init) {
        " get graylisted",
        SERVER,
        SettingsCategory::WritePath);
+  init("rsm-force-all-send-all",
+       &rsm_force_all_send_all,
+       "true",
+       nullptr, // no validation
+       "Forces ALL_SEND_ALL mode for read streams associated with RSM.",
+       SERVER | CLIENT | REQUIRES_RESTART,
+       SettingsCategory::Core);
   init("graylisting-monitored-period",
        &graylisting_monitored_period,
        "120s",
@@ -1032,6 +1270,13 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "30s",
        nullptr, // no validation
        "The interval at which the graylists are refreshed",
+       SERVER,
+       SettingsCategory::WritePath);
+  init("graylisting-min-latency",
+       &graylisting_min_latency,
+       "0ms",
+       nullptr,
+       "Don't graylist nodes that have p95 store latency less than this.",
        SERVER,
        SettingsCategory::WritePath);
   init("enable-read-throttling",
@@ -1203,6 +1448,14 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "(for improved debuggability).",
        CLIENT,
        SettingsCategory::Monitoring);
+  init("client-readers-flow-tracer-GSS-skip-remote-preemption-checks",
+       &client_readers_flow_tracer_GSS_skip_remote_preemption_checks,
+       "true",
+       nullptr,
+       "If set, skips remote preemption checks (aka CHECK SEALs) on GSSs "
+       "issued by ClientReadersFlowTracer.",
+       CLIENT,
+       SettingsCategory::Monitoring);
   init("client-readers-flow-tracer-lagging-metric-num-sample-groups",
        &client_readers_flow_tracer_lagging_metric_num_sample_groups,
        "3",
@@ -1232,6 +1485,13 @@ void Settings::defineSettings(SettingEasyInit& init) {
       "threshold to be (1 - x / 100).",
       CLIENT,
       SettingsCategory::Monitoring);
+  init("client-readers-flow-tracer-high-pri-max-lag",
+       &client_readers_flow_tracer_high_pri_max_lag,
+       "max",
+       validate_nonnegative<ssize_t>(),
+       "Max allowed amount of lag for high priority readers.",
+       CLIENT,
+       SettingsCategory::Monitoring);
   init("client-test-force-stats",
        &client_test_force_stats,
        "false",
@@ -1248,7 +1508,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
       "After receiving responses to an isLogEmpty() request from an f-majority "
       "of nodes, wait up to this long for more nodes to chime in if there is "
       "not yet consensus.",
-      CLIENT | EXPERIMENTAL,
+      CLIENT | DEPRECATED,
       SettingsCategory::ReadPath);
   init("release-retry-interval",
        &release_retry_interval,
@@ -1343,14 +1603,6 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "considered stuck.",
        SERVER | CLIENT,
        SettingsCategory::Monitoring);
-  init("reader-lagging-threshold",
-       &reader_lagging_threshold,
-       "2min",
-       validate_nonnegative<ssize_t>(),
-       "Amount of time we wait before we report a read stream that is "
-       "considered lagging.",
-       SERVER | CLIENT,
-       SettingsCategory::Monitoring);
   init(
       "log-state-recovery-interval",
       &log_state_recovery_interval,
@@ -1422,11 +1674,11 @@ void Settings::defineSettings(SettingEasyInit& init) {
       SettingsCategory::FailureDetector);
   init("enable-is-log-empty-v2",
        &enable_is_log_empty_v2,
-       "false",
+       "true",
        nullptr,
        "When enabled, the V2 implementation will be used to process all "
        "isLogEmpty requests.",
-       CLIENT,
+       CLIENT | DEPRECATED,
        SettingsCategory::Core);
   init(
       "enable-initial-get-cluster-state",
@@ -1498,13 +1750,13 @@ void Settings::defineSettings(SettingEasyInit& init) {
       SERVER | REQUIRES_RESTART /* Used in CopySetManager ctor */,
       SettingsCategory::WritePath);
   init("write-copyset-index",
-       &write_copyset_index,
+       &write_copyset_index_DEPRECATED,
        "true",
        nullptr, // no validation
        "If set, storage nodes will write the copyset index for all records. "
-       "This must be set before --rocksdb-use-copyset-index is enabled. "
-       "Doesn't affect copyset stickiness",
-       SERVER,
+       "Note that this won't be used until --rocksdb-use-copyset-index is "
+       "enabled.",
+       SERVER | DEPRECATED,
        SettingsCategory::WritePath);
   init("iterator-cache-ttl",
        &iterator_cache_ttl,
@@ -1526,7 +1778,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
        &max_total_appenders_size_soft,
        "524288000", // 500MB
        parse_positive<ssize_t>(),
-       "Total size in bytes of running Appenders accross all workers after "
+       "Total size in bytes of running Appenders across all workers after "
        "which "
        "we start taking measures to reduce the Appender residency time.",
        SERVER,
@@ -1535,7 +1787,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
        &max_total_appenders_size_hard,
        "629145600", // 600MB
        parse_positive<ssize_t>(),
-       "Total size in bytes of running Appenders accross all workers after "
+       "Total size in bytes of running Appenders across all workers after "
        "which "
        "we start rejecting new appends.",
        SERVER,
@@ -1690,7 +1942,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
        &rebuilding_stores_max_mem_bytes,
        "2G",
        parse_positive<size_t>(),
-       "Maxumun total size of in-flight StoreStorageTasks from rebuilding. "
+       "Maximum total size of in-flight StoreStorageTasks from rebuilding. "
        "Evenly divided among shards.",
        SERVER,
        SettingsCategory::ResourceManagement);
@@ -1714,8 +1966,8 @@ void Settings::defineSettings(SettingEasyInit& init) {
        &ssl_load_client_cert,
        "false",
        nullptr, // no validation
-       "Set to include client certificate for mutual ssl authenticaiton",
-       CLIENT | SERVER,
+       "Set to include client certificate for mutual ssl authentication",
+       CLIENT | REQUIRES_RESTART,
        SettingsCategory::Security);
   init("ssl-cert-path",
        &ssl_cert_path,
@@ -1744,6 +1996,14 @@ void Settings::defineSettings(SettingEasyInit& init) {
        validate_positive<ssize_t>(),
        "TTL for an SSL certificate that we have loaded from disk.",
        SERVER | CLIENT | REQUIRES_RESTART /* used in Worker ctor */,
+       SettingsCategory::Security);
+  init("ssl-use-session-resumption",
+       &ssl_use_session_resumption,
+       "false",
+       nullptr,
+       "If enabled, new SSL connections will attempt to resume previously "
+       "cached sessions.",
+       SERVER | CLIENT,
        SettingsCategory::Security);
   init("ssl-boundary",
        &ssl_boundary,
@@ -1864,13 +2124,6 @@ void Settings::defineSettings(SettingEasyInit& init) {
       "storage nodes reject the record.",
       SERVER,
       SettingsCategory::WritePath);
-  init("default-log-namespace",
-       &default_log_namespace,
-       "",
-       nullptr, // no validation
-       "Default log namespace to use on the client.",
-       CLIENT | DEPRECATED,
-       SettingsCategory::Configuration);
   init("server-based-nodes-configuration-store-timeout",
        &server_based_nodes_configuration_store_timeout,
        "60s",
@@ -1912,7 +2165,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "The seed string that will be used to fetch the initial nodes "
        "configuration. It can be in the form string:<server1>,<server2>,etc. "
        "Or you can provide an smc tier via 'smc:<smc_tier>'. If it's empty, "
-       "NCM client bootstraping is not used.",
+       "NCM client bootstrapping is not used.",
        CLIENT,
        SettingsCategory::Configuration);
   init("nodes-configuration-init-retry-timeout",
@@ -1967,7 +2220,8 @@ void Settings::defineSettings(SettingEasyInit& init) {
        &tcp_user_timeout,
        "300000", // 5 min
        nullptr,  // no validation
-       "The time in miliseconds that transmitted data may remain unacknowledged"
+       "The time in milliseconds that transmitted data may remain "
+       "unacknowledged "
        "before TCP will close the connection. "
        "0 for system default. "
        "-1 to disable. "
@@ -2045,6 +2299,21 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "intended destination ID, the connection is terminated.",
        SERVER | CLIENT,
        SettingsCategory::Network);
+  init("client-connect-with-fizz",
+       &client_connect_with_fizz,
+       "false",
+       nullptr,
+       "Use Fizz (TLS 1.3) when establishing secure connections to servers.",
+       CLIENT | REQUIRES_RESTART | DEPRECATED,
+       SettingsCategory::Network);
+  init("server-connect-with-fizz",
+       &server_connect_with_fizz,
+       "false",
+       nullptr,
+       "Use Fizz (TLS 1.3) when establishing secure connections to other"
+       " servers.",
+       SERVER | REQUIRES_RESTART | DEPRECATED,
+       SettingsCategory::Network);
   init("sequencer-batching",
        &sequencer_batching,
        "false",
@@ -2053,6 +2322,16 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "fewer records in the system. This setting is only used when the log "
        "group doesn't override it",
        SERVER,
+       SettingsCategory::Batching);
+  init("socket-batching-time-trigger",
+       &socket_batching_time_trigger,
+       "0s",
+       nullptr, // no validation
+       "Socket batching allows us to batch data before flushing it to the "
+       "socket to save CPU. It increases the amount of "
+       "memory consumed. And introduces additional latency when sending "
+       "messages.",
+       SERVER | CLIENT,
        SettingsCategory::Batching);
   init("sequencer-batching-time-trigger",
        &sequencer_batching_time_trigger,
@@ -2199,7 +2478,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
        &byte_offsets,
        "false",
        nullptr, // no validation
-       "Enables the server-side byte offset calculation feature."
+       "Enables the server-side byte offset calculation feature. "
        "NOTE: There is no guarantee of byte offsets result correctness if "
        "feature"
        "was switched on->off->on in period shorter than retention value for"
@@ -2208,7 +2487,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
        SettingsCategory::WritePath);
   init("enable-config-synchronization",
        &enable_config_synchronization,
-       "true",
+       "false",
        nullptr, // no validation
        "With config synchronization enabled, nodes on both ends of a connection"
        "will synchronize their configs if there is a mismatch in the config"
@@ -2258,7 +2537,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
        SettingsCategory::Testing);
   init("logsconfig-max-delta-records",
        &logsconfig_max_delta_records,
-       "4000",
+       "5000",
        nullptr,
        "How many delta records to keep in the logsconfig deltas log before we "
        "snapshot it.",
@@ -2267,27 +2546,19 @@ void Settings::defineSettings(SettingEasyInit& init) {
   init(
       "logsconfig-max-delta-bytes",
       &logsconfig_max_delta_bytes,
-      "10485760",
+      "10485760", // 10MB
       nullptr,
       "How many bytes of deltas to keep in the logsconfig deltas log before we "
       "snapshot it.",
       SERVER,
       SettingsCategory::Configuration);
-  init("test-hold-logsconfig-in-starting-state",
-       &test_hold_logsconfig_in_starting,
-       "false",
-       nullptr,
-       "Prevents LogsConfigStateMachine from being started. Used for testing "
-       "only.",
-       SERVER,
-       SettingsCategory::Testing);
   init("client-config-fetch-allowed",
        &client_config_fetch_allowed,
        "true",
        nullptr, // no validation
        "If true, servers will be allowed to fetch configs from the client side "
        "of a connection during config synchronization.",
-       SERVER,
+       SERVER | DEPRECATED,
        SettingsCategory::Configuration);
 
   init("unreleased-record-detector-interval",
@@ -2333,6 +2604,16 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "main config file.",
        SERVER | CLIENT | REQUIRES_RESTART | DEPRECATED,
        SettingsCategory::Configuration);
+
+  init("use-dedicated-server-to-server-address",
+       &use_dedicated_server_to_server_address,
+       "false",
+       nullptr,
+       "Temporary switch to roll out dedicated server-to-server address to "
+       "running clusters with minor disruption. This setting will be removed "
+       "soon in a future release as soon as the rollout is completed.",
+       SERVER,
+       SettingsCategory::Network);
 
   init("test-bypass-recovery",
        &bypass_recovery,
@@ -2409,6 +2690,29 @@ void Settings::defineSettings(SettingEasyInit& init) {
        SERVER | CLIENT | REQUIRES_RESTART,
        SettingsCategory::Configuration);
 
+  init("client-default-network-priority",
+       &client_default_network_priority,
+       "",
+       parse_network_priority,
+       "Sets the default client network priority. Clients will connect to the "
+       "server port associated with this priority, unless "
+       "'enable-port-based-qos' is false. Value must be one of 'low','medium', "
+       "or 'high.",
+       CLIENT | SERVER,
+       SettingsCategory::Network);
+
+  init("enable-port-based-qos",
+       &enable_port_based_qos,
+       "false",
+       nullptr,
+       "Feature gate setting for allowing port-based QoS / connections per "
+       "network priority. If disabled, all addresses will resolve to the "
+       "default_data_address listed in nodes configuration. Note that this "
+       "feature does not apply to connections between servers, only client to "
+       "server.",
+       CLIENT | SERVER,
+       SettingsCategory::Network);
+
   init("disable-event-log-trimming",
        &disable_event_log_trimming,
        "false",
@@ -2419,7 +2723,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
 
   init("event-log-max-delta-records",
        &event_log_max_delta_records,
-       "100",
+       "5000",
        nullptr,
        "How many delta records to keep in the event log before we "
        "snapshot it.",
@@ -2428,7 +2732,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
 
   init("event-log-max-delta-bytes",
        &event_log_max_delta_bytes,
-       "10485760",
+       "10485760", // 10MB
        parse_nonnegative<ssize_t>(),
        "How many bytes of deltas to keep in the event log before "
        "we snapshot it.",
@@ -2447,32 +2751,33 @@ void Settings::defineSettings(SettingEasyInit& init) {
        SERVER,
        SettingsCategory::Rebuilding);
 
-  init(
-      "append-store-durability",
-      &append_store_durability,
-      "async_write",
-      nullptr, // no validation
-      "The minimum guaranteed durablity of record copies before a storage node "
-      "confirms the STORE as successful. Can be one of \"memory\" if record "
-      "is to be stored in a RocksDB memtable only (logdeviced memory), "
-      "\"async_write\" if record is to be additionally written to the RocksDB "
-      "WAL file (kernel memory, frequently synced to disk), or \"sync_write\" "
-      "if the record is to be written to the memtable and WAL, and the STORE "
-      "acknowledged only after the WAL is synced to disk by a separate WAL "
-      "syncing thread using fdatasync(3).",
-      SERVER,
-      SettingsCategory::WritePath);
-
-  init("rebuild-store-durability",
-       &rebuild_store_durability,
+  init("append-store-durability",
+       &append_store_durability,
        "async_write",
        nullptr, // no validation
-       "The minimum guaranteed durablity of rebuilding writes before a storage "
-       "node will confirm the STORE as successful. Can be one of \"memory\", "
-       "\"async_write\", or \"sync_write\". See --append-store-durability for "
-       "a description of these options.",
+       "The minimum guaranteed durability of record copies before a storage "
+       "node "
+       "confirms the STORE as successful. Can be one of \"memory\" if record "
+       "is to be stored in a RocksDB memtable only (logdeviced memory), "
+       "\"async_write\" if record is to be additionally written to the RocksDB "
+       "WAL file (kernel memory, frequently synced to disk), or \"sync_write\" "
+       "if the record is to be written to the memtable and WAL, and the STORE "
+       "acknowledged only after the WAL is synced to disk by a separate WAL "
+       "syncing thread using fdatasync(3).",
        SERVER,
-       SettingsCategory::Rebuilding);
+       SettingsCategory::WritePath);
+
+  init(
+      "rebuild-store-durability",
+      &rebuild_store_durability,
+      "async_write",
+      nullptr, // no validation
+      "The minimum guaranteed durability of rebuilding writes before a storage "
+      "node will confirm the STORE as successful. Can be one of \"memory\", "
+      "\"async_write\", or \"sync_write\". See --append-store-durability for "
+      "a description of these options.",
+      SERVER,
+      SettingsCategory::Rebuilding);
 
   init("rebuilding-dont-wait-for-flush-callbacks",
        &rebuilding_dont_wait_for_flush_callbacks,
@@ -2517,6 +2822,25 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "in reading the log, which can be benefit non-disk-bound "
        "workloads.",
        SERVER | CLIENT,
+       SettingsCategory::ReadPath);
+
+  init("rsm-scd-copyset-reordering",
+       &rsm_scd_copyset_reordering,
+       "hash-shuffle",
+       parse_scd_copyset_reordering,
+       "SCDCopysetReordering values that clients ask servers to "
+       "use.  "
+       "Currently available options: "
+       "none, hash-shuffle (default), hash-shuffle-client-seed. "
+       "hash-shuffle results in only one storage node reading a record "
+       "block "
+       "from disk, and then serving it to multiple readers from the "
+       "cache. "
+       "hash-shuffle-client-seed enables multiple storage nodes to "
+       "participate "
+       "in reading the log, which can be benefit non-disk-bound "
+       "workloads.",
+       SERVER | CLIENT | REQUIRES_RESTART,
        SettingsCategory::ReadPath);
 
   init("sequencer-metadata-log-write-retry-delay",
@@ -2631,7 +2955,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
 
   init("enable-nodes-configuration-manager",
        &enable_nodes_configuration_manager,
-       "false", // defaults to false
+       "true",
        nullptr, // no custom validation necessary
        "If set, NodesConfigurationManager and its workflow will be enabled.",
        CLIENT | SERVER | REQUIRES_RESTART,
@@ -2639,7 +2963,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
 
   init("use-nodes-configuration-manager-nodes-configuration",
        &use_nodes_configuration_manager_nodes_configuration,
-       "false", // defaults to false
+       "true",
        nullptr, // no custom validation necessary
        "If true and enable_nodes_configuration_manager is set, logdevice will "
        "use the nodes configuration from the NodesConfigurationManager.",
@@ -2763,12 +3087,12 @@ void Settings::defineSettings(SettingEasyInit& init) {
       "60s..3600s",
       validate_nonnegative<ssize_t>(),
       "Some sequencer reactivations may be postponed when the changes that "
-      "triggered the reactivation are not important enough to be propogated "
+      "triggered the reactivation are not important enough to be propagated "
       "immediately. E.g., changes to replication factor or window size, need "
       "to be made immediately visible on the other hand changes changes to the "
       "nodeset due to say the 'exclude_from_nodeset' flag being set as part "
       "of a passive drain can be postponed. If the reactivations can be "
-      "postponed then the delay is chosen to be a radnom delay seconds "
+      "postponed then the delay is chosen to be a random delay seconds "
       "between the above range. If 0 then don't postpone ",
       SERVER,
       SettingsCategory::Configuration);
@@ -2811,10 +3135,10 @@ void Settings::defineSettings(SettingEasyInit& init) {
        &test_timestamp_linear_transform,
        "1,0",
        parse_test_timestamp_linear_tranform,
-       "Coefficents for tranforming the timestamp of records for test. "
-       "The value should contain two integrs sperated by ','. For example"
-       "'m,c'. Records timestamp is tranformed as m * now() + c."
-       "A default value of '1,0' makes the timestamp = now() which is expected"
+       "Coefficients for transforming the timestamp of records for test. "
+       "The value should contain two integers separated by ','. For example "
+       "'m,c'. Records timestamp is transformed as m * now() + c."
+       "A default value of '1,0' makes the timestamp = now() which is expected "
        "for all the normal use cases.",
        SERVER | REQUIRES_RESTART,
        SettingsCategory::Testing);
@@ -2948,7 +3272,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
            throw boost::program_options::error(buf);
          }
        },
-       "If true, readers in SCD mode will detect shards that are very slow and"
+       "If true, readers in SCD mode will detect shards that are very slow and "
        "may ask the other storage shards to filter them out",
        CLIENT,
        SettingsCategory::ReaderFailover);
@@ -3016,6 +3340,46 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "Allow inclusion of read pointer in RSM snapshots. Note that if this is "
        "set to true IT IS UNSAFE TO CHANGE IT BACK TO FALSE!",
        SERVER | CLIENT,
+       SettingsCategory::Core);
+
+  init("rsm-snapshot-request-timeout",
+       &rsm_snapshot_request_timeout,
+       "30s",
+       validate_nonnegative<ssize_t>(),
+       "Overall timeout for GetRsmSnapshotRequest",
+       CLIENT | SERVER,
+       SettingsCategory::Configuration);
+
+  init("rsm-snapshot-request-wave-timeout",
+       &rsm_snapshot_request_wave_timeout,
+       "2s..5s",
+       validate_positive<ssize_t>(),
+       "timeout settings for Fetching RSM snapshot via MessageBased Store",
+       CLIENT | SERVER,
+       SettingsCategory::Configuration);
+
+  init(
+      "rsm-snapshot-store-type",
+      &rsm_snapshot_store_type,
+      "log",
+      validate_rsm_snapshot_store,
+      "One of the following: "
+      "legacy (use legacy way of storing and retrieving snapshots from a log), "
+      "log (use Log Based snapshot store and point queries to fetch snapshots "
+      "instead of tailing), "
+      "message (Message Based for bootstrapping RSM snapshot from a Remote "
+      "cluster host)"
+      "local-store (From snapshot stored in local store)",
+      SERVER | CLIENT | REQUIRES_RESTART,
+      SettingsCategory::Core);
+
+  init("rsm-snapshot-enable-dual-writes",
+       &rsm_snapshot_enable_dual_writes,
+       "true",
+       nullptr, // no validation
+       "Decides whether snapshots should be written to log based store as "
+       "well(to roll back from local store to log based in case of emergency",
+       SERVER,
        SettingsCategory::Core);
 
   init("eventlog-snapshotting-period",
@@ -3097,10 +3461,10 @@ void Settings::defineSettings(SettingEasyInit& init) {
        &enable_offset_map,
        "false",
        nullptr, // no validation
-       "Enables the server-side OffsetMap calculation feature."
+       "Enables the server-side OffsetMap calculation feature. "
        "NOTE: There is no guarantee of byte offsets result correctness if "
        "feature"
-       "was switched on->off->on in period shorter than retention value for"
+       "was switched on->off->on in period shorter than retention value for "
        "logs.",
        SERVER,
        SettingsCategory::WritePath);
@@ -3108,7 +3472,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
        &enable_hh_wheel_backed_timers,
        "true",
        nullptr, // no validation
-       "Enables the new version of timers which run on a different thread"
+       "Enables the new version of timers which run on a different thread "
        "and use HHWheelTimer backend.",
        SERVER | CLIENT | REQUIRES_RESTART,
        SettingsCategory::Core);
@@ -3154,7 +3518,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "based on logs's measured throughput. This settings controls how often "
        "such adjustments will be considered. The nodeset size is chosen "
        "proportionally to throughput, replication factor and backlog duration. "
-       "The nodeset_size log attribute acts as the minimim allowed nodeset "
+       "The nodeset_size log attribute acts as the minimum allowed nodeset "
        "size, used for low-throughput logs and logs with infinite backlog "
        "duration. If --nodeset-adjustment-period is changed from nonzero to "
        "zero, all adjusted nodesets get immediately updated back to normal "
@@ -3189,21 +3553,22 @@ void Settings::defineSettings(SettingEasyInit& init) {
        SERVER,
        SettingsCategory::Sequencer);
 
-  init("nodeset-adjustment-min-window",
-       &nodeset_adjustment_min_window,
-       "1h",
-       validate_positive<ssize_t>(),
-       "When automatic nodeset size adjustment is enabled, only do the "
-       "adjustment if we've got append throughput information for at least this"
-       "period of time. More details: we choose nodeset size based on log's "
-       "average append throughput in a moving window of "
-       "size --nodeset-adjustment-period. The average is maintained by the "
-       "sequencer. If the sequencer was activated recently, we may not have a "
-       "good estimate of log's append throughput. This setting says how long "
-       "to wait after sequencer activation before allowing adjusting nodeset "
-       "size based on that sequencer's throughput.",
-       SERVER,
-       SettingsCategory::Sequencer);
+  init(
+      "nodeset-adjustment-min-window",
+      &nodeset_adjustment_min_window,
+      "1h",
+      validate_positive<ssize_t>(),
+      "When automatic nodeset size adjustment is enabled, only do the "
+      "adjustment if we've got append throughput information for at least this "
+      "period of time. More details: we choose nodeset size based on log's "
+      "average append throughput in a moving window of "
+      "size --nodeset-adjustment-period. The average is maintained by the "
+      "sequencer. If the sequencer was activated recently, we may not have a "
+      "good estimate of log's append throughput. This setting says how long "
+      "to wait after sequencer activation before allowing adjusting nodeset "
+      "size based on that sequencer's throughput.",
+      SERVER,
+      SettingsCategory::Sequencer);
 
   init("nodeset-max-randomizations",
        &nodeset_max_randomizations,
@@ -3229,7 +3594,7 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "Check permissions only for the received message of the type(s) "
        "specified. Separate different types with a comma. 'all' to apply to "
        "all messages. Prefix the value with '~' to include all types except "
-       "the given ones, e.g. '~WINDOW,RELEASE' will check permssions for "
+       "the given ones, e.g. '~WINDOW,RELEASE' will check permissions for "
        "messages of all types except WINDOW and RELEASE.",
        SERVER,
        SettingsCategory::Security);
@@ -3320,5 +3685,53 @@ void Settings::defineSettings(SettingEasyInit& init) {
        "Sampling period for OverloadDetector",
        CLIENT,
        SettingsCategory::Monitoring);
+  init("logsconfig-api-blacklist-nodes",
+       &logsconfig_api_blacklist_nodes,
+       "",
+       parse_recipients_list,
+       "Comma-separated list of indices of nodes that shouldn't be picked for "
+       "executing logs config API requests (e.g. makeDirectory()). Used in "
+       "tests.",
+       CLIENT,
+       SettingsCategory::Testing);
+  init("external-loglevel",
+       &external_loglevel,
+       "critical",
+       parse_log_level,
+       "One of the following: critical, error, warning, info, debug, none",
+       SERVER | CLIENT,
+       SettingsCategory::Core);
+  init("metadata-log-trim-interval",
+       &metadata_log_trim_interval,
+       "7200s",
+       validate_nonnegative<ssize_t>(),
+       "How often periodic trimming of metadata logs should run. Zero value "
+       "prevents it from running at all. ",
+       SERVER,
+       SettingsCategory::Sequencer);
+  init("metadata-log-trim-timeout",
+       &metadata_log_trim_timeout,
+       "120s",
+       validate_positive<size_t>(),
+       "Timeout when waiting for periodic metadata log trim request to be "
+       "completed",
+       SERVER,
+       SettingsCategory::Sequencer);
+  init("zk-vsc-max-retries",
+       &zk_vcs_max_retries,
+       "3",
+       validate_positive<int>(),
+       "Number of transient error retries for the zookeeper versioned config "
+       "store.",
+       SERVER | CLIENT | REQUIRES_RESTART,
+       SettingsCategory::Configuration);
+  init("test-same-partition-nodes",
+       &test_same_partition_nodes,
+       "",
+       parse_recipients_list,
+       "Used for isolation testing. Only nodes in this set will be addressable "
+       "from this node. An empty list disables this error injection.",
+       SERVER,
+       SettingsCategory::Testing);
 }
 }} // namespace facebook::logdevice

@@ -33,9 +33,10 @@ class Timer : public TimerInterface {
 
   explicit Timer(std::function<void()> callback);
 
-  virtual void activate(std::chrono::microseconds delay,
-                        TimeoutMap* timeout_map = nullptr) override {
-    impl_->activate(delay, timeout_map);
+  // If activate() is called while the timer is already active, it effectively
+  // cancels the previous timer.
+  virtual void activate(std::chrono::microseconds delay) override {
+    impl_->activate(delay);
   }
 
   virtual void cancel() override {

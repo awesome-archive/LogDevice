@@ -44,12 +44,6 @@ std::unique_ptr<MessageDispatch> ClientWorker::createMessageDispatch() {
   return std::make_unique<ClientMessageDispatch>();
 }
 
-void ClientWorker::sampleAllReadStreamsDegubInfo() const {
-  clientReadStreams().sampleAllReadStreamsDegubInfo();
-  sample_read_streams_timer_->activate(
-      settings().all_read_streams_sampling_rate);
-}
-
 void ClientWorker::setupWorker() {
   Worker::setupWorker();
   if (idx_.val() ==
@@ -60,10 +54,6 @@ void ClientWorker::setupWorker() {
     impl_->node_stats_handler_->init();
     impl_->node_stats_handler_->start();
   }
-  sample_read_streams_timer_ = std::make_unique<Timer>(
-      std::bind(&ClientWorker::sampleAllReadStreamsDegubInfo, this));
-
-  sampleAllReadStreamsDegubInfo();
 }
 
 NodeStatsMessageCallback* ClientWorker::nodeStatsMessageCallback() const {

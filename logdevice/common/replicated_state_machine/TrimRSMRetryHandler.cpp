@@ -38,7 +38,7 @@ void TrimRSMRetryHandler::trim(std::chrono::milliseconds retention) {
   // we take the new retention into account.
   retention_ = retention;
 
-  if (!in_flight_retention_.hasValue()) {
+  if (!in_flight_retention_.has_value()) {
     trimImpl();
   }
 }
@@ -63,9 +63,9 @@ void TrimRSMRetryHandler::trimImpl() {
       // of some nodes being in the config but staying in repair for a long
       // time. We can more aggresively retry when E::PARTIAL is considered a
       // transient failure.
-      ld_check(in_flight_retention_.hasValue());
+      ld_check(in_flight_retention_.has_value());
       if (in_flight_retention_.value() == retention_) {
-        in_flight_retention_.clear();
+        in_flight_retention_.reset();
         return;
       }
 
@@ -95,6 +95,7 @@ void TrimRSMRetryHandler::trimImpl() {
                                        Worker::onThisThread()->worker_type_,
                                        rsm_type_,
                                        false, /* don't trim everything */
+                                       false /* trim snapshot only */,
                                        trim_and_findtime_timeout,
                                        trim_and_findtime_timeout);
   Worker::onThisThread()->processor_->postWithRetrying(rq);

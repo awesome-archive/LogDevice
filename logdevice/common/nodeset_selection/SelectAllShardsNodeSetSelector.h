@@ -32,16 +32,14 @@ class SelectAllShardsNodeSetSelector : public NodeSetSelector {
       nodeset_size_t target_nodeset_size,
       uint64_t seed,
       const EpochMetaData* prev,
-      const Options* options = nullptr /* ignored */
-      ) override {
+      const Options& options) override {
     Result res;
-    const std::shared_ptr<LogsConfig::LogGroupNode> logcfg =
-        cfg->getLogGroupByIDShared(log_id);
+    const auto logcfg = cfg->getLogGroupByIDShared(log_id);
     if (!logcfg) {
       res.decision = Decision::FAILED;
       return res;
     }
-    if (logcfg->attrs().nodeSetSize().value().hasValue()) {
+    if (logcfg->attrs().nodeSetSize().value().has_value()) {
       ld_error("nodeSetSize property set for log %lu, unable to select all "
                "shards",
                log_id.val_);
@@ -51,7 +49,7 @@ class SelectAllShardsNodeSetSelector : public NodeSetSelector {
 
     const auto& membership = nodes_configuration.getStorageMembership();
     for (const auto node : *membership) {
-      if ((!options || !options->exclude_nodes.count(node))) {
+      if (!options.exclude_nodes.count(node)) {
         auto num_shards = nodes_configuration.getNumShards(node);
         for (shard_index_t s = 0; s < num_shards; ++s) {
           ShardID shard(node, s);

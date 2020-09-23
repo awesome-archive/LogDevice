@@ -10,12 +10,12 @@
 #include <chrono>
 #include <functional>
 
-#include "logdevice/common/DataRecordOwnsPayload.h"
 #include "logdevice/common/Request.h"
 #include "logdevice/common/WorkerCallbackHelper.h"
 #include "logdevice/common/replicated_state_machine/ReplicatedStateMachine-enum.h"
 #include "logdevice/common/types_internal.h"
 #include "logdevice/include/Err.h"
+#include "logdevice/include/Record.h"
 #include "logdevice/include/types.h"
 
 /**
@@ -69,6 +69,7 @@ class TrimRSMRequest : public Request {
       WorkerType worker_type,
       RSMType rsm_type,
       bool trim_everything,
+      bool trim_snapshot_only = false,
       std::chrono::milliseconds findtime_timeout = std::chrono::seconds{10},
       std::chrono::milliseconds trim_timeout = std::chrono::seconds{10})
       : Request(RequestType::FIND_KEY),
@@ -82,6 +83,7 @@ class TrimRSMRequest : public Request {
         trim_everything_(trim_everything),
         findtime_timeout_(findtime_timeout),
         trim_timeout_(trim_timeout),
+        trim_snapshot_only_(trim_snapshot_only),
         callbackHelper_(this) {}
 
   int getThreadAffinity(int /*nthreads*/) override {
@@ -97,6 +99,7 @@ class TrimRSMRequest : public Request {
   void trimSnapshotLog();
   void onSnapshotTrimmed(Status st);
   void deltaFindTimeCallback(Status st, lsn_t lsn);
+  void trimDeltaLog(lsn_t trim_upto);
   void onDeltaTrimmed(Status st);
 
  private:
@@ -128,6 +131,7 @@ class TrimRSMRequest : public Request {
   lsn_t snapshot_delta_read_ptr_{LSN_INVALID};
 
   bool is_partial_{false};
+  bool trim_snapshot_only_{false};
   read_stream_id_t snapshot_log_rsid_{READ_STREAM_ID_INVALID};
 
   WorkerCallbackHelper<TrimRSMRequest> callbackHelper_;

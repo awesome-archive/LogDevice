@@ -10,19 +10,19 @@
 #include "logdevice/common/AdminCommandTable.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/server/ServerWorker.h"
-#include "logdevice/server/rebuilding/ShardRebuildingV2.h"
+#include "logdevice/server/rebuilding/ShardRebuilding.h"
 
 namespace facebook { namespace logdevice {
 
 ChunkRebuilding::ChunkRebuilding(
     std::unique_ptr<ChunkData> data,
-    log_rebuilding_id_t chunk_id,
+    chunk_rebuilding_id_t chunk_id,
     std::shared_ptr<const RebuildingSet> rebuilding_set,
     UpdateableSettings<RebuildingSettings> rebuilding_settings,
     lsn_t rebuilding_version,
     lsn_t restart_version,
     uint32_t shard,
-    ShardRebuildingV2Ref owner)
+    ShardRebuildingRef owner)
     : owner_(owner),
       data_(std::move(data)),
       chunkID_(chunk_id),
@@ -47,7 +47,7 @@ lsn_t ChunkRebuilding::getRebuildingVersion() const {
 lsn_t ChunkRebuilding::getRestartVersion() const {
   return restartVersion_;
 }
-log_rebuilding_id_t ChunkRebuilding::getLogRebuildingId() const {
+chunk_rebuilding_id_t ChunkRebuilding::getChunkRebuildingId() const {
   return chunkID_;
 }
 ServerInstanceId ChunkRebuilding::getServerInstanceId() const {
@@ -65,14 +65,13 @@ void ChunkRebuilding::start() {
   rrStores_.resize(data_->numRecords());
   rrAmends_.resize(data_->numRecords());
   for (size_t i = 0; i < rrStores_.size(); ++i) {
-    rrStores_[i] = std::make_unique<RecordRebuildingStore>(
-        data_->blockID,
-        shard_,
-        RawRecord(data_->getLSN(i), data_->getRecordBlob(i), /* owned */ false),
-        this,
-        data_->replication,
-        std::shared_ptr<PayloadHolder>(
-            data_, data_->getUninitializedPayloadHolder(i)));
+    rrStores_[i] =
+        std::make_unique<RecordRebuildingStore>(data_->blockID,
+                                                shard_,
+                                                data_->getLSN(i),
+                                                data_->getRecordBlob(i),
+                                                this,
+                                                data_->replication);
   }
   numInFlight_ = rrStores_.size();
   for (size_t i = 0; i < rrStores_.size(); ++i) {
@@ -111,7 +110,7 @@ bool ChunkRebuilding::onStored(const STORED_Header& header,
                                ShardID from,
                                lsn_t rebuilding_version,
                                uint32_t rebuilding_wave,
-                               log_rebuilding_id_t rebuilding_id,
+                               chunk_rebuilding_id_t rebuilding_id,
                                ServerInstanceId server_instance_id,
                                FlushToken flush_token) {
   ssize_t idx = data_->findLSN(header.rid.lsn());
@@ -211,12 +210,12 @@ void ChunkRebuilding::onAmendDone(lsn_t lsn) {
   if (numInFlight_ == 0) {
     owner_.postCallbackRequest([chunk_id = chunkID_,
                                 oldest_timestamp = data_->oldestTimestamp](
-                                   ShardRebuildingV2* shard_rebuilding) {
+                                   ShardRebuilding* shard_rebuilding) {
       if (!shard_rebuilding) {
         RATELIMIT_INFO(
             std::chrono::seconds(10),
             1,
-            "ShardRebuildingV2 went away while ChunkRebuilding was in flight.");
+            "ShardRebuilding went away while ChunkRebuilding was in flight.");
         return;
       }
       shard_rebuilding->onChunkRebuildingDone(chunk_id, oldest_timestamp);
@@ -255,7 +254,7 @@ void ChunkRebuilding::getDebugInfo(InfoRebuildingChunksTable& table) const {
       .set<8>(numInFlight_ - amend_self - amend_others)
       .set<9>(amend_others)
       .set<10>(amend_self)
-      .set<11>(toSystemTimestamp(startTime_).toMilliseconds());
+      .set<11>(startTime_.approximateSystemTimestamp().toMilliseconds());
 }
 
 StartChunkRebuildingRequest::StartChunkRebuildingRequest(
@@ -275,14 +274,15 @@ Request::Execution StartChunkRebuildingRequest::execute() {
   ChunkRebuilding* r = r_.get();
   auto ins =
       ServerWorker::onThisThread()->runningChunkRebuildings().map.emplace(
-          r->getLogRebuildingId(), std::move(r_));
+          r->getChunkRebuildingId(), std::move(r_));
   ld_check(ins.second); // ids must be unique
   r->start();
   return Request::Execution::COMPLETE;
 }
 
-AbortChunkRebuildingRequest::AbortChunkRebuildingRequest(worker_id_t worker_id,
-                                                         log_rebuilding_id_t id)
+AbortChunkRebuildingRequest::AbortChunkRebuildingRequest(
+    worker_id_t worker_id,
+    chunk_rebuilding_id_t id)
     : workerID_(worker_id), id_(id) {}
 
 int AbortChunkRebuildingRequest::getThreadAffinity(int) {

@@ -80,9 +80,6 @@ Status readImpl(LocalLogStore::ReadIterator& read_iterator,
   read_ctx->it_stats_.read_start_time = std::chrono::steady_clock::now();
 
   STAT_INCR(stats, read_streams_num_ops);
-  if (read_ctx->rebuilding_) {
-    STAT_INCR(stats, read_streams_num_ops_rebuilding);
-  }
 
   size_t prev_block_bytes_read = read_iterator.getIOBytesUnnormalized();
 
@@ -118,39 +115,6 @@ Status readImpl(LocalLogStore::ReadIterator& read_iterator,
              read_streams_num_csi_entries_sent,
              read_ctx->it_stats_.sent_csi_entries);
     STAT_ADD(stats, read_streams_block_bytes_read, block_bytes_read);
-    if (read_ctx->rebuilding_) {
-      PER_SHARD_STAT_ADD(stats,
-                         read_streams_num_records_read_rebuilding,
-                         read_iterator.getStore()->getShardIdx(),
-                         read_ctx->it_stats_.read_records);
-      PER_SHARD_STAT_ADD(stats,
-                         read_streams_num_bytes_read_rebuilding,
-                         read_iterator.getStore()->getShardIdx(),
-                         read_ctx->it_stats_.read_record_bytes +
-                             read_ctx->it_stats_.read_csi_bytes);
-      PER_SHARD_STAT_ADD(stats,
-                         read_streams_num_record_bytes_read_rebuilding,
-                         read_iterator.getStore()->getShardIdx(),
-                         read_ctx->it_stats_.read_record_bytes);
-      PER_SHARD_STAT_ADD(stats,
-                         read_streams_num_csi_entries_read_rebuilding,
-                         read_iterator.getStore()->getShardIdx(),
-                         read_ctx->it_stats_.read_csi_entries);
-      PER_SHARD_STAT_ADD(stats,
-                         read_streams_num_csi_bytes_read_rebuilding,
-                         read_iterator.getStore()->getShardIdx(),
-                         read_ctx->it_stats_.read_csi_bytes);
-      PER_SHARD_STAT_ADD(stats,
-                         read_streams_block_bytes_read_rebuilding,
-                         read_iterator.getStore()->getShardIdx(),
-                         block_bytes_read);
-      STAT_ADD(stats,
-               read_streams_num_records_filtered_rebuilding,
-               read_ctx->it_stats_.filtered_records);
-      STAT_ADD(stats,
-               read_streams_num_bytes_filtered_rebuilding,
-               read_ctx->it_stats_.filtered_record_bytes);
-    }
   };
 
   ld_spew("Starting batch: log %lu, read_ptr %s",
@@ -244,7 +208,8 @@ Status readImpl(LocalLogStore::ReadIterator& read_iterator,
 
       // Check and move timestamp window.
       if (read_ctx->it_stats_.maxTimestampReached()) {
-        ld_check(read_ctx->it_stats_.max_read_timestamp_lower_bound.hasValue());
+        ld_check(
+            read_ctx->it_stats_.max_read_timestamp_lower_bound.has_value());
         read_ctx->ts_window_high_ =
             read_ctx->it_stats_.max_read_timestamp_lower_bound.value();
         return E::WINDOW_END_REACHED;
@@ -521,11 +486,10 @@ int getTailRecord(LocalLogStore::ReadIterator& iterator,
   if (record_flags & LocalLogStoreRecordFormat::FLAG_OFFSET_MAP) {
     flags |= TailRecordHeader::OFFSET_MAP;
   }
-  std::shared_ptr<PayloadHolder> ph;
+  PayloadHolder ph;
   if (include_payload) {
     // make a private copy so that payload can be owned by the PayloadHolder
-    payload = payload.dup();
-    ph = std::make_shared<PayloadHolder>(payload.data(), payload.size());
+    ph = PayloadHolder::copyPayload(payload);
     flags |= TailRecordHeader::HAS_PAYLOAD;
     flags |= (record_flags &
               (TailRecordHeader::CHECKSUM | TailRecordHeader::CHECKSUM_64BIT |

@@ -30,6 +30,13 @@ project(${PACKAGE_NAME} CXX)
 option(PORTABLE "build a portable binary" OFF)
 option(thriftpy3 "Include Thriftpy3 in build (requires Cython 0.29)" OFF)
 
+# Use the Debug build profile as default unless -DCMAKE_BUILD_TYPE is passed in.
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE None)
+endif(NOT CMAKE_BUILD_TYPE)
+
+message(STATUS "Building with \"${CMAKE_BUILD_TYPE}\" build profile.")
+
 enable_testing()
 # gtest_discover_tests was introduced in cmake 3.10
 if(${CMAKE_VERSION} VERSION_EQUAL "3.10" OR ${CMAKE_VERSION} VERSION_GREATER "3.10")
@@ -49,7 +56,6 @@ if(${BUILD_SUBMODULES})
   include(build-folly)
   include(build-fizz)
   include(build-wangle)
-  include(build-rsocket)
   include(build-fbthrift)
   include(${LOGDEVICE_DIR}/external/fbthrift/ThriftLibrary.cmake)
 else()
@@ -59,6 +65,7 @@ else()
   # we don't want to be build against rocksdb master in legocastle.
   # find_package(RocksDB CONFIG REQUIRED)
   # set(ROCKSDB_LIBRARIES RocksDB::rocksdb)
+  find_package(fmt CONFIG REQUIRED)
   find_package(folly CONFIG REQUIRED)
   set(FOLLY_LIBRARIES Folly::folly)
   set(FOLLY_BENCHMARK_LIBRARIES Folly::follybenchmark)
@@ -67,8 +74,6 @@ else()
   find_package(wangle CONFIG REQUIRED)
   find_package(FBThrift CONFIG REQUIRED)
   find_package(fmt CONFIG REQUIRED)
-  find_package(yarpl CONFIG REQUIRED)
-  find_package(rsocket CONFIG REQUIRED)
   find_program(THRIFT1 thrift1)
   find_path(THRIFT_COMPILER_INCLUDE thrift/lib/cpp2/Thrift.h)
   set(FBTHRIFT_LIBRARIES
@@ -91,7 +96,6 @@ else()
   add_custom_target(wangle)
   add_custom_target(fbthrift)
   add_custom_target(fmt)
-  add_custom_target(rsocket)
 endif()
 
 include(build-docs)
@@ -100,11 +104,6 @@ include(logdevice-deps)
 # GTest Project
 add_subdirectory(${LOGDEVICE_DIR}/external/gtest)
 include_directories(${GTEST_INCLUDE_DIRS} ${GMOCK_INCLUDE_DIRS})
-
-# OpenTracing Project
-
-add_subdirectory(${LOGDEVICE_DIR}/external/opentracing)
-include_directories(${OPENTRACING_INCLUDE_DIRS})
 
 # Flatbuffers Project
 add_subdirectory(${LOGDEVICE_DIR}/external/flatbuffers)
@@ -124,11 +123,10 @@ auto_sources(hfiles "*.h" RECURSE "${LOGDEVICE_CLIENT_HEADER_DIR}")
 set (THRIFT_DEPS
   ${FBTHRIFT_LIBRARIES}
   ${WANGLE_LIBRARIES}
+  ${FOLLY_LIBRARIES}
   ${FIZZ_LIBRARIES}
   ${LIBSODIUM_LIBRARIES}
-  ${RSOCKET_LIBRARIES}
   ${FMT_LIBRARIES}
-  ${FOLLY_LIBRARIES}
   ${BZIP2_LIBRARIES}
   ${ZLIB_LIBRARIES}
   ${Boost_LIBRARIES}
@@ -147,8 +145,6 @@ set(LOGDEVICE_EXTERNAL_DEPS
   ${FOLLY_BENCHMARK_LIBRARIES}
   ${FOLLY_LIBRARIES}
   ${FOLLY_TEST_UTIL_LIBRARIES}
-  ${OPENTRACING_MOCKTRACER_STATIC_LIB}
-  ${OPENTRACING_STATIC_LIB}
   ${LIBUNWIND_LIBRARIES}
   ${ZLIB_LIBRARIES}
   ${Boost_LIBRARIES}

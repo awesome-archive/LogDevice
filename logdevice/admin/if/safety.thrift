@@ -6,10 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-include "logdevice/admin/if/common.thrift"
+include "logdevice/common/if/common.thrift"
 include "logdevice/admin/if/nodes.thrift"
 
 namespace cpp2 facebook.logdevice.thrift
+namespace go logdevice.admin.if.safety
 namespace py3 logdevice.admin
 namespace php LogDevice
 namespace wiki Thriftdoc.LogDevice.Safety
@@ -139,7 +140,7 @@ struct CheckImpactRequest {
   9: optional bool check_internal_logs = true,
   10: optional bool check_capacity = true,
   /**
-   * The precentage of the storage that is allowed to be taken down by
+   * The percentage of the storage that is allowed to be taken down by
    * operations, safety checker will take into account DEAD nodes as well.
    * This means that if this value is 25, then safety checker will deny
    * maintenances that will may take down more storage nodes if the operation
@@ -150,7 +151,7 @@ struct CheckImpactRequest {
    */
   11: i32 max_unavailable_storage_capacity_pct = 25,
   /**
-   * The precentage of the sequencing capacity that is allowed to be taken down
+   * The percentage of the sequencing capacity that is allowed to be taken down
    * by operations, safety checker will take into account DEAD/DISABLED nodes
    * as well. This means that if this value is 25, then safety checker will deny
    * maintenances that will may take down more sequencer nodes if the operation

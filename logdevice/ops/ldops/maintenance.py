@@ -22,11 +22,13 @@ from ldops import admin_api
 from ldops.const import ALL_SHARDS
 from ldops.exceptions import LDOpsError
 from logdevice.admin.clients import AdminAPI
-from logdevice.admin.common.types import NodeID, ShardID
 from logdevice.admin.maintenance.types import (
     MaintenanceDefinition,
     MaintenanceDefinitionResponse,
+    MaintenancePriority,
     MaintenancesFilter,
+    MarkAllShardsUnrecoverableRequest,
+    MarkAllShardsUnrecoverableResponse,
     RemoveMaintenancesRequest,
     RemoveMaintenancesResponse,
 )
@@ -36,6 +38,7 @@ from logdevice.admin.nodes.types import (
     ShardStorageState,
 )
 from logdevice.admin.safety.types import CheckImpactRequest, CheckImpactResponse
+from logdevice.common.types import NodeID, ShardID
 
 
 class SafetyError(LDOpsError):
@@ -159,6 +162,9 @@ async def apply_maintenance(
     extras: Optional[Mapping[str, str]] = None,
     skip_safety_checks: Optional[bool] = False,
     allow_passive_drains: Optional[bool] = False,
+    force_restore_rebuilding: Optional[bool] = False,
+    priority: MaintenancePriority = MaintenancePriority.MEDIUM,
+    skip_capacity_checks: Optional[bool] = False,
 ) -> Collection[MaintenanceDefinition]:
     """
     Applies maintenance to MaintenanceManager.
@@ -189,15 +195,18 @@ async def apply_maintenance(
     req = MaintenanceDefinition(
         shards=list(shards),
         shard_target_state=shard_target_state,
-        sequencer_nodes=[n for n in sequencer_nodes],
+        sequencer_nodes=list(sequencer_nodes),
         sequencer_target_state=SequencingState.DISABLED,
         user=user,
         reason=reason,
         extras=extras,
         skip_safety_checks=skip_safety_checks,
+        skip_capacity_checks=skip_capacity_checks,
         group=group,
         ttl_seconds=int(ttl.total_seconds()),
         allow_passive_drains=allow_passive_drains,
+        force_restore_rebuilding=force_restore_rebuilding,
+        priority=priority,
     )
     resp: MaintenanceDefinitionResponse = await admin_api.apply_maintenance(
         client=client, req=req
@@ -223,3 +232,15 @@ async def remove_maintenances(
         client=client, req=req
     )
     return resp.maintenances
+
+
+async def mark_all_shards_unrecoverable(
+    client: AdminAPI, user: Optional[str] = None, reason: Optional[str] = ""
+) -> MarkAllShardsUnrecoverableResponse:
+    """
+    Marks all the UNAVAILABLE shards as unrecoverable. This will advice the
+    readers to not wait for data on these shards and issue data loss gaps
+    if necessary.
+    """
+    req = MarkAllShardsUnrecoverableRequest(user=user, reason=reason)
+    return await admin_api.mark_all_shards_unrecoverable(client=client, req=req)

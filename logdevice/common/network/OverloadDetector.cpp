@@ -10,8 +10,8 @@
 #include <algorithm>
 
 #include "folly/Random.h"
+#include "logdevice/common/Connection.h"
 #include "logdevice/common/Sender.h"
-#include "logdevice/common/Socket.h"
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/stats/Stats.h"
 
@@ -42,23 +42,23 @@ OverloadDetectorDependencies::getNodesConfiguration() {
   return Worker::onThisThread()->getNodesConfiguration();
 }
 
-Socket* OverloadDetectorDependencies::getSocketFor(node_index_t nid) {
-  return Worker::onThisThread()->sender().findServerSocket(nid);
+Connection* OverloadDetectorDependencies::getConnectionFor(node_index_t nid) {
+  return Worker::onThisThread()->sender().findServerConnection(nid);
 }
 
 ssize_t OverloadDetectorDependencies::getTcpRecvBufOccupancy(node_index_t nid) {
-  auto s = getSocketFor(nid);
-  return s ? s->getTcpRecvBufOccupancy() : -1;
+  auto c = getConnectionFor(nid);
+  return c ? c->getTcpRecvBufOccupancy() : -1;
 }
 
 size_t OverloadDetectorDependencies::getTcpRecvBufSize(node_index_t nid) {
-  auto s = getSocketFor(nid);
-  return s ? s->getTcpRecvBufSize() : 0;
+  auto c = getConnectionFor(nid);
+  return c ? c->getTcpRecvBufSize() : 0;
 }
 
 uint64_t OverloadDetectorDependencies::getNumBytesReceived(node_index_t nid) {
-  auto s = getSocketFor(nid);
-  return s ? s->getNumBytesReceived() : 0;
+  auto c = getConnectionFor(nid);
+  return c ? c->getNumBytesReceived() : 0;
 }
 
 OverloadDetector::OverloadDetector(
@@ -75,7 +75,7 @@ OverloadDetector::~OverloadDetector() {
 
 void OverloadDetector::start() {
   if (!deps_->settings().server) {
-    // this should is only used by clients
+    // this is only used by clients
     loop_timer_ = std::make_unique<Timer>([this]() { runOnce(); });
     ld_debug("Starting overload detector");
     loop_timer_->activate(std::chrono::microseconds::zero());
@@ -135,7 +135,7 @@ void OverloadDetector::issueTimers() {
     decltype(period) delay{folly::Random::rand64(period.count())};
     auto [it, __] = recv_q_timer_.try_emplace(
         nid, [this, nid = nid]() { updateSampleFor(nid); });
-    it->second.activate(period);
+    it->second.activate(delay);
   }
 }
 
@@ -169,11 +169,12 @@ void OverloadDetector::updateSampleFor(node_index_t nid) {
   auto rcvd_bytes = deps_->getNumBytesReceived(nid);
   if (occupancy >= 0 && capacity > 0) {
     if (100 * occupancy >= capacity * deps_->getOverloadThreshold()) {
-      ld_spew("Socket for nid %u has recv-q with %ld bytes unread and capacity "
-              "of %lu bytes.",
-              nid,
-              occupancy,
-              capacity);
+      ld_spew(
+          "Connection for nid %u has recv-q with %ld bytes unread and capacity "
+          "of %lu bytes.",
+          nid,
+          occupancy,
+          capacity);
     }
     if (capacity < occupancy) {
       occupancy = capacity;

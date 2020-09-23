@@ -5,7 +5,7 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-#include "logdevice/server/RecordRebuildingAmend.h"
+#include "logdevice/server/rebuilding/RecordRebuildingAmend.h"
 
 #include <folly/Random.h>
 #include <gtest/gtest.h>
@@ -13,9 +13,8 @@
 #include "logdevice/common/FlowGroup.h"
 #include "logdevice/common/LocalLogStoreRecordFormat.h"
 #include "logdevice/common/protocol/STORE_Message.h"
+#include "logdevice/common/test/SenderTestProxy.h"
 #include "logdevice/common/test/TestUtil.h"
-
-using namespace facebook::logdevice;
 
 // Shortcuts for writing ShardIDs
 #define N0 ShardID(0, 0)
@@ -82,7 +81,7 @@ const logid_t LOG_ID(8008);
 const lsn_t LSN(123);
 const uint64_t TIMESTAMP(1234567890ul);
 const esn_t LNG(332233);
-const log_rebuilding_id_t REBUILDING_ID(11);
+const chunk_rebuilding_id_t REBUILDING_ID(11);
 const ServerInstanceId
     SERVER_INSTANCE_ID(std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::system_clock::now().time_since_epoch())
@@ -93,8 +92,7 @@ class MockNodeAvailabilityChecker : public NodeAvailabilityChecker {
   NodeStatus checkNode(NodeSetState* nodeset_state,
                        ShardID shard,
                        StoreChainLink* destination_out,
-                       bool ignore_nodeset_state,
-                       bool /*unused*/) const override {
+                       bool ignore_nodeset_state) const override {
     ++const_cast<std::map<ShardID, int>&>(requests_seen)[shard];
     if (!ignore_nodeset_state) {
       const auto now = std::chrono::steady_clock::now();
@@ -243,7 +241,7 @@ class TestRecordRebuildingAmend : public RecordRebuildingAmend,
   lsn_t getRebuildingVersion() const override {
     return 11;
   }
-  log_rebuilding_id_t getLogRebuildingId() const override {
+  chunk_rebuilding_id_t getChunkRebuildingId() const override {
     return REBUILDING_ID;
   }
   node_index_t getMyNodeIndex() const override {
@@ -364,7 +362,7 @@ class RecordRebuildingAmendTest : public ::testing::Test {
     EXPECT_TRUE(m->getHeader().flags & STORE_Header::AMEND);
     EXPECT_FALSE(m->getHeader().flags & STORE_Header::DRAINED);
     const PayloadHolder* payload = m->getPayloadHolder();
-    ASSERT_EQ(nullptr, payload);
+    ASSERT_EQ(0, payload->size());
   }
 
   copyset_t copyset;

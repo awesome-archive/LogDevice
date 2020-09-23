@@ -11,14 +11,11 @@
 
 #include <folly/Memory.h>
 #include <gtest/gtest.h>
-#include <opentracing/mocktracer/in_memory_recorder.h>
-#include <opentracing/mocktracer/tracer.h>
 
 #include "logdevice/common/ExponentialBackoffAdaptiveVariable.h"
 #include "logdevice/common/LinearCopySetSelector.h"
 #include "logdevice/common/NoopTraceLogger.h"
 #include "logdevice/common/PassThroughCopySetManager.h"
-#include "logdevice/common/Sender.h"
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/configuration/Configuration.h"
 #include "logdevice/common/configuration/LocalLogsConfig.h"
@@ -30,6 +27,8 @@
 #include "logdevice/common/protocol/STORED_Message.h"
 #include "logdevice/common/protocol/STORE_Message.h"
 #include "logdevice/common/test/CopySetSelectorTestUtil.h"
+#include "logdevice/common/test/NodesConfigurationTestUtil.h"
+#include "logdevice/common/test/SenderTestProxy.h"
 #include "logdevice/common/test/TestUtil.h"
 
 namespace facebook { namespace logdevice {
@@ -39,7 +38,7 @@ namespace facebook { namespace logdevice {
  *       a sufficient number of storage nodes.
  */
 
-// Convenient shortcuts for writting ShardIDs.
+// Convenient shortcuts for writing ShardIDs.
 #define N0S0 ShardID(0, 0)
 #define N1S0 ShardID(1, 0)
 #define N2S0 ShardID(2, 0)
@@ -49,7 +48,7 @@ namespace facebook { namespace logdevice {
 #define N6S0 ShardID(6, 0)
 #define N7S0 ShardID(7, 0)
 #define N8S0 ShardID(8, 0)
-// Convenient shortcuts for writting NodeIDs.
+// Convenient shortcuts for writing NodeIDs.
 #define N0 NodeID(0, 0)
 #define N1 NodeID(1, 0)
 #define N2 NodeID(2, 0)
@@ -122,13 +121,14 @@ class AppenderTest : public ::testing::Test {
   // return.
   bool is_accepting_work_{true};
 
-  // Keep track of the state of the Appender's timers.
-  // Note that instead of mocking the timers directly, this test suite will call
+  // Keep track of the state of the store timer.
+  // Note that instead of mocking the timer directly, this test suite will call
   // the onTimeout() method of Appender directly.
-  // These values are only used to assert that the timers have been activated
-  // through calls to activateStoreTimer() and activateRetryTimer(), and
+  // This value is only used to assert that the timer has been activated
+  // through call to activateStoreTimer()
   bool store_timer_active_{false};
-  bool retry_timer_active_{false};
+  // Indicates that immediate retry wave was scheduled after send failure.
+  bool retry_wave_scheduled_{false};
 
   // Keep track of which nodes are not available following Appender calling
   // setNotAvailableUntil(). Used by checkNotAvailableUntil() to inform the
@@ -180,8 +180,6 @@ class AppenderTest : public ::testing::Test {
   // Start the Appender.
   void start(bool stream_message = false);
 
-  void startWithMockE2ETracer(std::shared_ptr<opentracing::Tracer>);
-
   // takes advantage of friend declaration in STORE_Message to obtain the header
   const STORE_Header& getHeader(const STORE_Message* msg);
 
@@ -192,6 +190,9 @@ class AppenderTest : public ::testing::Test {
 
   // call Appender::onTimeout().
   void triggerTimeout();
+
+  // Sends previously scheduled retry wave
+  void triggerRetryWave();
 
   // Trigger the on socket close callback for `nid`.
   void triggerOnSocketClosed(ShardID shard);
@@ -212,14 +213,15 @@ class AppenderTest : public ::testing::Test {
     ASSERT_TRUE(retired_);
   }
   void checkReplyHasNoValue() {
-    ASSERT_FALSE(reply_.hasValue());
+    ASSERT_FALSE(reply_.has_value());
   }
 
  private:
   // Map a NodeID to a list of SocketCallback. (this mocks some logic in
   // Recipient which registers a socket callback to the socket by calling
-  // registerOnSocketClosed()). Tests can call triggerOnSocketClosed(ShardID) to
-  // simulate the callback being called for a NodeID.
+  // registerOnConnectionClosed()). Tests can call
+  // triggerOnSocketClosed(ShardID) to simulate the callback being called for a
+  // NodeID.
   std::unordered_map<
       NodeID,
       folly::IntrusiveList<SocketCallback, &SocketCallback::listHook_>,
@@ -238,13 +240,9 @@ class AppenderTest::TestCopySetSelectorDeps
   NodeStatus checkNode(NodeSetState* nodeset_state,
                        ShardID shard,
                        StoreChainLink* destination_out,
-                       bool ignore_nodeset_state,
-                       bool allow_unencrypted_connections) const override {
-    return NodeAvailabilityChecker::checkNode(nodeset_state,
-                                              shard,
-                                              destination_out,
-                                              ignore_nodeset_state,
-                                              allow_unencrypted_connections);
+                       bool ignore_nodeset_state) const override {
+    return NodeAvailabilityChecker::checkNode(
+        nodeset_state, shard, destination_out, ignore_nodeset_state);
   }
 
   void setConnectionError(NodeID node, Status error) {
@@ -252,9 +250,9 @@ class AppenderTest::TestCopySetSelectorDeps
   }
 
  private:
-  int checkConnection(NodeID nid,
-                      ClientID* our_name_at_peer,
-                      bool) const override {
+  int checkConnection(node_index_t id,
+                      ClientID* our_name_at_peer) const override {
+    NodeID nid(id);
     auto it = node_status_.find(nid);
     if (it != node_status_.end() &&
         it->second.connection_state_ != Status::OK) {
@@ -292,7 +290,7 @@ class AppenderTest::TestCopySetSelectorDeps
     return true;
   }
 
-  int connect(NodeID /*nid*/, bool /*allow_unencrypted*/) const override {
+  int connect(node_index_t /*nid*/) const override {
     // Called by when checkNode() sees a node that's not
     // connected. Ignored.
     return 0;
@@ -422,9 +420,9 @@ class AppenderTest::MockAppender : public Appender {
  public:
   using MockSender = SenderTestProxy<MockAppender>;
 
-  explicit MockAppender(AppenderTest* test,
-                        std::chrono::milliseconds client_timeout,
-                        request_id_t append_request_id)
+  MockAppender(AppenderTest* test,
+               std::chrono::milliseconds client_timeout,
+               request_id_t append_request_id)
       : Appender(
             Worker::onThisThread(false),
             std::make_shared<NoopTraceLogger>(UpdateableConfig::createEmpty()),
@@ -432,29 +430,9 @@ class AppenderTest::MockAppender : public Appender {
             append_request_id,
             STORE_flags_t(0),
             LOG_ID,
-            PayloadHolder(MockAppender::dummyPayload, PayloadHolder::UNOWNED),
+            PayloadHolder::copyString("test"),
             epoch_t(0),
             500),
-        stats_(StatsParams().setIsServer(true)),
-        test_(test) {
-    sender_ = std::make_unique<MockSender>(this);
-  }
-
-  explicit MockAppender(AppenderTest* test,
-                        std::chrono::milliseconds client_timeout,
-                        request_id_t append_request_id,
-                        std::shared_ptr<opentracing::Tracer> e2e_tracer)
-      : Appender(
-            Worker::onThisThread(false),
-            std::make_shared<NoopTraceLogger>(UpdateableConfig::createEmpty()),
-            client_timeout,
-            append_request_id,
-            STORE_flags_t(0),
-            LOG_ID,
-            PayloadHolder(MockAppender::dummyPayload, PayloadHolder::UNOWNED),
-            epoch_t(0),
-            500,
-            e2e_tracer),
         stats_(StatsParams().setIsServer(true)),
         test_(test) {
     sender_ = std::make_unique<MockSender>(this);
@@ -483,24 +461,17 @@ class AppenderTest::MockAppender : public Appender {
   void checkWorkerThread() override {}
 
   void initStoreTimer() override {}
-  void initRetryTimer() override {}
   void cancelStoreTimer() override {
     test_->store_timer_active_ = false;
   }
   bool storeTimerIsActive() override {
     return test_->store_timer_active_;
   }
-  void cancelRetryTimer() override {
-    test_->retry_timer_active_ = false;
-  }
-  void activateRetryTimer() override {
-    test_->retry_timer_active_ = true;
-  }
   void activateStoreTimer(std::chrono::milliseconds) override {
     test_->store_timer_active_ = true;
   }
-  bool retryTimerIsActive() override {
-    return test_->retry_timer_active_;
+  void sendRetryWave() override {
+    test_->retry_wave_scheduled_ = true;
   }
   bool isNodeAlive(NodeID node) override {
     // if we can't find the node in dead_nodes_, it is alive.
@@ -567,15 +538,6 @@ class AppenderTest::MockAppender : public Appender {
       return -1;
     }
 
-    // used in e2e tracing test when we want to create spans for all stores
-    if (msg->type_ == MessageType::STORE && e2e_tracer_) {
-      ShardID to = ShardID(addr.id_.node_.index(), 0);
-      std::pair<uint32_t, ShardID> current_info(1, to);
-
-      std::shared_ptr<opentracing::Span> span = e2e_tracer_->StartSpan("STORE");
-      all_store_spans_[current_info] = span;
-    }
-
     NodeID nid = addr.id_.node_;
     switch (msg->type_) {
       case MessageType::STORE:
@@ -601,7 +563,7 @@ class AppenderTest::MockAppender : public Appender {
     return addr.toString();
   }
 
-  bool bytesPendingLimitReached() const override {
+  bool bytesPendingLimitReached(const PeerType /*peer_type*/) const override {
     return test_->bytes_pending_limit_reached_;
   }
 
@@ -645,22 +607,18 @@ class AppenderTest::MockAppender : public Appender {
   bool noteAppenderReaped(Appender::FullyReplicated replicated,
                           lsn_t reaped_lsn,
                           std::shared_ptr<TailRecord> tail_record,
-                          epoch_t* last_released_epoch_out,
-                          bool* lng_changed_out) override {
+                          epoch_t* last_released_epoch_out) override {
     if (lsn_to_epoch(reaped_lsn) <= test_->preempted_epoch_) {
       err = E::PREEMPTED;
-      *lng_changed_out = false;
       return false;
     }
 
     if (replicated != Appender::FullyReplicated::YES) {
       err = E::ABORTED;
-      *lng_changed_out = false;
       return false;
     }
 
     *last_released_epoch_out = test_->last_released_epoch_;
-    *lng_changed_out = true;
     return true;
   }
 
@@ -675,13 +633,13 @@ class AppenderTest::MockAppender : public Appender {
     return &stats_;
   }
 
-  int registerOnSocketClosed(NodeID nid, SocketCallback& cb) override {
+  int registerOnConnectionClosed(NodeID nid, SocketCallback& cb) override {
     test_->on_close_cb_map_[nid].push_back(cb);
     return 0;
   }
 
   void replyToAppendRequest(APPENDED_Header& replyhdr) override {
-    ASSERT_FALSE(test_->reply_.hasValue());
+    ASSERT_FALSE(test_->reply_.has_value());
     test_->reply_ = replyhdr;
   }
 
@@ -701,8 +659,6 @@ class AppenderTest::MockAppender : public Appender {
  private:
   StatsHolder stats_;
   AppenderTest* test_;
-  static Payload dummyPayload; // something to pass to Apppender constructor,
-                               // not used by the test
 };
 
 void AppenderTest::start(bool stream_message) {
@@ -717,54 +673,34 @@ void AppenderTest::start(bool stream_message) {
   appender_->start(nullptr, LSN);
 }
 
-// Start the Appender providing a tracer object to be used in e2e tracing
-void AppenderTest::startWithMockE2ETracer(
-    std::shared_ptr<opentracing::Tracer> tracer) {
-  appender_ =
-      new MockAppender(this, std::chrono::seconds{1}, request_id_t{1}, tracer);
-  appender_->appender_span_ = tracer->StartSpan("APPENDER");
-  appender_->start(nullptr, LSN);
-}
-
 void AppenderTest::updateConfig() {
   configuration::Nodes nodes;
   for (ShardID shard : shards_) {
-    node_index_t nid = shard.node();
-    ld_check(!nodes.count(nid));
-    Configuration::Node& node = nodes[nid];
-    node.address = Sockaddr("::1", folly::to<std::string>(4440 + nid));
-    node.generation = 1;
-    node.addStorageRole();
-    node.addSequencerRole();
+    nodes.emplace(shard.node(),
+                  configuration::Node::withTestDefaults(shard.node())
+                      .setIsMetadataNode(true));
   }
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes), ReplicationProperty{{NodeLocationScope::NODE, 3}});
 
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(replication_);
+  auto log_attrs =
+      logsconfig::LogAttributes().with_replicationFactor(replication_);
 
-  Configuration::NodesConfig nodes_config(nodes);
   auto logs_config = std::make_unique<configuration::LocalLogsConfig>();
   logs_config->insert(boost::icl::right_open_interval<logid_t::raw_type>(
                           LOG_ID.val_, LOG_ID.val_ + 1),
                       "mylog",
                       log_attrs);
 
-  // metadata stored on all nodes with max replication factor 3
-  Configuration::MetaDataLogsConfig meta_config =
-      createMetaDataLogsConfig(nodes_config, nodes_config.getNodes().size(), 3);
-
   std::shared_ptr<ServerConfig> server_cfg =
-      ServerConfig::fromDataTest(__FILE__, nodes_config, meta_config);
+      ServerConfig::fromDataTest(__FILE__);
   config_.updateableServerConfig()->update(server_cfg);
   config_.updateableNodesConfiguration()->update(
-      server_cfg->getNodesConfigurationFromServerConfigSource());
+      std::move(nodes_configuration));
   config_.updateableLogsConfig()->update(std::move(logs_config));
 
-  StorageSet shards;
-  for (const auto& it : nodes) {
-    for (shard_index_t s = 0; s < it.second.getNumShards(); ++s) {
-      shards.push_back(ShardID(it.first, s));
-    }
-  }
+  StorageSet shards =
+      config_.getNodesConfiguration()->getStorageMembership()->getAllShards();
   std::sort(shards.begin(), shards.end());
   auto nodeset_state = std::make_shared<MockNodeSetState>(
       this, shards, LOG_ID, NodeSetState::HealthCheck::DISABLED);
@@ -782,10 +718,14 @@ const STORE_Header& AppenderTest::getHeader(const STORE_Message* msg) {
 }
 
 void AppenderTest::triggerTimeout() {
-  ASSERT_TRUE(retry_timer_active_ || store_timer_active_);
-  retry_timer_active_ = false;
+  ASSERT_TRUE(store_timer_active_);
   store_timer_active_ = false;
   appender_->onTimeout();
+}
+
+void AppenderTest::triggerRetryWave() {
+  ASSERT_TRUE(retry_wave_scheduled_);
+  appender_->sendWave();
 }
 
 void AppenderTest::triggerOnSocketClosed(ShardID shard) {
@@ -947,7 +887,7 @@ void AppenderTest::checkReleaseMsg(std::set<ShardID> shards) {
   }
 
 void AppenderTest::checkAppended(Status expected_status) {
-  ASSERT_TRUE(reply_.hasValue());
+  ASSERT_TRUE(reply_.has_value());
   ASSERT_EQ(request_id_t{1}, reply_->rqid);
   ASSERT_EQ(expected_status, reply_->status);
   ASSERT_EQ(LSN, reply_->lsn);
@@ -998,6 +938,10 @@ void AppenderTest::onStoredSent(Status status,
               not_available_nodes_[shard]);                                  \
   }
 
+// Check that Appender doesn't call setNotAvailableUntil() for the given shard
+#define CHECK_AVAILABLE(shard) \
+  { ASSERT_EQ(not_available_nodes_.end(), not_available_nodes_.find(shard)); }
+
 // Mark several node ids not available.
 #define SET_NOT_AVAILABLE(reason, ...)                                        \
   {                                                                           \
@@ -1039,7 +983,7 @@ TEST_F(AppenderTest, SimpleStream) {
   ON_STORED_SENT(E::OK, 1, N0S0, N1S0, N3S0);
   ASSERT_TRUE(retired_);
   CHECK_DELETE_MSG(N2S0, N4S0);
-  ASSERT_FALSE(reply_.hasValue());
+  ASSERT_FALSE(reply_.has_value());
   Appender::Reaper()(appender_);
   CHECK_APPENDED(E::OK);
   CHECK_RELEASE_MSG(N0S0, N1S0, N3S0);
@@ -1071,7 +1015,7 @@ TEST_F(AppenderTest, NotEnoughRepliesExpectedTryNewWave) {
 
   // At this point, Appender should give up this wave because 3 out of 5 nodes
   // could not store a copy of the record, meaning that there is not enough
-  // nodes left to fully replicate it. The retry timer is activated.
+  // nodes left to fully replicate it. The retry wave is scheduled.
 
   // Check that Appender notified NodeSetState that N4S0 has no space.
   CHECK_NOT_AVAILABLE(N4S0, NO_SPC);
@@ -1079,8 +1023,9 @@ TEST_F(AppenderTest, NotEnoughRepliesExpectedTryNewWave) {
   // The candidate iterator will propose N4S0 first but pickDestinations should
   // discard it.
   first_candidate_idx_ = 4;
-  // Retry timer is triggered.
-  triggerTimeout();
+  // Triggers retry
+  ASSERT_TRUE(retry_wave_scheduled_);
+  triggerRetryWave();
   // STORE could be sent to 5 nodes with wave 2.
   CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N5S0, N6S0, N7S0, N8S0, N0S0);
   CHECK_NO_STORE_MSG();
@@ -1090,7 +1035,7 @@ TEST_F(AppenderTest, NotEnoughRepliesExpectedTryNewWave) {
   // 1 recipient replies for the previous wave. This should not cause APPENDED
   // to be sent.
   ON_STORED_SENT(E::OK, 1, N1S0);
-  ASSERT_FALSE(reply_.hasValue());
+  ASSERT_FALSE(reply_.has_value());
   // A third recipient replies.
   ON_STORED_SENT(E::OK, 2, N7S0);
 
@@ -1123,7 +1068,7 @@ TEST_F(AppenderTest, StoreTimeoutTryNewWave) {
   CHECK_NO_STORE_MSG();
   // STORED is received from previous wave and discarded.
   ON_STORED_SENT(E::OK, 1, N4S0, N3S0, N2S0);
-  ASSERT_FALSE(reply_.hasValue());
+  ASSERT_FALSE(reply_.has_value());
   // 3 nodes reply in time this time.
   ON_STORED_SENT(E::OK, 2, N7S0, N5S0, N6S0);
   CHECK_APPENDED(E::OK);
@@ -1148,7 +1093,7 @@ TEST_F(AppenderTest, StoreTimeoutRelaxedGraylisting) {
   CHECK_NO_STORE_MSG();
   // STORED is received from previous wave and discarded.
   ON_STORED_SENT(E::OK, 1, N4S0, N3S0, N2S0, N1S0, N0S0);
-  ASSERT_FALSE(reply_.hasValue());
+  ASSERT_FALSE(reply_.has_value());
   // 3 nodes reply on time.
   ON_STORED_SENT(E::OK, 2, N0S0, N1S0, N2S0);
   CHECK_APPENDED(E::OK);
@@ -1215,13 +1160,13 @@ TEST_F(AppenderTest, ChainSendingFail) {
   CHECK_NO_STORE_MSG();
 
   // Since this is a chain sending, one node not reachable should be enough for
-  // deciding to immediately retry a new wave after the retry timer triggers.
+  // deciding to schedyle immediate retry wave.
   ASSERT_FALSE(store_timer_active_);
-  ASSERT_TRUE(retry_timer_active_);
+  ASSERT_TRUE(retry_wave_scheduled_);
 
-  // Retry timer triggers, we start another wave.
+  // Retry wave triggers, we start another wave.
   first_candidate_idx_ = 2;
-  triggerTimeout();
+  triggerRetryWave();
 
   // Second wave, use chain sending again and N2S0 is the first recipient.
   CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N2S0);
@@ -1257,12 +1202,12 @@ TEST_F(AppenderTest, ChainSendingForwardingFailure) {
   // wave immediately.
   ON_STORED_SENT(E::FORWARD, 1, N1S0);
 
-  // The retry timer is activated so that we retry another wave immediately.
+  // The retry wave is scheduled so that we retry another wave immediately.
   ASSERT_FALSE(store_timer_active_);
-  ASSERT_TRUE(retry_timer_active_);
+  ASSERT_TRUE(retry_wave_scheduled_);
   // The new wave has the following chain link: N2S0 -> N3S0 -> N4S0
   first_candidate_idx_ = 2;
-  triggerTimeout();
+  triggerRetryWave();
 
   // Second wave, use chain sending again and N2S0 is the first recipient.
   CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N2S0);
@@ -1289,12 +1234,12 @@ TEST_F(AppenderTest, ChainSendingFailToSendFirstNode) {
   CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::NOBUFS, 1, N0S0);
   CHECK_NO_STORE_MSG();
 
-  // The retry timer is activated so that we retry another wave immediately.
+  // The retry wave is scheduled so that we retry another wave immediately.
   ASSERT_FALSE(store_timer_active_);
-  ASSERT_TRUE(retry_timer_active_);
+  ASSERT_TRUE(retry_wave_scheduled_);
   // The new wave has the following chain link: N2S0 -> N3S0 -> N4S0
   first_candidate_idx_ = 2;
-  triggerTimeout();
+  triggerRetryWave();
 
   // Second wave, use chain sending again and N2S0 is the first recipient.
   CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N2S0);
@@ -1434,13 +1379,35 @@ TEST_F(AppenderTest, NodeSetStateTransientErrors) {
   CHECK_NOT_AVAILABLE(N0S0, STORE_DISABLED);
   ON_STORED_SENT(E::NOSPC, 1, N1S0);
   CHECK_NOT_AVAILABLE(N1S0, NO_SPC);
-  ASSERT_FALSE(reply_.hasValue());
+  ASSERT_FALSE(reply_.has_value());
   ASSERT_FALSE(retired_);
   ON_STORED_SENT(E::OK, 1, N4S0);
   CHECK_APPENDED(E::OK);
   ASSERT_TRUE(retired_);
   Appender::Reaper()(appender_);
   CHECK_RELEASE_MSG(N2S0, N3S0, N4S0);
+}
+
+// Check that STORED with an error that failes the wave does not graylist
+// anything else
+TEST_F(AppenderTest, GraylistingCorrectOnError) {
+  updateConfig();
+  start();
+
+  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0, N3S0, N4S0);
+
+  ON_STORED_SENT(E::NOSPC, 1, N2S0, N3S0, N4S0);
+  CHECK_NOT_AVAILABLE(N2S0, NO_SPC);
+  CHECK_NOT_AVAILABLE(N3S0, NO_SPC);
+  CHECK_NOT_AVAILABLE(N4S0, NO_SPC);
+  // check if retry wave is scheduled since we failed a wave
+  ASSERT_TRUE(retry_wave_scheduled_);
+  // Trigger a scheduled retry wave
+  triggerRetryWave();
+  // check other nodes not graylisted
+  CHECK_AVAILABLE(N0S0);
+  CHECK_AVAILABLE(N1S0);
+  Appender::Reaper()(appender_);
 }
 
 // Test that `nodes_stored_amendable_' is updated correctly as we get STORED
@@ -1455,7 +1422,9 @@ TEST_F(AppenderTest, NodesStoredAmendable) {
   CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0);
   // FAILED reply should not affect the set
   appender_->onReply(storedHeader(1, E::FAILED, NodeID(), 0 /* flags */), N0S0);
-  triggerTimeout();
+  ASSERT_TRUE(retry_wave_scheduled_);
+  // Trigger a scheduled retry wave
+  triggerRetryWave();
   ASSERT_EQ((std::multiset<ShardID>{}), appender_->getNodesStoredAmendable());
 
   CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N0S0, N1S0);
@@ -1499,7 +1468,8 @@ TEST_F(AppenderTest, SubsequentWavesAmendDirect) {
   // Issue {N3S0, N0S0, N1S0} for the second wave.  N0S0 should get a STORE with
   // the AMEND flag set.
   first_candidate_idx_ = 3;
-  triggerTimeout();
+  ASSERT_TRUE(retry_wave_scheduled_);
+  triggerRetryWave();
   auto STORE_has_amend_flag = [&](ShardID shard) -> bool {
     auto it = store_msgs_.find(shard);
     if (it == store_msgs_.end()) {
@@ -1545,7 +1515,8 @@ TEST_F(AppenderTest, SubsequentWavesAmendChained) {
   appender_->onReply(storedHeader(1, E::OK, NodeID(), 0 /* flags */), N3S0);
   appender_->onReply(storedHeader(1, E::FAILED, NodeID(), 0 /* flags */), N4S0);
 
-  triggerTimeout();
+  ASSERT_TRUE(retry_wave_scheduled_);
+  triggerRetryWave();
   // Because N4S0 failed to store, the second wave is not amendable at all (N4S0
   // needs the payload and is last in the chain)
   {
@@ -1628,7 +1599,7 @@ TEST_F(AppenderTest, SoftPreemptedWhenDraining) {
   // sequencer should NOT be preempted, no reply should been sent
   EXPECT_EQ(EPOCH_INVALID, preempted_epoch_);
   EXPECT_FALSE(preempted_by_.isNodeID());
-  ASSERT_FALSE(reply_.hasValue());
+  ASSERT_FALSE(reply_.has_value());
 
   // since the appender may still complete the wave, no new wave should
   // be started
@@ -1639,14 +1610,14 @@ TEST_F(AppenderTest, SoftPreemptedWhenDraining) {
   // sequencer should NOT be preempted either
   EXPECT_EQ(EPOCH_INVALID, preempted_epoch_);
   EXPECT_FALSE(preempted_by_.isNodeID());
-  ASSERT_FALSE(reply_.hasValue());
+  ASSERT_FALSE(reply_.has_value());
 
   // there is no hope to finish the wave, the Appender should retry
   // for a new wave
-  ASSERT_TRUE(retry_timer_active_);
+  ASSERT_TRUE(retry_wave_scheduled_);
   ASSERT_FALSE(store_timer_active_);
   first_candidate_idx_ = 3;
-  triggerTimeout();
+  triggerRetryWave();
 
   // this checks the DRAINING flag in STORE header
   CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N3S0, N4S0, N5S0, N6S0);
@@ -1685,11 +1656,11 @@ TEST_F(AppenderTest, PremptedByNormalSealWhenDraining) {
   appender_->onReply(storedHeader(1, E::PREEMPTED, N8, SOFT), N3S0);
   EXPECT_EQ(EPOCH_INVALID, preempted_epoch_);
   EXPECT_FALSE(preempted_by_.isNodeID());
-  ASSERT_FALSE(reply_.hasValue());
-  ASSERT_TRUE(retry_timer_active_);
+  ASSERT_FALSE(reply_.has_value());
+  ASSERT_TRUE(retry_wave_scheduled_);
   ASSERT_FALSE(store_timer_active_);
   first_candidate_idx_ = 3;
-  triggerTimeout();
+  triggerRetryWave();
   CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 2, N3S0, N4S0, N5S0, N6S0);
   CHECK_NO_STORE_MSG();
   // in this case, N3S0 sents a NORMAL preemption
@@ -1704,37 +1675,5 @@ TEST_F(AppenderTest, PremptedByNormalSealWhenDraining) {
   // No release message should have been sent.
   CHECK_NO_RELEASE_MSG();
 }
-
-TEST_F(AppenderTest, E2ETracing) {
-  // check that spans corresponding to store messages are created
-  shards_ = {N0S0, N1S0, N2S0, N3S0, N4S0};
-  replication_ = 3;
-  extras_ = 0;
-  updateConfig();
-  first_candidate_idx_ = 0;
-
-  auto recorder = new opentracing::mocktracer::InMemoryRecorder{};
-  opentracing::mocktracer::MockTracerOptions tracer_options;
-  tracer_options.recorder.reset(recorder);
-  auto tracer = std::make_shared<opentracing::mocktracer::MockTracer>(
-      opentracing::mocktracer::MockTracerOptions{std::move(tracer_options)});
-
-  // send store implementation should create spans for all STOREs sent
-  startWithMockE2ETracer(tracer);
-
-  CHECK_STORE_MSG_AND_TRIGGER_ON_SENT(E::OK, 1, N0S0, N1S0, N2S0);
-  // when stored is sent both store and stored spans should be finished
-  ON_STORED_SENT(E::OK, 1, N0S0, N1S0, N2S0);
-
-  ASSERT_EQ(recorder->spans().size(), replication_ * 2);
-
-  for (unsigned int i = 0; i < replication_; i += 2) {
-    auto stored_parent_span_id = recorder->spans().at(i).references[0].span_id;
-    auto store_span_id = recorder->spans().at(i + 1).span_context.span_id;
-    ASSERT_EQ(stored_parent_span_id, store_span_id);
-  }
-}
-
-Payload AppenderTest::MockAppender::dummyPayload("test", sizeof("test"));
 
 }} // namespace facebook::logdevice

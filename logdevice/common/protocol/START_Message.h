@@ -147,7 +147,6 @@ class START_Message : public Message {
     // We have highly sophisticated handling for protocol versions
     return false;
   }
-  bool allowUnencrypted() const override;
   static Message::deserializer_t deserialize;
 
   // `proto_' only populated when receiving
@@ -159,6 +158,8 @@ class START_Message : public Message {
   small_shardset_t filtered_out_;
   // server-side filtering parameters
   ReadStreamAttributes attrs_;
+
+  PermissionParams getPermissionParams() const override;
 
   std::string client_session_id_; // session id of client that created stream
   uint64_t csid_hash_pt1 = 0;     // Session id hash, pt1

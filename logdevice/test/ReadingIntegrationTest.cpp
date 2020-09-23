@@ -9,10 +9,14 @@
 #include <memory>
 #include <thread>
 
+#include <folly/Conv.h>
+#include <folly/Overload.h>
 #include <folly/Random.h>
+#include <folly/compression/Compression.h>
 #include <folly/hash/Checksum.h>
 #include <gtest/gtest.h>
 
+#include "logdevice/common/PayloadGroupCodec.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/ReadStreamAttributes.h"
 #include "logdevice/common/ReaderImpl.h"
@@ -22,7 +26,9 @@
 #include "logdevice/common/configuration/Configuration.h"
 #include "logdevice/common/test/TestUtil.h"
 #include "logdevice/common/types_internal.h"
+#include "logdevice/include/BufferedWriteDecoder.h"
 #include "logdevice/include/Client.h"
+#include "logdevice/include/types.h"
 #include "logdevice/lib/ClientImpl.h"
 #include "logdevice/test/utils/IntegrationTestBase.h"
 #include "logdevice/test/utils/IntegrationTestUtils.h"
@@ -70,18 +76,16 @@ TEST_P(ReadingIntegrationTest, ReadStreamAtEndDoesNotCrash) {
 
   // We should be able to kill a node without the reader crashing
   ld_check(cluster->getConfig()
-               ->get()
-               ->serverConfig()
-               ->getNode(1)
-               ->isReadableStorageNode());
+               ->getNodesConfiguration()
+               ->getStorageMembership()
+               ->hasShardShouldReadFrom(1));
   cluster->getNode(1).kill();
 
   // We should be able to replace a node without the reader crashing
   ld_check(cluster->getConfig()
-               ->get()
-               ->serverConfig()
-               ->getNode(2)
-               ->isReadableStorageNode());
+               ->getNodesConfiguration()
+               ->getStorageMembership()
+               ->hasShardShouldReadFrom(2));
   ASSERT_EQ(0, cluster->replace(2));
 
   // Give some time for Client to notice the node replacement
@@ -99,19 +103,33 @@ TEST_P(ReadingIntegrationTest, AsyncReaderTest) {
   const logid_t logid(2);
   const size_t num_records = 10;
   // a map <lsn, data> for appended records
-  std::map<lsn_t, std::string> lsn_map;
+  using PayloadVariant = std::variant<std::string, PayloadGroup>;
+  std::map<lsn_t, PayloadVariant> lsn_map;
 
   lsn_t first_lsn = LSN_INVALID;
   for (int i = 0; i < num_records; ++i) {
-    std::string data("data" + std::to_string(i));
-    lsn_t lsn = client->appendSync(logid, Payload(data.data(), data.size()));
+    lsn_t lsn;
+    PayloadVariant payload;
+    if (i % 2 == 0) {
+      std::string data("data" + std::to_string(i));
+      lsn = client->appendSync(logid, Payload(data.data(), data.size()));
+      payload = data;
+    } else {
+      std::string data1("data1." + std::to_string(i));
+      std::string data2("data2." + std::to_string(i));
+      PayloadGroup payload_group = {
+          {0, folly::IOBuf::wrapBufferAsValue(data1.data(), data1.size())},
+          {5, folly::IOBuf::wrapBufferAsValue(data2.data(), data2.size())}};
+      lsn = client->appendSync(logid, folly::copy(payload_group));
+      payload = std::move(payload_group);
+    }
     EXPECT_NE(LSN_INVALID, lsn);
     if (first_lsn == LSN_INVALID) {
       first_lsn = lsn;
     }
 
     EXPECT_EQ(lsn_map.end(), lsn_map.find(lsn));
-    lsn_map[lsn] = data;
+    lsn_map[lsn] = payload;
   }
 
   cluster->waitForRecovery();
@@ -128,15 +146,24 @@ TEST_P(ReadingIntegrationTest, AsyncReaderTest) {
   auto record_cb = [&](std::unique_ptr<DataRecord>& r) {
     EXPECT_EQ(logid, r->logid);
     EXPECT_NE(lsn_map.cend(), it);
-    EXPECT_EQ(it->first, r->attrs.lsn);
+    const auto& [expected_lsn, expected_payload_variant] = *it;
+    EXPECT_EQ(expected_lsn, r->attrs.lsn);
     const Payload& p = r->payload;
     if (has_payload) {
       EXPECT_NE(nullptr, p.data());
-      EXPECT_EQ(it->second.size(), p.size());
-      EXPECT_EQ(it->second, p.toString());
+      std::visit(folly::overload(
+                     [&](const std::string& expected_payload) {
+                       EXPECT_EQ(expected_payload.size(), p.size());
+                       EXPECT_EQ(expected_payload, p.toString());
+                     },
+                     [&](const PayloadGroup& expected_payload) {
+                       EXPECT_EQ(expected_payload.size(), r->payloads.size());
+                     }),
+                 expected_payload_variant);
     } else {
       EXPECT_EQ(nullptr, p.data());
       EXPECT_EQ(0, p.size());
+      EXPECT_TRUE(r->payloads.empty());
     }
     if (++it == lsn_map.cend()) {
       sem.post();
@@ -353,12 +380,12 @@ TEST_P(ReadingIntegrationTest, ReaderTest) {
 // Thin end-to-end test for single copy delivery,
 // where copyset shuffling is seeded using the client's session info
 TEST_P(ReadingIntegrationTest, SeededSCDReaderTest) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(2);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(256);
-  log_attrs.set_scdEnabled(true);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(2)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(256)
+                       .with_scdEnabled(true);
 
   auto cluster = clusterFactory()
                      .setLogGroupName("my-logs")
@@ -401,6 +428,13 @@ TEST_P(ReadingIntegrationTest, ReaderSSLTest) {
       cluster->createClient(testTimeout(), std::move(client_settings));
 
   IntegrationTest_RunReaderTest(cluster.get(), client);
+
+  // Check that the number of SSL context created, is greater than 0 but not
+  // greater than the number of workers.
+  Stats s = dynamic_cast<ClientImpl*>(client.get())->stats()->aggregate();
+  ASSERT_LE(1, s.ssl_context_created);
+  ASSERT_GE(folly::to<size_t>(client->settings().get("num-workers").value()),
+            s.ssl_context_created);
 }
 
 TEST_P(ReadingIntegrationTest, ReaderSSLNoClientCertTest) {
@@ -530,15 +564,16 @@ TEST_P(ReadingIntegrationTest, PurgingSmokeTest) {
       node.addSequencerRole();
     } else {
       node.addStorageRole(/*num_shards*/ 2);
+      node.metadata_node = true;
     }
   }
 
-  Configuration::NodesConfig nodes_config(nodes);
-
   // set replication factor for metadata log to be 2
   // otherwise recovery cannot complete for metadata log
-  Configuration::MetaDataLogsConfig meta_config =
-      createMetaDataLogsConfig(nodes_config, nodes.size(), 2);
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes), ReplicationProperty{{NodeLocationScope::NODE, 2}});
+
+  Configuration::MetaDataLogsConfig meta_config;
   // Sequencers writing into metadata logs throw off the epoch counting logic
   // below
   meta_config.sequencers_write_metadata_logs = false;
@@ -546,15 +581,23 @@ TEST_P(ReadingIntegrationTest, PurgingSmokeTest) {
 
   auto cluster = clusterFactory()
                      .doPreProvisionEpochMetaData()
-                     .setNodes(nodes)
+                     .setNodes(std::move(nodes_configuration))
                      .setMetaDataLogsConfig(meta_config)
                      .create(4);
 
   std::shared_ptr<const Configuration> config = cluster->getConfig()->get();
-  ld_check(config->serverConfig()->getNode(0)->isSequencingEnabled());
-  ld_check(config->serverConfig()->getNode(1)->isReadableStorageNode());
-  ld_check(config->serverConfig()->getNode(2)->isReadableStorageNode());
-  ld_check(config->serverConfig()->getNode(3)->isReadableStorageNode());
+  ld_check(config->getNodesConfiguration()
+               ->getSequencerMembership()
+               ->isSequencingEnabled(0));
+  ld_check(config->getNodesConfiguration()
+               ->getStorageMembership()
+               ->hasShardShouldReadFrom(1));
+  ld_check(config->getNodesConfiguration()
+               ->getStorageMembership()
+               ->hasShardShouldReadFrom(2));
+  ld_check(config->getNodesConfiguration()
+               ->getStorageMembership()
+               ->hasShardShouldReadFrom(3));
   ld_check(config->getLogGroupByIDShared(LOG_ID)
                ->attrs()
                .replicationFactor()
@@ -618,11 +661,11 @@ TEST_P(ReadingIntegrationTest, PurgingSmokeTest) {
 // enough of the cluster goes down that we expect service interruption.
 TEST_P(ReadingIntegrationTest, ReadHealth) {
   // Make sure replication factor is 2
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(2);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(256);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(2)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(256);
   auto cluster = clusterFactory()
                      .setLogGroupName("my-logs")
                      .setLogAttributes(log_attrs)
@@ -648,7 +691,9 @@ TEST_P(ReadingIntegrationTest, ReadHealth) {
   wait_until([&]() { return async_reader->isConnectionHealthy(LOG_ID) == 1; });
 
   ld_info("Killing first storage node, should not affect connection health");
-  ld_check(config->serverConfig()->getNode(1)->isReadableStorageNode());
+  ld_check(config->getNodesConfiguration()
+               ->getStorageMembership()
+               ->hasShardShouldReadFrom(1));
   cluster->getNode(1).kill();
   /* sleep override */
   std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -656,7 +701,9 @@ TEST_P(ReadingIntegrationTest, ReadHealth) {
   wait_until([&]() { return async_reader->isConnectionHealthy(LOG_ID) == 1; });
 
   ld_info("Killing sequencer node, should not affect connection health");
-  ld_check(!config->serverConfig()->getNode(0)->isReadableStorageNode());
+  ld_check(!config->getNodesConfiguration()
+                ->getStorageMembership()
+                ->hasShardShouldReadFrom(0));
   cluster->getNode(0).kill();
   /* sleep override */
   std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -665,7 +712,9 @@ TEST_P(ReadingIntegrationTest, ReadHealth) {
 
   ld_info("Killing second storage node, should negatively affect cluster "
           "health because r=2");
-  ld_check(config->serverConfig()->getNode(2)->isReadableStorageNode());
+  ld_check(config->getNodesConfiguration()
+               ->getStorageMembership()
+               ->hasShardShouldReadFrom(2));
   cluster->getNode(2).kill();
   wait_until([&]() { return reader->isConnectionHealthy(LOG_ID) == 0; });
   wait_until([&]() { return async_reader->isConnectionHealthy(LOG_ID) == 0; });
@@ -675,11 +724,11 @@ TEST_P(ReadingIntegrationTest, ReadHealth) {
 // Appropriate callbacks should be triggered at the right time.
 TEST_P(ReadingIntegrationTest, HealthChangeCallback) {
   // Make sure replication factor is 2
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(2);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(256);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(2)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(256);
   auto cluster = clusterFactory()
                      .setLogGroupName("my-logs")
                      .setLogAttributes(log_attrs)
@@ -706,24 +755,24 @@ TEST_P(ReadingIntegrationTest, HealthChangeCallback) {
   // The callback will post on this semaphore every time it sees a
   // health change on LOG_ID. Every other call is a logic error.
   Semaphore sem;
-  bool currently_healthy = false;
+  std::atomic<bool> currently_healthy{false};
   auto health_change_cb = [&](const logid_t id, const HealthChangeType status) {
     const bool healthy = (status == HealthChangeType::LOG_HEALTHY);
     ld_info("Health change callback called: id %lu, currently healthy %d "
             "new health %d",
             id.val_,
-            currently_healthy,
+            currently_healthy.load(),
             healthy);
     // validate parameters
     EXPECT_EQ(LOG_ID, id);
-    if (currently_healthy) {
+    if (currently_healthy.load()) {
       EXPECT_EQ(HealthChangeType::LOG_UNHEALTHY, status);
     } else {
       EXPECT_EQ(HealthChangeType::LOG_HEALTHY, status);
     }
 
     // change internal state
-    currently_healthy = healthy;
+    currently_healthy.store(healthy);
     sem.post();
   };
 
@@ -737,37 +786,43 @@ TEST_P(ReadingIntegrationTest, HealthChangeCallback) {
 
   ld_info("Waiting for reader to connect and reach healthy state");
   sem.wait();
-  EXPECT_TRUE(currently_healthy);
+  EXPECT_TRUE(currently_healthy.load());
 
   ld_info("Waiting for reader to read at least one record");
   record_sem.wait();
 
   ld_info("Killing first storage node, should not affect connection health");
-  ld_check(config->serverConfig()->getNode(1)->isReadableStorageNode());
+  ld_check(config->getNodesConfiguration()
+               ->getStorageMembership()
+               ->hasShardShouldReadFrom(1));
   cluster->getNode(1).kill();
   /* sleep override */
   std::this_thread::sleep_for(std::chrono::seconds(1));
-  EXPECT_TRUE(currently_healthy);
+  EXPECT_TRUE(currently_healthy.load());
 
   ld_info("Killing sequencer node, should not affect connection health");
-  ld_check(!config->serverConfig()->getNode(0)->isReadableStorageNode());
+  ld_check(!config->getNodesConfiguration()
+                ->getStorageMembership()
+                ->hasShardShouldReadFrom(0));
   cluster->getNode(0).kill();
   /* sleep override */
   std::this_thread::sleep_for(std::chrono::seconds(1));
-  EXPECT_TRUE(currently_healthy);
+  EXPECT_TRUE(currently_healthy.load());
 
   ld_info("Killing second storage node, should negatively affect cluster "
           "health because r=2");
-  ld_check(config->serverConfig()->getNode(2)->isReadableStorageNode());
+  ld_check(config->getNodesConfiguration()
+               ->getStorageMembership()
+               ->hasShardShouldReadFrom(2));
   cluster->getNode(2).kill();
   sem.wait();
-  EXPECT_FALSE(currently_healthy);
+  EXPECT_FALSE(currently_healthy.load());
 
   ld_info("Restarting second storage node, the cluster should go back to a "
           "healthy state");
   cluster->getNode(2).start();
   sem.wait();
-  EXPECT_TRUE(currently_healthy);
+  EXPECT_TRUE(currently_healthy.load());
 }
 
 // Tests AsyncReader::getBytesBuffered() and the postStatisticsRequest()
@@ -827,6 +882,16 @@ static std::pair<uint32_t, uint32_t> calc_hash(const std::string& s) {
       (uint32_t)s.size(), folly::crc32c((const uint8_t*)s.data(), s.size()));
 }
 
+static std::pair<uint32_t, uint32_t>
+calc_hash(const PayloadGroup& payload_group) {
+  folly::IOBufQueue queue;
+  PayloadGroupCodec::encode(payload_group, queue);
+  auto iobuf = queue.move();
+  iobuf->coalesce();
+  return std::make_pair(static_cast<uint32_t>(iobuf->length()),
+                        folly::crc32c(iobuf->data(), iobuf->length()));
+}
+
 // Parse the hash returned by a reader with PAYLOAD_HASH_ONLY flag.
 static std::pair<uint32_t, uint32_t> parse_hash(Payload payload) {
   std::pair<uint32_t, uint32_t> res;
@@ -853,14 +918,20 @@ TEST_P(ReadingIntegrationTest, PayloadHashOnly) {
   std::shared_ptr<Client> client = cluster->createClient();
   ASSERT_TRUE((bool)client);
 
-  std::string payload1 = "abra";
-  std::string payload2 = "cadabra";
+  const std::string payload1 = "abra";
+  const std::string payload2 = "cadabra";
+  const PayloadGroup payload3 = {
+      {1, folly::IOBuf::wrapBufferAsValue(payload1.data(), payload1.size())},
+      {2, folly::IOBuf::wrapBufferAsValue(payload2.data(), payload2.size())}};
 
   lsn_t lsn1 = client->appendSync(LOG_ID, payload1);
   ASSERT_NE(LSN_INVALID, lsn1);
   lsn_t lsn2 = client->appendSync(LOG_ID, payload2);
   ASSERT_NE(LSN_INVALID, lsn2);
   ASSERT_EQ(lsn1 + 1, lsn2);
+  lsn_t lsn3 = client->appendSync(LOG_ID, folly::copy(payload3));
+  ASSERT_NE(LSN_INVALID, lsn3);
+  ASSERT_EQ(lsn2 + 1, lsn3);
 
   std::unique_ptr<Reader> reader = client->createReader(1);
   auto reader_impl = dynamic_cast<ReaderImpl*>(reader.get());
@@ -886,12 +957,14 @@ TEST_P(ReadingIntegrationTest, PayloadHashOnly) {
   ASSERT_EQ(lsn1 - 1, gap.hi);
   ASSERT_EQ(GapType::BRIDGE, gap.type);
 
-  nread = reader->read(2, &recs, &gap);
-  ASSERT_EQ(2, nread);
+  nread = reader->read(3, &recs, &gap);
+  ASSERT_EQ(3, nread);
   EXPECT_EQ(lsn1, recs[0]->attrs.lsn);
   EXPECT_EQ(calc_hash(payload1), parse_hash(recs[0]->payload));
   EXPECT_EQ(lsn2, recs[1]->attrs.lsn);
   EXPECT_EQ(calc_hash(payload2), parse_hash(recs[1]->payload));
+  EXPECT_EQ(lsn3, recs[2]->attrs.lsn);
+  EXPECT_EQ(calc_hash(payload3), parse_hash(recs[2]->payload));
 }
 
 TEST_P(ReadingIntegrationTest, LogTailAttributes) {
@@ -912,14 +985,12 @@ TEST_P(ReadingIntegrationTest, LogTailAttributes) {
       node.addStorageRole(/*num_shards*/ 2);
     }
   }
-
-  Configuration::NodesConfig nodes_config(nodes);
-
   // set replication factor for metadata log to be 2
   // otherwise recovery cannot complete for metadata log
-  Configuration::MetaDataLogsConfig meta_config =
-      createMetaDataLogsConfig(nodes_config, nodes.size(), 2);
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes), ReplicationProperty{{NodeLocationScope::NODE, 2}});
 
+  Configuration::MetaDataLogsConfig meta_config;
   // Sequencers writing into metadata logs throw off the epoch counting logic
   // below
   meta_config.sequencers_write_metadata_logs = false;
@@ -927,13 +998,15 @@ TEST_P(ReadingIntegrationTest, LogTailAttributes) {
 
   auto cluster = clusterFactory()
                      .doPreProvisionEpochMetaData()
-                     .setNodes(nodes)
+                     .setNodes(std::move(nodes_configuration))
                      .setParam("--byte-offsets")
                      .setMetaDataLogsConfig(meta_config)
                      .create(4);
 
   std::shared_ptr<const Configuration> config = cluster->getConfig()->get();
-  ld_check(config->serverConfig()->getNode(0)->isSequencingEnabled());
+  ld_check(config->getNodesConfiguration()
+               ->getSequencerMembership()
+               ->isSequencingEnabled(0));
 
   std::shared_ptr<Client> client = cluster->createClient();
 
@@ -1014,12 +1087,12 @@ TEST_P(ReadingIntegrationTest, LogTailAttributes) {
 // Can not remove now due to the defined functions
 #ifndef NDEBUG // This test requires fault injection.
 TEST_P(ReadingIntegrationTest, PurgingStuck) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(2);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(256);
-  log_attrs.set_scdEnabled(true);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(2)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(256)
+                       .with_scdEnabled(true);
 
   const logid_t LOG_ID(1);
 
@@ -1378,7 +1451,7 @@ TEST_P(ReadingIntegrationTest,
                                 shard_idx,
                                 logid.val_,
                                 lsn_to_string(lsn2));
-      std::string response = n.sendCommand(cmd, true);
+      std::string response = n.sendCommand(cmd);
       // Strip the trailing "\r\n".
       ld_info("N%d replied: %s",
               (int)n.node_index_,
@@ -1507,7 +1580,7 @@ TEST_P(ReadingIntegrationTest, UnderreplicatedRegion) {
   // "rebuilding mark_dirty" seems to indicate success.
   auto command_ok = [](std::string output) {
     // These admin commands output a few lines of human-readable things like
-    // "Clearing dirty ranges and writting checkpoint for shard %u...",
+    // "Clearing dirty ranges and writing checkpoint for shard %u...",
     // followed by two lines "Done." and "END".
     const std::string expected = "Done.\r\n";
     return output.size() >= expected.size() &&
@@ -1762,6 +1835,260 @@ TEST_P(ReadingIntegrationTest, GuaranteedEfficiencyWithNodeDown) {
   EXPECT_EQ(1, s.rewind_done);
   EXPECT_EQ(0, s.scd_shard_underreplicated_region_entered);
   EXPECT_EQ(0, s.scd_shard_underreplicated_region_promoted);
+}
+
+TEST_P(ReadingIntegrationTest, EmptyPayload) {
+  auto cluster = clusterFactory()
+                     .setNumDBShards(1)
+                     // Disable checksums because in some places they're
+                     // treated as part of payload.
+                     .setParam("--checksum-bits", "0")
+                     .create(1);
+  cluster->waitUntilAllSequencersQuiescent();
+
+  std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
+  int rv = client_settings->set("checksum-bits", "0");
+  ASSERT_EQ(0, rv) << err;
+  auto client = cluster->createClient(
+      getDefaultTestTimeout(), std::move(client_settings));
+
+  auto lsn = client->appendSync(logid_t(1), "");
+  ASSERT_NE(LSN_INVALID, lsn);
+
+  auto reader = client->createReader(1);
+  reader->startReading(logid_t(1), lsn, lsn);
+  ASSERT_TRUE(reader->isReadingAny());
+  std::vector<std::unique_ptr<DataRecord>> recs;
+  GapRecord gap;
+  ssize_t n = reader->read(1, &recs, &gap);
+  ASSERT_EQ(1, n);
+  EXPECT_EQ(lsn, recs[0]->attrs.lsn);
+  EXPECT_EQ("", recs[0]->payload.toString());
+  EXPECT_FALSE(reader->isReadingAny());
+
+  // Now try that with buffered writer.
+  class CB : public BufferedWriter::AppendCallback {
+   public:
+    bool done = false;
+    lsn_t lsn = LSN_INVALID;
+    Semaphore sem;
+
+    void onSuccess(logid_t,
+                   ContextSet,
+                   const DataRecordAttributes& attrs) override {
+      EXPECT_FALSE(done);
+      done = true;
+      lsn = attrs.lsn;
+      sem.post();
+    }
+    void onFailure(logid_t, ContextSet, Status) override {
+      ADD_FAILURE(); // appends are not supposed to fail
+      EXPECT_FALSE(done);
+      done = true;
+      sem.post();
+    }
+
+    void reset() {
+      ld_check(!sem.try_wait());
+      done = false;
+      lsn = LSN_INVALID;
+    }
+  };
+
+  CB cb;
+  std::unique_ptr<BufferedWriter> writer = BufferedWriter::create(client, &cb);
+  rv = writer->append(logid_t(1), "", nullptr);
+  ASSERT_EQ(0, rv) << err;
+  // BufferedWriter will write this batch without compression because
+  // compression won't make the empty string shorter (varint-length-prefixed
+  // empty string, to be precise).
+  rv = writer->flushAll();
+  ASSERT_EQ(0, rv) << err;
+  cb.sem.wait();
+  lsn = cb.lsn;
+
+  reader->startReading(logid_t(1), lsn, lsn);
+  ASSERT_TRUE(reader->isReadingAny());
+  recs.clear();
+  n = reader->read(1, &recs, &gap);
+  ASSERT_EQ(1, n);
+  EXPECT_EQ(lsn, recs[0]->attrs.lsn);
+  EXPECT_EQ("", recs[0]->payload.toString());
+  EXPECT_FALSE(reader->isReadingAny());
+
+  // Now try with compression.
+  cb.reset();
+  rv = writer->append(logid_t(1), "", nullptr);
+  ASSERT_EQ(0, rv) << err;
+  // Add a compressible payload to make BufferedWriter decide to compress the
+  // batch.
+  rv = writer->append(logid_t(1), std::string(1000, '\0'), nullptr);
+  ASSERT_EQ(0, rv) << err;
+  // There'll be no compression because compression won't make the empty string
+  // shorter.
+  rv = writer->flushAll();
+  ASSERT_EQ(0, rv) << err;
+  cb.sem.wait();
+  lsn = cb.lsn;
+
+  reader->startReading(logid_t(1), lsn, lsn);
+  ASSERT_TRUE(reader->isReadingAny());
+  recs.clear();
+  n = reader->read(1, &recs, &gap);
+  ASSERT_EQ(1, n);
+  EXPECT_EQ(lsn, recs[0]->attrs.lsn);
+  EXPECT_EQ("", recs[0]->payload.toString());
+  recs.clear();
+  n = reader->read(1, &recs, &gap);
+  ASSERT_EQ(1, n);
+  EXPECT_EQ(lsn, recs[0]->attrs.lsn);
+  EXPECT_EQ(std::string(1000, '\0'), recs[0]->payload.toString());
+  EXPECT_FALSE(reader->isReadingAny());
+}
+
+TEST_P(ReadingIntegrationTest, ReadCompressedPayloadGroups) {
+  auto cluster = clusterFactory()
+                     .setNumDBShards(1)
+                     // Disable checksums because in some places they're
+                     // treated as part of payload.
+                     .setParam("--checksum-bits", "0")
+                     .create(1);
+  cluster->waitUntilAllSequencersQuiescent();
+
+  std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
+  int rv = client_settings->set("checksum-bits", "0");
+  ASSERT_EQ(0, rv) << err;
+  auto client = cluster->createClient(
+      getDefaultTestTimeout(), std::move(client_settings));
+
+  class CB : public BufferedWriter::AppendCallback {
+   public:
+    bool done = false;
+    lsn_t lsn = LSN_INVALID;
+    Semaphore sem;
+
+    void onSuccess(logid_t,
+                   ContextSet,
+                   const DataRecordAttributes& attrs) override {
+      EXPECT_FALSE(done);
+      done = true;
+      lsn = attrs.lsn;
+      sem.post();
+    }
+    void onFailure(logid_t, ContextSet, Status) override {
+      ADD_FAILURE(); // appends are not supposed to fail
+      EXPECT_FALSE(done);
+      done = true;
+      sem.post();
+    }
+
+    void reset() {
+      ld_check(!sem.try_wait());
+      done = false;
+      lsn = LSN_INVALID;
+    }
+  };
+
+  // We're going to read payloads without decoding them and use decoder to
+  // decode them
+  auto reader = client->createReader(1);
+  reader->doNotDecodeBufferedWrites();
+
+  auto decoder = BufferedWriteDecoder::create();
+
+  // Write single payload using buffered writer
+  CB cb;
+  std::unique_ptr<BufferedWriter> writer = BufferedWriter::create(client, &cb);
+  rv = writer->append(logid_t(1), "payload", nullptr);
+  ASSERT_EQ(0, rv) << err;
+  rv = writer->flushAll();
+  ASSERT_EQ(0, rv) << err;
+  cb.sem.wait();
+  lsn_t lsn = cb.lsn;
+
+  // Read and decode
+  reader->startReading(logid_t(1), lsn, lsn);
+  ASSERT_TRUE(reader->isReadingAny());
+
+  std::vector<std::unique_ptr<DataRecord>> recs;
+  GapRecord gap;
+  ssize_t n = reader->read(1, &recs, &gap);
+  ASSERT_EQ(1, n);
+  EXPECT_EQ(lsn, recs[0]->attrs.lsn);
+  EXPECT_FALSE(reader->isReadingAny());
+
+  // Decoding should fail, since payload is not in the right format
+  CompressedPayloadGroups compressed_payload_groups;
+  rv = decoder->decodeOneCompressed(
+      std::move(recs[0]), compressed_payload_groups);
+  EXPECT_TRUE(compressed_payload_groups.empty());
+  EXPECT_NE(0, rv);
+
+  // Now write mix of single payload and payload groups
+  cb.reset();
+  const std::string payload1 = "single";
+  rv = writer->append(logid_t(1), folly::copy(payload1), nullptr);
+  ASSERT_EQ(0, rv) << err;
+
+  const std::string payload2_0(64, 'a');
+  const std::string payload2_5("b");
+  rv = writer->append(
+      logid_t(1),
+      PayloadGroup{
+          {0, folly::IOBuf::wrapBufferAsValue(folly::StringPiece(payload2_0))},
+          {5, folly::IOBuf::wrapBufferAsValue(folly::StringPiece(payload2_5))}},
+      nullptr);
+  ASSERT_EQ(0, rv) << err;
+  rv = writer->flushAll();
+  ASSERT_EQ(0, rv) << err;
+  cb.sem.wait();
+  lsn = cb.lsn;
+
+  // It should be decodable now
+  reader->startReading(logid_t(1), lsn, lsn);
+  ASSERT_TRUE(reader->isReadingAny());
+  recs.clear();
+  n = reader->read(1, &recs, &gap);
+  ASSERT_EQ(1, n);
+  EXPECT_EQ(lsn, recs[0]->attrs.lsn);
+  EXPECT_FALSE(reader->isReadingAny());
+
+  rv = decoder->decodeOneCompressed(
+      std::move(recs[0]), compressed_payload_groups);
+  ASSERT_EQ(0, rv) << err;
+
+  // Decoded group should contain 2 keys
+  EXPECT_EQ(2, compressed_payload_groups.size());
+  ASSERT_EQ(1, compressed_payload_groups.count(0));
+  ASSERT_EQ(1, compressed_payload_groups.count(5));
+
+  // Only key 0 can be compressed
+  EXPECT_EQ(Compression::LZ4, compressed_payload_groups.at(0).compression);
+  EXPECT_EQ(Compression::NONE, compressed_payload_groups.at(5).compression);
+
+  // Should contain two records for each key
+  ASSERT_EQ(2, compressed_payload_groups.at(0).descriptors.size());
+  ASSERT_EQ(2, compressed_payload_groups.at(5).descriptors.size());
+
+  // Check uncompressed payload sizes
+  EXPECT_EQ(payload1.size(),
+            compressed_payload_groups.at(0).descriptors[0]->uncompressed_size);
+  EXPECT_EQ(payload2_0.size(),
+            compressed_payload_groups.at(0).descriptors[1]->uncompressed_size);
+  EXPECT_EQ(folly::none, compressed_payload_groups.at(5).descriptors[0]);
+  EXPECT_EQ(payload2_5.size(),
+            compressed_payload_groups.at(5).descriptors[1]->uncompressed_size);
+
+  // Payloads should match after uncompression
+  EXPECT_EQ(
+      payload2_5,
+      compressed_payload_groups.at(5).payload.moveToFbString().toStdString());
+  EXPECT_EQ(payload1 + payload2_0,
+            folly::io::getCodec(folly::io::CodecType::LZ4)
+                ->uncompress(&compressed_payload_groups.at(0).payload,
+                             payload1.size() + payload2_0.size())
+                ->moveToFbString()
+                .toStdString());
 }
 
 INSTANTIATE_TEST_CASE_P(ReadingIntegrationTest,

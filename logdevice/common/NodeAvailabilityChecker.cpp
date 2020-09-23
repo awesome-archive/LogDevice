@@ -22,8 +22,7 @@ NodeAvailabilityChecker::NodeStatus
 NodeAvailabilityChecker::checkNode(NodeSetState* nodeset_state,
                                    ShardID shard,
                                    StoreChainLink* destination_out,
-                                   bool ignore_nodeset_state,
-                                   bool allow_unencrypted_connections) const {
+                                   bool ignore_nodeset_state) const {
   ld_check(destination_out != nullptr);
   const auto& storage_membership =
       getNodesConfiguration()->getStorageMembership();
@@ -56,13 +55,12 @@ NodeAvailabilityChecker::checkNode(NodeSetState* nodeset_state,
     return NodeStatus::NOT_AVAILABLE;
   }
 
-  NodeID dest_nid(shard.node(), 0);
+  node_index_t dest_id = shard.node();
   ClientID our_name_at_peer;
 
   NodeStatus result;
 
-  int rv = checkConnection(
-      dest_nid, &our_name_at_peer, allow_unencrypted_connections);
+  int rv = checkConnection(dest_id, &our_name_at_peer);
   if (rv != 0) {
     switch (err) {
       case E::NOTFOUND:
@@ -70,7 +68,7 @@ NodeAvailabilityChecker::checkNode(NodeSetState* nodeset_state,
         // We never tried/managed to connect to this node and connecting attempt
         // is not in progress. Let's try to connect and report as unavailable if
         // it fails immediately.
-        rv = connect(dest_nid, allow_unencrypted_connections);
+        rv = connect(dest_id);
         if (rv != 0) {
           result = NodeStatus::NOT_AVAILABLE;
         } else {
@@ -87,7 +85,7 @@ NodeAvailabilityChecker::checkNode(NodeSetState* nodeset_state,
         // We don't have a working connection to the node yet. Skip this
         // destination for now, but make sure a reconnection attempt is in
         // progress.
-        connect(dest_nid, allow_unencrypted_connections);
+        connect(dest_id);
         // fall-through
         FOLLY_FALLTHROUGH;
       case E::DISABLED:
@@ -103,9 +101,9 @@ NodeAvailabilityChecker::checkNode(NodeSetState* nodeset_state,
         RATELIMIT_CRITICAL(std::chrono::seconds(1),
                            1,
                            "INTERNAL ERROR: Sender::checkConnection() failed "
-                           "with unexpected error %s for NodeID %s",
+                           "with unexpected error %s for N%u",
                            error_name(err),
-                           dest_nid.toString().c_str());
+                           dest_id);
         ld_check(false);
         result = NodeStatus::NOT_AVAILABLE;
     }
@@ -115,7 +113,6 @@ NodeAvailabilityChecker::checkNode(NodeSetState* nodeset_state,
 
   if (result == NodeStatus::AVAILABLE ||
       result == NodeStatus::AVAILABLE_NOCHAIN) {
-    ld_check(dest_nid.isNodeID());
     // our_name_at_peer may not be valid if chain-sending is not allowed,
     // but it must be valid when chain-sending is allowed. assert in debug
     // build
@@ -127,12 +124,20 @@ NodeAvailabilityChecker::checkNode(NodeSetState* nodeset_state,
   return result;
 }
 
-int NodeAvailabilityChecker::checkConnection(NodeID nid,
-                                             ClientID* our_name_at_peer,
-                                             bool allow_unencrypted) const {
-  return Worker::onThisThread()->sender().checkConnection(
-      nid, our_name_at_peer, allow_unencrypted);
-}
+int NodeAvailabilityChecker::checkConnection(node_index_t nid,
+                                             ClientID* our_name_at_peer) const {
+  auto& sender = Worker::onThisThread()->sender();
+  int rv = sender.checkServerConnection(nid);
+  if (rv != 0) {
+    return -1;
+  }
+  if (our_name_at_peer) {
+    const auto* info = sender.getConnectionInfo(Address(nid));
+    ld_check(info);
+    *our_name_at_peer = info->our_name_at_peer.value_or(ClientID::INVALID);
+  }
+  return 0;
+} // namespace logdevice
 
 // `nodeset_state` is nullptr in tests.
 std::chrono::steady_clock::time_point
@@ -174,8 +179,8 @@ NodeAvailabilityChecker::getNodesConfiguration() const {
   return Worker::onThisThread()->getNodesConfiguration();
 }
 
-int NodeAvailabilityChecker::connect(NodeID nid, bool allow_unencrypted) const {
-  return Worker::onThisThread()->sender().connect(nid, allow_unencrypted);
+int NodeAvailabilityChecker::connect(node_index_t nid) const {
+  return Worker::onThisThread()->sender().connect(nid);
 }
 
 const NodeAvailabilityChecker* NodeAvailabilityChecker::instance() {

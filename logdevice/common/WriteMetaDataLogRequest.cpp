@@ -33,6 +33,17 @@ WriteMetaDataLogRequest::WriteMetaDataLogRequest(
   ld_check(epoch_store_metadata_->isValid());
   ld_check(!epoch_store_metadata_->disabled());
   ld_check(!epoch_store_metadata_->writtenInMetaDataLog());
+  ld_spew("[sequencer_activity_in_progress++] Created WriteMetaDataLogRequest "
+          "for log %lu",
+          log_id.val());
+  WORKER_STAT_INCR(sequencer_activity_in_progress);
+}
+
+WriteMetaDataLogRequest::~WriteMetaDataLogRequest() {
+  ld_spew("[sequencer_activity_in_progress--] Destroyed "
+          "WriteMetaDataLogRequest for log %lu",
+          log_id_.val());
+  WORKER_STAT_DECR(sequencer_activity_in_progress);
 }
 
 void WriteMetaDataLogRequest::executionBody() {
@@ -87,15 +98,11 @@ void WriteMetaDataLogRequest::writeRecord() {
            log_id_.val(),
            epoch_store_metadata_->toString().c_str());
 
-  // duplicate the payload, and pass the ownership to the
-  // Appender eventually
-  auto payload_dup =
-      Payload(serialized_payload_.data(), serialized_payload_.size()).dup();
   WeakRef<WriteMetaDataLogRequest> ref = ref_holder_.ref();
   auto reply = runInternalAppend(
       MetaDataLog::metaDataLogID(log_id_),
       AppendAttributes(),
-      PayloadHolder(payload_dup.data(), payload_dup.size()),
+      PayloadHolder::copyString(serialized_payload_),
       [ref, this](Status st, lsn_t lsn, NodeID, RecordTimestamp) {
         if (!ref) {
           // WriteMetaDataLogRequest was already destroyed
@@ -108,7 +115,7 @@ void WriteMetaDataLogRequest::writeRecord() {
       10000, /* timeout, 10sec*/
       1,     /* append_message_count */
       epoch_store_metadata_->h.epoch /* acceptable_epoch */);
-  if (reply.hasValue()) {
+  if (reply.has_value()) {
     // got a synchronous error
     onAppendResult(reply.value().status, LSN_INVALID);
   }
@@ -133,6 +140,13 @@ void WriteMetaDataLogRequest::onAppendResult(Status st, lsn_t lsn) {
     case E::NOTINSERVERCONFIG:
     case E::NOSEQUENCER:
     case E::NOTREADY:
+      WORKER_STAT_INCR(write_metadata_request_failed);
+      RATELIMIT_ERROR(
+          std::chrono::seconds(1),
+          1,
+          "Append to metadata log %lu failed with non-retryable error %s",
+          MetaDataLog::metaDataLogID(log_id_).val(),
+          error_description(st));
       // another sequencer should take care of this
       destroyRequest(st);
       return;
@@ -151,6 +165,7 @@ void WriteMetaDataLogRequest::onAppendResult(Status st, lsn_t lsn) {
             Worker::settings().sequencer_metadata_log_write_retry_delay);
         append_retry_timer_->randomize();
       }
+      WORKER_STAT_INCR(write_metadata_request_failed);
       RATELIMIT_ERROR(std::chrono::seconds(1),
                       1,
                       "Append to metadata log %lu failed with error %s, "
@@ -163,6 +178,7 @@ void WriteMetaDataLogRequest::onAppendResult(Status st, lsn_t lsn) {
       append_retry_timer_->activate();
       return;
     default:
+      WORKER_STAT_INCR(write_metadata_request_failed);
       RATELIMIT_ERROR(std::chrono::seconds(1),
                       1,
                       "unexpected error when appending to metadata log %lu: %s",
@@ -225,10 +241,11 @@ void WriteMetaDataLogRequest::onEpochStoreUpdated(
                         bool unexpected = false) {
     static const char* unexpected_str = "Unexpected ";
     std::string retry_str;
-    if (delay.hasValue()) {
+    if (delay.has_value()) {
       retry_str =
           " Retrying in " + std::to_string(delay.value().count()) + "ms.";
     }
+    WORKER_STAT_INCR(write_metadata_epoch_store_failed);
     RATELIMIT_ERROR(std::chrono::seconds(1),
                     1,
                     "%serror when updating metadata in epoch store for log "

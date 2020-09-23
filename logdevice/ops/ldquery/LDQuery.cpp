@@ -28,7 +28,7 @@
 #include "tables/HistoricalMetadata.h"
 #include "tables/Info.h"
 #include "tables/InfoConfig.h"
-#include "tables/IsLogEmpty.h"
+#include "tables/InfoRsm.h"
 #include "tables/Iterators.h"
 #include "tables/LogGroups.h"
 #include "tables/LogRebuildings.h"
@@ -54,9 +54,6 @@
 #include "tables/StorageTasks.h"
 #include "tables/StoredLogs.h"
 #include "tables/SyncSequencerRequests.h"
-
-using facebook::logdevice::err;
-using facebook::logdevice::errorStrings;
 
 namespace facebook { namespace logdevice { namespace ldquery {
 
@@ -158,7 +155,7 @@ LDQuery::LDQuery(std::string config_path,
   table_registry_.registerTable<tables::HistoricalMetadataLegacy>(ctx_);
   table_registry_.registerTable<tables::Info>(ctx_);
   table_registry_.registerTable<tables::InfoConfig>(ctx_);
-  table_registry_.registerTable<tables::IsLogEmpty>(ctx_);
+  table_registry_.registerTable<tables::InfoRsm>(ctx_);
   table_registry_.registerTable<tables::Iterators>(ctx_);
   table_registry_.registerTable<tables::LogGroups>(ctx_);
   table_registry_.registerTable<tables::LogRebuildings>(ctx_);
@@ -169,8 +166,10 @@ LDQuery::LDQuery(std::string config_path,
   table_registry_.registerTable<tables::Partitions>(ctx_);
   table_registry_.registerTable<tables::Purges>(ctx_);
   table_registry_.registerTable<tables::Readers>(ctx_);
-  table_registry_.registerTable<tables::Record<tables::RecordQueryMode::CSI>>(ctx_);
-  table_registry_.registerTable<tables::Record<tables::RecordQueryMode::DATA>>(ctx_);
+  table_registry_.registerTable<tables::Record<tables::RecordQueryMode::CSI>>(
+      ctx_);
+  table_registry_.registerTable<tables::Record<tables::RecordQueryMode::DATA>>(
+      ctx_);
   table_registry_.registerTable<tables::RecordCache>(ctx_);
   table_registry_.registerTable<tables::Recoveries>(ctx_);
   table_registry_.registerTable<tables::Sequencers>(ctx_);

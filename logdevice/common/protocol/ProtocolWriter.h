@@ -19,20 +19,18 @@
 #include "logdevice/common/types_internal.h"
 #include "logdevice/include/Err.h"
 
-struct evbuffer;
-
 namespace facebook { namespace logdevice {
 
 /**
  * @file Utility class for serializing object into destination buffer (e.g.,
- * serializing Message subclasses onto the network evbuffer). Simplifies of a
+ * serializing Message subclasses onto the network buffer). Simplifies of a
  * lot of boilerplate like handling protocol errors, protocol versions etc.
  * The idea is to allow the callsite (message serializer) to repeatedly call
  * write() without checking for errors every time.
  *
  * If ProtocolWriter encounters an internal error, it moves into an error
  * state which makes subsequent write() calls no-ops.  The error is reported
- * to the socket later, when result*() is called.
+ * to the Connection later, when result*() is called.
  */
 
 class ProtocolWriter {
@@ -56,6 +54,13 @@ class ProtocolWriter {
     virtual int writeWithoutCopy(const void* src,
                                  size_t nbytes,
                                  size_t nwritten) = 0;
+
+    virtual int writeWithoutCopy(const folly::IOBuf* /* buffer */,
+                                 size_t /* nwritten */) {
+      ld_check(false);
+      err = E::INTERNAL;
+      return -1;
+    }
 
     /**
      * @return  a string to identify the buffer destination
@@ -119,7 +124,7 @@ class ProtocolWriter {
   }
 
   /**
-   * Writes the specified range into the socket.
+   * Writes the specified range into the Connection.
    *
    * No-op if the writer has previously encountered an error.
    */
@@ -138,9 +143,11 @@ class ProtocolWriter {
    * Writes data without necessarily copying it.  The Message subclass should
    * ensure the region of memory is valid as long as it exists.
    *
-   * Wraps evbuffer_add_reference() from libevent.
+   * TODO: After we get rid of EvbufferDestination, the IOBuf overload won't
+   *       require the original IOBuf to remain alive after the call.
    */
   void writeWithoutCopy(const void* data, size_t size);
+  void writeWithoutCopy(const folly::IOBuf* buffer);
 
   /**
    * Writes a vector.  std::string also welcome as it is sufficiently
@@ -183,7 +190,7 @@ class ProtocolWriter {
 
   /**
    * Gate all subsequent write*() calls to protocol `proto' or newer.  If the
-   * socket protocol is older, subsequent write*() calls will be no-ops.
+   * Connection protocol is older, subsequent write*() calls will be no-ops.
    */
   void protoGate(uint16_t proto) {
     // It would be very strange to allow a lower protocol after previously
@@ -220,12 +227,12 @@ class ProtocolWriter {
   }
 
   uint16_t proto() const {
-    ld_assert(proto_.hasValue());
+    ld_assert(proto_.has_value());
     return proto_.value();
   }
 
   bool isProtoVersionAllowed() {
-    if (!proto_.hasValue()) {
+    if (!proto_.has_value()) {
       setError(E::PROTO); // protocol version must be set
       return false;
     } else if (proto_.value() < proto_gate_) {
@@ -254,9 +261,6 @@ class ProtocolWriter {
                  folly::Optional<uint16_t> proto = folly::none);
 
   ProtocolWriter(MessageType type,
-                 struct evbuffer* dest, // may be null
-                 folly::Optional<uint16_t> proto = folly::none);
-  ProtocolWriter(MessageType tyoe,
                  folly::IOBuf* iobuf,
                  folly::Optional<uint16_t> proto);
 
@@ -294,7 +298,7 @@ class ProtocolWriter {
   const char* context_;
 
   size_t nwritten_ = 0;
-  // Socket protocol
+  // Connection protocol
   folly::Optional<uint16_t> proto_;
   // Protocol gate; write calls are ignored if `proto_' < `proto_gate_'
   uint16_t proto_gate_ = 0;

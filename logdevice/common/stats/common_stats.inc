@@ -8,8 +8,8 @@
 /* can be included multiple times */
 
 #ifndef STAT_DEFINE
-  #error STAT_DEFINE() macro not defined
-  #define STAT_DEFINE(...)
+#error STAT_DEFINE() macro not defined
+#define STAT_DEFINE(...)
 #endif
 
 // Stats shared between server and client
@@ -22,16 +22,24 @@ STAT_DEFINE(post_request_failed, SUM)
 STAT_DEFINE(worker_requests_executed, SUM)
 // Number of Requests > request_execution_delay_threshold in execute().
 STAT_DEFINE(worker_slow_requests, SUM)
+// Number of Request queue times > request_queue_warning_time_limit in execute().
+STAT_DEFINE(worker_long_queued_requests, SUM)
+// Number of HI_PRI Request queue times > request_queue_warning_time_limit in execute().
+STAT_DEFINE(worker_hi_pri_long_queued_requests, SUM)
 // Number of tasks on background thread that spent > 10 msec executing.
 STAT_DEFINE(background_slow_requests, SUM)
 // TaskQueue stats.
-STAT_DEFINE(worker_choose_hi_pri_work, SUM)
 STAT_DEFINE(worker_enqueued_hi_pri_work, SUM)
 STAT_DEFINE(worker_enqueued_mid_pri_work, SUM)
 STAT_DEFINE(worker_enqueued_lo_pri_work, SUM)
 STAT_DEFINE(worker_executed_hi_pri_work, SUM)
 STAT_DEFINE(worker_executed_mid_pri_work, SUM)
 STAT_DEFINE(worker_executed_lo_pri_work, SUM)
+
+STAT_DEFINE(ssl_context_created, SUM)
+STAT_DEFINE(ssl_session_resumption_attempt, SUM)
+STAT_DEFINE(ssl_session_resumption_success, SUM)
+STAT_DEFINE(ssl_session_resumption_cached, SUM)
 
 // See OverloadDetector
 STAT_DEFINE(num_workers_tracked_by_overload_detector, SUM)
@@ -52,20 +60,8 @@ STAT_DEFINE(metadata_log_read_failed_corruption, SUM)
 STAT_DEFINE(metadata_log_read_dataloss, SUM)
 STAT_DEFINE(metadata_log_read_failed_other, SUM)
 
-
 // Number of CONFIG_CHANGED_Messages received with Action::Reload.
 STAT_DEFINE(config_changed_reload, SUM)
-// Number of CONFIG_CHANGED_Messages ignored because the config is already
-// up-to-date.
-STAT_DEFINE(config_changed_ignored_uptodate, SUM)
-// Number of CONFIG_CHANGED_Messages ignored because the config is not trusted.
-STAT_DEFINE(config_changed_ignored_not_trusted, SUM)
-// Number of CONFIG_CHANGED_Messages ignored because one with same or newer
-// config is already being processed.
-STAT_DEFINE(config_changed_ignored_update_in_progress, SUM)
-// Number of config updates that occurred as a result of
-// CONFIG_CHANGED_Messages.
-STAT_DEFINE(config_changed_update, SUM)
 
 // Number of times nodes configuration polling gets a success result
 STAT_DEFINE(nodes_configuration_polling_success, SUM)
@@ -92,6 +88,9 @@ STAT_DEFINE(nodeset_finder_fallback_to_metadata_log, SUM)
 // LogsConfigManager
 // Number of updates sent to UpdateableLogsConfig by LogsConfigManager
 STAT_DEFINE(logsconfig_manager_published_update, SUM)
+// Number of times a new LocalLogsConfig was published because
+// server config was updated
+STAT_DEFINE(logsconfig_manager_published_server_config_update, SUM)
 // LogsConfig manager receiving updates from the state machine
 STAT_DEFINE(logsconfig_manager_received_update, SUM)
 // The version of the last processed delta/snapshot on this node
@@ -102,6 +101,23 @@ STAT_DEFINE(logsconfig_manager_started, MAX)
 STAT_DEFINE(logsconfig_manager_serialization_errors, SUM)
 // LogsConfig number of deltas applied
 STAT_DEFINE(logsconfig_manager_delta_applied, SUM)
+
+// LogsConfig RSM trimming requests
+STAT_DEFINE(logsconfig_manager_trimming_requests, SUM)
+// LogsConfig RSM snapshotting errors
+STAT_DEFINE(logsconfig_manager_snapshotting_errors, SUM)
+// LogsConfig number of deltas written in LogsConfig state machine
+STAT_DEFINE(logsconfig_manager_delta_written, SUM)
+// How many snapshots has been created
+STAT_DEFINE(logsconfig_manager_snapshot_created, SUM)
+// How many snapshots we have requested
+STAT_DEFINE(logsconfig_manager_snapshot_requested, SUM)
+
+// RSM Snapshot Store stats
+STAT_DEFINE(rsm_legacy_snapshot_store_init, SUM)
+STAT_DEFINE(rsm_log_snapshot_store_init, SUM)
+STAT_DEFINE(rsm_msg_snapshot_store_init, SUM)
+STAT_DEFINE(rsm_local_snapshot_store_init, SUM)
 
 // NodesConfigurationManager
 // Number of new nodes configuration published
@@ -212,6 +228,7 @@ STAT_DEFINE(get_seq_state_attempts_context_historical_metadata, SUM)
 STAT_DEFINE(get_seq_state_attempts_context_get_tail_record, SUM)
 STAT_DEFINE(get_seq_state_attempts_context_reader_monitoring, SUM)
 STAT_DEFINE(get_seq_state_attempts_context_is_log_empty_v2, SUM)
+STAT_DEFINE(get_seq_state_attempts_context_rsm, SUM)
 
 // No. of actual GetSeqStateRequests that were sent out
 STAT_DEFINE(get_seq_state_unique_context_unknown, SUM)
@@ -234,8 +251,9 @@ STAT_DEFINE(get_seq_state_unique_context_historical_metadata, SUM)
 STAT_DEFINE(get_seq_state_unique_context_get_tail_record, SUM)
 STAT_DEFINE(get_seq_state_unique_context_reader_monitoring, SUM)
 STAT_DEFINE(get_seq_state_unique_context_is_log_empty_v2, SUM)
+STAT_DEFINE(get_seq_state_unique_context_rsm, SUM)
 
-// Socket stats.
+// Connection stats.
 STAT_DEFINE(sock_read_events, SUM)
 STAT_DEFINE(sock_time_spent_reading_message, SUM)
 STAT_DEFINE(sock_num_messages_read, SUM)
@@ -252,6 +270,9 @@ STAT_DEFINE(sock_peer_closed_event_proc_time, SUM)
 
 STAT_DEFINE(sock_total_bytes_in_messages_written, SUM)
 STAT_DEFINE(sock_total_time_in_messages_written, SUM)
+STAT_DEFINE(sock_write_sched_delay, SUM)
+STAT_DEFINE(sock_write_sched_size, SUM)
+STAT_DEFINE(sock_write_event_nobufs, SUM)
 
 // Timer Delays
 STAT_DEFINE(wh_timer_sched_delay, SUM)
@@ -301,9 +322,12 @@ STAT_DEFINE(read_streams_stalled, SUM)
 // related to read_streams_stalled, read_streams_healthy and
 // read_streams_non_authoritative.
 STAT_DEFINE(read_streams_stuck, SUM)
+STAT_DEFINE(read_streams_stuck_failing_sync_seq_req, SUM)
 STAT_DEFINE(read_streams_lagging, SUM)
+STAT_DEFINE(read_streams_stuck_or_lagging, SUM)
 STAT_DEFINE(read_streams_stuck_ignoring_overload, SUM)
 STAT_DEFINE(read_streams_lagging_ignoring_overload, SUM)
+STAT_DEFINE(read_streams_stuck_or_lagging_ignoring_overload, SUM)
 
 // Number of read streams creation events.
 // Includes streams that have been destroyed.
@@ -392,6 +416,23 @@ STAT_DEFINE(config_update_same_version, SUM)
 STAT_DEFINE(durability_failures, SUM)
 STAT_DEFINE(durability_total, SUM)
 
+// Network stats
+// Failed to send a message because we are out of send buffer
+STAT_DEFINE(send_failed_nobufs, SUM)
+
+// Connection health check stats. Not accumulated for destroyed threads.
+STAT_DEFINE(num_sockets, SUM)
+STAT_DEFINE(sock_active, SUM)
+STAT_DEFINE(sock_stalled, SUM)
+STAT_DEFINE(sock_app_limited, SUM)
+STAT_DEFINE(sock_receiver_throttled, SUM)
+STAT_DEFINE(sock_network_throttled, SUM)
+// Socket has been inactive for prolonged period of time
+STAT_DEFINE(sock_idle, SUM)
+STAT_DEFINE(slow_socket_detection_time, SUM)
+STAT_DEFINE(sock_health_unknown, SUM)
+STAT_DEFINE(client_connection_close_backlog, SUM)
+STAT_DEFINE(server_connection_close_backlog, SUM)
 #endif // DESTROYING_THREAD
 #endif // RESETTING_STATS
 

@@ -10,8 +10,6 @@
 #include <folly/Memory.h>
 #include <folly/Optional.h>
 #include <gtest/gtest.h>
-#include <opentracing/mocktracer/in_memory_recorder.h>
-#include <opentracing/mocktracer/tracer.h>
 
 #include "logdevice/common/AppenderPrep.h"
 #include "logdevice/common/Checksum.h"
@@ -22,6 +20,7 @@
 #include "logdevice/common/RateLimiter.h"
 #include "logdevice/common/Sequencer.h"
 #include "logdevice/common/SequencerLocator.h"
+#include "logdevice/common/request_util.h"
 #include "logdevice/common/settings/Settings.h"
 #include "logdevice/common/test/TestUtil.h"
 
@@ -88,17 +87,10 @@ class APPEND_MessageTest : public ::testing::Test {
   static logid_t TEST_LOG;
 
   explicit APPEND_MessageTest()
-      : settings_(create_default_settings<Settings>()) {
+      : settings_(create_default_settings<Settings>()),
+        processor_(make_test_processor(settings_)) {
     // build a Configuration object and use it to initialize a Sequencer
-    Configuration::Node node;
-    node.address = Sockaddr("127.0.0.1", "20034");
-    node.gossip_address = Sockaddr("127.0.0.1", "20035");
-    node.generation = 1;
-    node.addStorageRole();
-    Configuration::NodesConfig nodes({{0, std::move(node)}});
-
-    logsconfig::LogAttributes log_attrs;
-    log_attrs.set_replicationFactor(1);
+    auto log_attrs = logsconfig::LogAttributes().with_replicationFactor(1);
     auto logs_config = std::make_unique<configuration::LocalLogsConfig>();
     logs_config->insert(boost::icl::right_open_interval<logid_t::raw_type>(
                             TEST_LOG.val_, TEST_LOG.val_ + 1),
@@ -110,8 +102,9 @@ class APPEND_MessageTest : public ::testing::Test {
     ml_config.sequencers_provision_epoch_store = false;
     ml_config.sequencers_write_metadata_logs = false;
     config_ = std::make_shared<Configuration>(
-        ServerConfig::fromDataTest(__FILE__, nodes, std::move(ml_config)),
-        std::move(logs_config));
+        ServerConfig::fromDataTest(__FILE__, std::move(ml_config)),
+        std::move(logs_config),
+        createSimpleNodesConfig(1));
 
     settings_.enable_sticky_copysets = true;
 
@@ -131,8 +124,10 @@ class APPEND_MessageTest : public ::testing::Test {
     metadata->h.epoch = metadata->h.effective_since = epoch;
 
     sequencer_->startActivation([](logid_t) { return 0; });
-    sequencer_->completeActivationWithMetaData(
-        epoch, config_, std::move(metadata));
+    run_on_worker(processor_.get(), 1, [&]() {
+      return sequencer_->completeActivationWithMetaData(
+          epoch, config_, std::move(metadata));
+    });
 
     current_epoch_ = epoch;
   }
@@ -147,18 +142,12 @@ class APPEND_MessageTest : public ::testing::Test {
          APPEND_flags_t flags = APPEND_flags_t(APPEND_Header::CHECKSUM_PARITY),
          epoch_t seen_epoch = EPOCH_INVALID);
 
-  std::shared_ptr<MockAppenderPrep> createWithMockE2ETracing(
-      logid_t log_id,
-      std::shared_ptr<opentracing::Tracer> e2e_tracer = nullptr,
-      std::unique_ptr<opentracing::Span> append_msg_recv_span = nullptr,
-      APPEND_flags_t flags = APPEND_flags_t(APPEND_Header::CHECKSUM_PARITY),
-      epoch_t seen_epoch = EPOCH_INVALID);
-
   std::shared_ptr<Sequencer> sequencer_;
   std::shared_ptr<Configuration> config_;
   epoch_t current_epoch_{1};
   Settings settings_;
   PrincipalIdentity principal_;
+  std::shared_ptr<Processor> processor_;
 };
 logid_t APPEND_MessageTest::TEST_LOG(1);
 
@@ -217,14 +206,11 @@ class MockAppenderPrep : public AppenderPrep {
     sequencer_nodes_[log_id] = node_id;
   }
 
-  std::shared_ptr<opentracing::Span> getAppenderSpan() {
-    return appender_span_;
-  }
-
   std::shared_ptr<Sequencer> sequencer_;
   RateLimiter* limiter_{nullptr};
   bool can_activate_{true};
   NodeID my_node_id_;
+  bool is_client_connected_{true};
   // if set, next call to runAppender() returns this value instead of proxying
   // it to Sequencer
   folly::Optional<Status> next_status_;
@@ -314,9 +300,9 @@ class MockAppenderPrep : public AppenderPrep {
       running_appenders_.push_back(&appender);
     }
 
-    if (next_status_.hasValue()) {
+    if (next_status_.has_value()) {
       err = next_status_.value();
-      next_status_.clear();
+      next_status_.reset();
       return err != E::OK ? RunAppenderStatus::ERROR_DELETE
                           : RunAppenderStatus::SUCCESS_KEEP;
     }
@@ -345,6 +331,9 @@ class MockAppenderPrep : public AppenderPrep {
   }
   const PrincipalIdentity* getPrincipal() override {
     return &owner_->principal_;
+  }
+  bool isClientConnected() const {
+    return is_client_connected_;
   }
   void isAllowed(std::shared_ptr<PermissionChecker> permission_checker,
                  const PrincipalIdentity& principal,
@@ -413,33 +402,10 @@ const Settings& MockEpochSequencer::getSettings() const {
 
 class APPEND_MessageTest_MockAppender : public Appender {
  public:
-  explicit APPEND_MessageTest_MockAppender(
-      epoch_t seen_epoch,
-      STORE_flags_t flags = STORE_flags_t(0))
-      : Appender(
-            nullptr,
-            std::make_shared<NoopTraceLogger>(UpdateableConfig::createEmpty()),
-            std::chrono::seconds(1),
-            request_id_t(1),
-            passthru_flags(flags),
-            APPEND_MessageTest::TEST_LOG,
-            PayloadHolder(dummyPayload, PayloadHolder::UNOWNED),
-            seen_epoch,
-            50) {}
-
-  explicit APPEND_MessageTest_MockAppender(
-      STORE_flags_t flags = STORE_flags_t(0))
-      : APPEND_MessageTest_MockAppender(epoch_t(0), flags) {}
-
-  explicit APPEND_MessageTest_MockAppender(
-      const MockAppenderPrep& prep,
-      STORE_flags_t flags = STORE_flags_t(0))
-      : APPEND_MessageTest_MockAppender(prep.getSeen(), flags) {}
-
-  explicit APPEND_MessageTest_MockAppender(
-      const MockAppenderPrep& prep,
-      PayloadHolder ph,
-      STORE_flags_t flags = STORE_flags_t(0))
+  APPEND_MessageTest_MockAppender(
+      STORE_flags_t flags = STORE_flags_t(0),
+      epoch_t seen_epoch = epoch_t(0),
+      PayloadHolder ph = PayloadHolder::copyString("mirko"))
       : Appender(
             nullptr,
             std::make_shared<NoopTraceLogger>(UpdateableConfig::createEmpty()),
@@ -448,24 +414,18 @@ class APPEND_MessageTest_MockAppender : public Appender {
             passthru_flags(flags),
             APPEND_MessageTest::TEST_LOG,
             std::move(ph),
-            prep.getSeen(),
+            seen_epoch,
             50) {}
+
+  APPEND_MessageTest_MockAppender(const MockAppenderPrep& prep,
+                                  PayloadHolder ph,
+                                  STORE_flags_t flags = STORE_flags_t(0))
+      : APPEND_MessageTest_MockAppender(flags, prep.getSeen(), std::move(ph)) {}
+
   explicit APPEND_MessageTest_MockAppender(
       const MockAppenderPrep& prep,
-      std::shared_ptr<opentracing::Tracer> e2e_tracer,
-      std::shared_ptr<opentracing::Span> appender_span)
-      : Appender(
-            nullptr,
-            std::make_shared<NoopTraceLogger>(UpdateableConfig::createEmpty()),
-            std::chrono::seconds(1),
-            request_id_t(1),
-            passthru_flags(STORE_flags_t(0)),
-            APPEND_MessageTest::TEST_LOG,
-            PayloadHolder(dummyPayload, PayloadHolder::UNOWNED),
-            prep.getSeen(),
-            50,
-            e2e_tracer,
-            appender_span) {}
+      STORE_flags_t flags = STORE_flags_t(0))
+      : APPEND_MessageTest_MockAppender(flags, prep.getSeen()) {}
 
   int start(std::shared_ptr<EpochSequencer> /*epoch_sequencer*/,
             lsn_t /*lsn*/) override {
@@ -474,17 +434,15 @@ class APPEND_MessageTest_MockAppender : public Appender {
   }
 
  private:
-  static Payload dummyPayload;
-
   // Passthru flags from AppenderPrep to Appender
   STORE_flags_t passthru_flags(STORE_flags_t flags) {
     return flags &
         (APPEND_Header::CHECKSUM | APPEND_Header::CHECKSUM_64BIT |
-         APPEND_Header::CHECKSUM_PARITY | APPEND_Header::BUFFERED_WRITER_BLOB);
+         APPEND_Header::CHECKSUM_PARITY | APPEND_Header::BUFFERED_WRITER_BLOB |
+         APPEND_Header::PAYLOAD_GROUP);
   }
 };
 using MockAppender = APPEND_MessageTest_MockAppender;
-Payload MockAppender::dummyPayload("mirko", strlen("mirko"));
 
 std::shared_ptr<MockAppenderPrep>
 APPEND_MessageTest::create(logid_t log_id,
@@ -501,33 +459,6 @@ APPEND_MessageTest::create(logid_t log_id,
   prep->setAppendMessage(header, LSN_INVALID, ClientID(1), attrs);
   prep->sequencer_ = sequencer_;
   prep->my_node_id_ = NodeID(0, 1);
-  return prep;
-}
-
-std::shared_ptr<MockAppenderPrep> APPEND_MessageTest::createWithMockE2ETracing(
-    logid_t log_id,
-    std::shared_ptr<opentracing::Tracer> tracer,
-    std::unique_ptr<opentracing::Span> append_msg_recv_span,
-    APPEND_flags_t flags,
-    epoch_t seen_epoch) {
-  APPEND_Header header{};
-  header.logid = log_id;
-  header.seen = seen_epoch;
-  header.flags = flags;
-
-  auto prep = std::make_shared<MockAppenderPrep>(this);
-
-  AppendAttributes attrs;
-  attrs.optional_keys[KeyType::FINDKEY] = "abcdefgh";
-  prep->setAppendMessage(header,
-                         LSN_INVALID,
-                         ClientID(1),
-                         attrs,
-                         tracer,
-                         std::move(append_msg_recv_span));
-  prep->sequencer_ = sequencer_;
-  prep->my_node_id_ = NodeID(0, 1);
-
   return prep;
 }
 
@@ -608,6 +539,19 @@ TEST_F(APPEND_MessageTest, Basic) {
     // N2 is boycotted
     prep->execute(std::move(a));
     ASSERT_RUNNING(prep, {raw});
+  }
+  {
+    std::unique_ptr<Appender> a(new MockAppender);
+    auto prep = create(log1);
+    prep->my_node_id_ = N1;
+    prep->setSequencer(log1, N1);
+    prep->setAlive({N1, N2});
+    prep->is_client_connected_ = false;
+
+    // Since client is disconnected, we do not expect
+    // a running appender
+    prep->execute(std::move(a));
+    ASSERT_EQ(0, prep->running_appenders_.size());
   }
 }
 
@@ -936,7 +880,7 @@ TEST_F(APPEND_MessageTest, CorruptionBeforeDataStore) {
 
     checksum_bytes(Slice(data, sizeof(data)), 32, new_data);
     memcpy(new_data + 4, data, sizeof(data));
-    PayloadHolder ph(new_data, new_size);
+    PayloadHolder ph(PayloadHolder::TAKE_OWNERSHIP, new_data, new_size);
 
     uint32_t flags2 = flags | APPEND_Header::CHECKSUM;
     auto prep = create(log, flags2);
@@ -954,7 +898,7 @@ TEST_F(APPEND_MessageTest, CorruptionBeforeDataStore) {
 
     checksum_bytes(Slice(data, sizeof(data)), 64, new_data);
     memcpy(new_data + 8, data, sizeof(data));
-    PayloadHolder ph(new_data, new_size);
+    PayloadHolder ph(PayloadHolder::TAKE_OWNERSHIP, new_data, new_size);
 
     uint32_t flags2 = flags | APPEND_Header::CHECKSUM |
         APPEND_Header::CHECKSUM_64BIT | APPEND_Header::CHECKSUM_PARITY;
@@ -976,7 +920,7 @@ TEST_F(APPEND_MessageTest, CorruptionBeforeDataStore) {
     // Copy currupted checksum bits into the data for the payload
     memcpy(new_data, &corruptedBits, 4);
     memcpy(new_data + 4, data, sizeof(data));
-    PayloadHolder ph(new_data, new_size);
+    PayloadHolder ph(PayloadHolder::TAKE_OWNERSHIP, new_data, new_size);
 
     uint32_t flags2 = flags | APPEND_Header::CHECKSUM;
     auto prep = create(log, flags2);
@@ -998,7 +942,7 @@ TEST_F(APPEND_MessageTest, CorruptionBeforeDataStore) {
     // Copy currupted checksum bits into the data for the payload
     memcpy(new_data, &corruptedBits, 8);
     memcpy(new_data + 8, data, sizeof(data));
-    PayloadHolder ph(new_data, new_size);
+    PayloadHolder ph(PayloadHolder::TAKE_OWNERSHIP, new_data, new_size);
 
     uint32_t flags2 = flags | APPEND_Header::CHECKSUM |
         APPEND_Header::CHECKSUM_64BIT | APPEND_Header::CHECKSUM_PARITY;
@@ -1012,53 +956,5 @@ TEST_F(APPEND_MessageTest, CorruptionBeforeDataStore) {
     prep->execute(std::move(a));
     ASSERT_RESULTS(prep, std::make_pair(E::BADPAYLOAD, NodeID()));
   }
-}
-
-TEST_F(APPEND_MessageTest, E2ETracing) {
-  // simple test to check that spans are created and all works as expected
-  const logid_t log(1);
-  const NodeID N0(0, 1);
-
-  auto recorder = new opentracing::mocktracer::InMemoryRecorder{};
-  opentracing::mocktracer::MockTracerOptions tracer_options;
-  tracer_options.recorder.reset(recorder);
-  auto tracer = std::make_shared<opentracing::mocktracer::MockTracer>(
-      opentracing::mocktracer::MockTracerOptions{std::move(tracer_options)});
-
-  // create a span to be used as a span coming from client side
-  auto span = tracer->StartSpan("Mock_APPEND_Message_received");
-
-  {
-    auto prep = createWithMockE2ETracing(log, tracer, std::move(span));
-
-    // the appender span created on the appender prep is passed to the appender
-    // constructor
-    auto appender_span = prep->getAppenderSpan();
-    std::unique_ptr<Appender> a(new MockAppender(*prep, tracer, appender_span));
-
-    // simple configuration for test purposes
-    prep->my_node_id_ = N0;
-    prep->setSequencer(log, N0);
-    prep->setAlive({N0});
-
-    prep->execute(std::move(a));
-  }
-
-  // so far the execution should have created span
-  // one span is created in this test
-  ASSERT_TRUE(recorder->spans().size() > 1);
-
-  // the appender span is the last one to finish
-  auto appender_span_reference_span_id =
-      recorder->spans().back().references[0].span_id;
-  auto appender_span_reference_type =
-      recorder->spans().back().references[0].reference_type;
-
-  // the span id of the append message receive (the first span created)
-  auto append_recv_span_id = recorder->spans().front().span_context.span_id;
-
-  ASSERT_EQ(appender_span_reference_span_id, append_recv_span_id);
-  ASSERT_EQ(appender_span_reference_type,
-            opentracing::SpanReferenceType::FollowsFromRef);
 }
 }} // namespace facebook::logdevice

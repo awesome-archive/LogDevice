@@ -6,10 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-include "logdevice/admin/if/common.thrift"
+include "logdevice/common/if/common.thrift"
 include "logdevice/admin/if/nodes.thrift"
 
 namespace cpp2 facebook.logdevice.thrift
+namespace go logdevice.admin.if.cluster_membership
 namespace py3 logdevice.admin
 
 /**
@@ -195,4 +196,54 @@ struct MarkShardsAsProvisionedResponse {
    * The version of the updated NodesConfiguration.
    */
   2: common.unsigned64 new_nodes_configuration_version,
+}
+
+////////////////////////////////////////////////////////////////////////////
+////////////////////// Bump Generation Request /////////////////////////////
+////////////////////////////////////////////////////////////////////////////
+
+/**
+ * Request to bump the generation of all the nodes that match the passed
+ * filters.
+ */
+struct BumpGenerationRequest {
+  /**
+   * List of NodeFilters to bump their generationin the nodes configuration.
+   * Matches from each filter are union-ed together and are updated in the same
+   * nodes configuration transaction.
+   */
+  1: list<nodes.NodesFilter> node_filters,
+}
+
+struct BumpGenerationResponse {
+  /**
+   * List of nodes that we successfully bumped the generation for.
+   */
+  1: list<common.NodeID> bumped_nodes,
+  /**
+   * The version of the updated NodesConfiguration.
+   */
+  2: common.unsigned64 new_nodes_configuration_version,
+}
+
+////////////////////////////////////////////////////////////////////////////
+////////////////////// Boostrap Cluster Request ////////////////////////////
+////////////////////////////////////////////////////////////////////////////
+
+/**
+ * Request to finalize the bootstrapping of the cluster
+ */
+struct BootstrapClusterRequest {
+  /**
+   * The metadata replication property that this cluster will have. This will
+   * be used to provision the initial metadata nodeset.
+   */
+  1: common.ReplicationProperty metadata_replication_property,
+}
+
+struct BootstrapClusterResponse {
+  /**
+   * The version of the updated NodesConfiguration.
+   */
+  1: common.unsigned64 new_nodes_configuration_version,
 }

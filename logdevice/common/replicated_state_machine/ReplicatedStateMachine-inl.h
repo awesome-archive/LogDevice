@@ -6,22 +6,41 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include <folly/Optional.h>
+
 #include "logdevice/common/Checksum.h"
+#include "logdevice/common/SnapshotStoreTypes.h"
 #include "logdevice/common/Timestamp.h"
+#include "logdevice/common/TrimRequest.h"
 #include "logdevice/common/replicated_state_machine/ReplicatedStateMachine-enum.h"
+#include "logdevice/common/replicated_state_machine/TrimRSMRequest.h"
 #include "logdevice/common/replicated_state_machine/logging.h"
 
 namespace facebook { namespace logdevice {
 
 template <typename T, typename D>
-ReplicatedStateMachine<T, D>::ReplicatedStateMachine(RSMType rsm_type,
-                                                     logid_t delta_log_id,
-                                                     logid_t snapshot_log_id)
+ReplicatedStateMachine<T, D>::ReplicatedStateMachine(
+    RSMType rsm_type,
+    std::unique_ptr<RSMSnapshotStore> snapshot_store,
+    logid_t delta_log_id,
+    logid_t snapshot_log_id)
     : rsm_type_(rsm_type),
       delta_log_id_(delta_log_id),
       snapshot_log_id_(snapshot_log_id),
+      snapshot_store_(std::move(snapshot_store)),
       callbackHelper_(this) {
   ld_check(delta_log_id_ != LOGID_INVALID);
+}
+
+template <typename T, typename D>
+void ReplicatedStateMachine<T, D>::startFetchingSnapshot() {
+  if (snapshot_store_) {
+    rsm_info(rsm_type_, "Using RSMSnapshotStore...");
+    initSnapshotFetchTimer();
+  } else {
+    rsm_info(rsm_type_, "Using old RSM code...");
+    getSnapshotLogTailLSN();
+  }
 }
 
 template <typename T, typename D>
@@ -29,18 +48,94 @@ void ReplicatedStateMachine<T, D>::start() {
   // Initialize `data_` with a default value that we'll use if the snapshot
   // log is empty.
   data_ = makeDefaultState(version_);
+  advertiseVersions(RsmVersionType::IN_MEMORY, version_);
 
   if (snapshot_log_id_ == LOGID_INVALID) {
     onBaseSnapshotRetrieved();
   } else {
-    getSnapshotLogTailLSN();
+    startFetchingSnapshot();
   }
   stopped_ = false;
 }
 
 template <typename T, typename D>
+void ReplicatedStateMachine<T, D>::scheduleStop() {
+  if (!read_stream_deletion_timer_.isAssigned()) {
+    read_stream_deletion_timer_.assign([this] { stop(); });
+    read_stream_deletion_timer_.activate(std::chrono::microseconds(0));
+  }
+}
+
+template <typename T, typename D>
+void ReplicatedStateMachine<T, D>::getSnapshot() {
+  auto rsm_type = rsm_type_;
+  auto ticket = callbackHelper_.ticket();
+  auto snapshot_cb = [rsm_type, ticket](
+                         Status st,
+                         std::string snapshot_blob_out,
+                         RSMSnapshotStore::SnapshotAttributes snapshot_attrs) {
+    rsm_info(rsm_type,
+             "getSnapshot()'s callback. st:%s, snapshot blob size:%zu, "
+             "attrs:(base_ver:%s, ts:%lu)",
+             error_name(st),
+             snapshot_blob_out.size(),
+             lsn_to_string(snapshot_attrs.base_version).c_str(),
+             snapshot_attrs.timestamp.count());
+
+    ticket.postCallbackRequest([st,
+                                snapshot_blob_out,
+                                snapshot_attrs,
+                                rsm_type](ReplicatedStateMachine<T, D>* s) {
+      if (!s) {
+        rsm_info(rsm_type, "State machine doesn't exist");
+        return;
+      }
+
+      Payload payload;
+      switch (st) {
+        case E::OK:
+          s->snapshot_sync_ = snapshot_attrs.base_version;
+          payload = Payload(snapshot_blob_out.data(), snapshot_blob_out.size());
+          if (!s->processSnapshot(payload, snapshot_attrs)) {
+            s->activateSnapshotFetchTimer();
+          }
+          break;
+        case E::UPTODATE:
+        case E::EMPTY:
+          s->onBaseSnapshotRetrieved();
+          break;
+        case E::STALE:
+        case E::NOTFOUND:
+        case E::FAILED:
+        case E::TIMEDOUT:
+        case E::INPROGRESS:
+        case E::TOOBIG:
+          // Let snapshot timer retry
+          s->activateSnapshotFetchTimer();
+          break;
+        default:
+          rsm_error(rsm_type, "Unexpected status:%s received", error_name(st));
+          s->activateSnapshotFetchTimer();
+      }
+    });
+  };
+
+  lsn_t ver = std::max(waiting_for_snapshot_, version_);
+  rsm_info(rsm_type_,
+           "Fetching snapshot with ver:%s, (waiting_for_snapshot_:%s, "
+           "version_:%s). sync_state_:%d",
+           lsn_to_string(ver).c_str(),
+           lsn_to_string(waiting_for_snapshot_).c_str(),
+           lsn_to_string(version_).c_str(),
+           (int)sync_state_);
+  snapshot_store_->getSnapshot(ver, std::move(snapshot_cb));
+}
+
+template <typename T, typename D>
 void ReplicatedStateMachine<T, D>::stop() {
-  ld_check(!stopped_);
+  if (stopped_) {
+    return;
+  }
 
   auto stop_read_stream = [](read_stream_id_t& rsid) {
     if (rsid != READ_STREAM_ID_INVALID) {
@@ -54,8 +149,106 @@ void ReplicatedStateMachine<T, D>::stop() {
 
   stopped_ = true;
   cancelGracePeriodForSnapshotting();
+  read_stream_deletion_timer_.cancel();
   // This will unblock anyone that called wait().
   sem_.post();
+}
+
+template <typename T, typename D>
+void ReplicatedStateMachine<T, D>::trim(std::function<void(Status st)> trim_cb,
+                                        std::chrono::milliseconds retention) {
+  auto settings = Worker::settings();
+  if (!snapshot_store_) {
+    // For no store(legacy code), we need to trim snapshot followed by delta
+    // log (via TrimRSMRequest)
+    legacyTrim(std::move(trim_cb), retention, false /* trim snapshot only */);
+  } else {
+    // 1. Trim snapshot log if applicable
+    if (settings.rsm_snapshot_store_type == SnapshotStoreType::LOG) {
+      // For LOG based snapshot store, getDurableVersion() can be used to trim
+      // delta log, therefore we only trim snapshot log below
+      legacyTrim(trim_cb, retention, true /* trim snapshot only */);
+    }
+    // 2. Trim delta
+    trimDelta(std::move(trim_cb));
+  }
+}
+
+// Adapted from TrimRSMRetryHandler::trimImpl()
+template <typename T, typename D>
+void ReplicatedStateMachine<T, D>::legacyTrim(
+    std::function<void(Status st)> trim_cb,
+    std::chrono::milliseconds retention,
+    bool snapshot_only) {
+  auto cb = [this, trim_cb](Status st) {
+    if (st != E::OK) {
+      rsm_error(rsm_type_, "Could not trim snapshot log: %s.", error_name(st));
+    }
+    trim_cb(st);
+  };
+
+  rsm_info(rsm_type_,
+           "Attempting TrimRSMRequest for snapshot log%s",
+           snapshot_only ? "" : " and delta log.");
+  auto cur_timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::high_resolution_clock::now().time_since_epoch());
+  const auto trim_and_findtime_timeout = std::chrono::seconds{20};
+  std::unique_ptr<Request> rq =
+      std::make_unique<TrimRSMRequest>(delta_log_id_,
+                                       snapshot_log_id_,
+                                       cur_timestamp - retention,
+                                       cb,
+                                       Worker::onThisThread()->idx_,
+                                       Worker::onThisThread()->worker_type_,
+                                       rsm_type_,
+                                       false, /* don't trim everything */
+                                       snapshot_only,
+                                       trim_and_findtime_timeout,
+                                       trim_and_findtime_timeout);
+  Worker::onThisThread()->processor_->postWithRetrying(rq);
+}
+
+template <typename T, typename D>
+void ReplicatedStateMachine<T, D>::trimDelta(
+    std::function<void(Status st)> trim_cb) {
+  auto ver_cb = [this, trim_cb](Status st, lsn_t durable_ver_out) {
+    if (st != E::OK) {
+      trim_cb(st);
+      return;
+    }
+    if (durable_ver_out == LSN_INVALID) {
+      // no valid trim point found
+      trim_cb(E::NOTFOUND);
+      return;
+    }
+    trimDeltaUpto(durable_ver_out, std::move(trim_cb));
+  };
+  snapshot_store_->getDurableVersion(std::move(ver_cb));
+}
+
+template <typename T, typename D>
+void ReplicatedStateMachine<T, D>::trimDeltaUpto(lsn_t trim_upto,
+                                                 trim_cb_t trim_cb) {
+  const auto trim_timeout = std::chrono::seconds{20};
+  auto delta_log_id = delta_log_id_;
+  ld_info("Trimming delta log:%lu upto lsn:%s",
+          delta_log_id_.val_,
+          lsn_to_string(trim_upto).c_str());
+
+  auto on_trimmed_cb = [delta_log_id, trim_cb](Status st) {
+    ld_info("Trimming for log:%lu finished with status:%s",
+            delta_log_id.val_,
+            error_name(st));
+    trim_cb(st);
+  };
+
+  auto trimreq = std::make_unique<TrimRequest>(
+      nullptr, delta_log_id_, trim_upto, trim_timeout, on_trimmed_cb);
+  trimreq->setTargetWorker(Worker::onThisThread()->idx_);
+  trimreq->setWorkerType(Worker::onThisThread()->worker_type_);
+  trimreq->bypassWriteTokenCheck();
+  std::unique_ptr<Request> req(std::move(trimreq));
+  Worker::onThisThread()->processor_->postWithRetrying(req);
 }
 
 template <typename T, typename D>
@@ -94,12 +287,19 @@ read_stream_id_t ReplicatedStateMachine<T, D>::createBasicReadStream(
       ClientReadStreamBufferType::CIRCULAR,
       100,
       std::move(deps),
-      processor->config_);
+      processor->config_,
+      nullptr,
+      nullptr,
+      MonitoringTier::MEDIUM_PRI,
+      std::set<std::string>{},
+      SCDCopysetReordering(processor->settings()->rsm_scd_copyset_reordering));
 
   // SCD adds complexity and may incur latency on storage node failures. Since
   // replicated state machines should be low volume logs, we can afford to not
   // use that optimization.
-  read_stream->forceNoSingleCopyDelivery();
+  if (w->settings().rsm_force_all_send_all) {
+    read_stream->forceNoSingleCopyDelivery();
+  }
 
   w->clientReadStreams().insertAndStart(std::move(read_stream));
 
@@ -119,31 +319,27 @@ void ReplicatedStateMachine<T, D>::resumeReadStream(read_stream_id_t id) {
 template <typename T, typename D>
 void ReplicatedStateMachine<T, D>::getSnapshotLogTailLSN() {
   rsm_info(rsm_type_, "Retrieving tail lsn of snapshot log...");
+  ld_check_eq(sync_state_, SyncState::SYNC_SNAPSHOT);
+  ld_check(sync_sequencer_request_ == nullptr);
 
-  auto ticket = callbackHelper_.ticket();
-  auto cb_wrapper =
-      [ticket](Status st,
-               NodeID /*seq*/,
-               lsn_t next_lsn,
-               std::unique_ptr<LogTailAttributes> /*tail*/,
-               std::shared_ptr<const EpochMetaDataMap> /*metadata_map*/,
-               std::shared_ptr<TailRecord> /*tail_record*/,
-               folly::Optional<bool> /*is_log_empty*/) {
+  sync_sequencer_request_ = std::make_unique<SyncSequencerRequest>(
+      snapshot_log_id_,
+      /* flags */ 0,
+      [this](Status st,
+             NodeID /*seq*/,
+             lsn_t next_lsn,
+             std::unique_ptr<LogTailAttributes> /*tail*/,
+             std::shared_ptr<const EpochMetaDataMap> /*metadata_map*/,
+             std::shared_ptr<TailRecord> /*tail_record*/,
+             folly::Optional<bool> /*is_log_empty*/) {
         const lsn_t tail_lsn =
             next_lsn <= LSN_OLDEST ? LSN_OLDEST : next_lsn - 1;
-        ticket.postCallbackRequest(
-            [st, tail_lsn](ReplicatedStateMachine<T, D>* s) {
-              if (s) {
-                s->onGotSnapshotLogTailLSN(st, LSN_OLDEST, tail_lsn);
-              }
-            });
-      };
-
-  std::unique_ptr<Request> req = std::make_unique<SyncSequencerRequest>(
-      snapshot_log_id_,
-      SyncSequencerRequest::INCLUDE_TAIL_ATTRIBUTES,
-      cb_wrapper);
-  postRequestWithRetrying(req);
+        sync_sequencer_request_.reset();
+        onGotSnapshotLogTailLSN(st, LSN_OLDEST, tail_lsn);
+      },
+      GetSeqStateRequest::Context::RSM);
+  int rv = sync_sequencer_request_->start();
+  ld_check(rv == 0);
 }
 
 template <typename T, typename D>
@@ -177,24 +373,26 @@ void ReplicatedStateMachine<T, D>::onGotSnapshotLogTailLSN(Status st,
 
 template <typename T, typename D>
 int ReplicatedStateMachine<T, D>::deserializeSnapshot(
-    const DataRecord& record,
+    const Payload& payload,
+    const RSMSnapshotStore::SnapshotAttributes& snapshot_attrs,
     std::unique_ptr<T>& out,
     RSMSnapshotHeader& header_out) const {
-  const auto header_sz =
-      RSMSnapshotHeader::deserialize(record.payload, header_out);
+  const auto header_sz = RSMSnapshotHeader::deserialize(payload, header_out);
   if (header_sz < 0) {
-    rsm_error(rsm_type_,
-              "Failed to deserialize header of snapshot record with lsn %s",
-              lsn_to_string(record.attrs.lsn).c_str());
+    rsm_error(rsm_type_, "Failed to deserialize header of snapshot.");
     err = E::BADMSG;
     return -1;
   }
+  rsm_debug(rsm_type_,
+            "Deserialized snapshot with base version:%s, delta ptr:%s",
+            lsn_to_string(header_out.base_version).c_str(),
+            lsn_to_string(header_out.delta_log_read_ptr).c_str());
 
-  const uint8_t* ptr = reinterpret_cast<const uint8_t*>(record.payload.data());
+  const uint8_t* ptr = reinterpret_cast<const uint8_t*>(payload.data());
   ptr += header_sz;
 
   std::unique_ptr<uint8_t[]> buf_decompressed;
-  Payload p(ptr, record.payload.size() - header_sz);
+  Payload p(ptr, payload.size() - header_sz);
 
   if (header_out.flags & RSMSnapshotHeader::ZSTD_COMPRESSION) {
     size_t uncompressed_size = ZSTD_getDecompressedSize(p.data(), p.size());
@@ -226,8 +424,12 @@ int ReplicatedStateMachine<T, D>::deserializeSnapshot(
     p = Payload(buf_decompressed.get(), uncompressed_size);
   }
 
-  std::chrono::milliseconds timestamp = record.attrs.timestamp;
+  std::chrono::milliseconds timestamp = snapshot_attrs.timestamp;
   auto new_val = deserializeState(p, header_out.base_version, timestamp);
+  rsm_debug(rsm_type_,
+            "%s deserializeState() for base_version:%s",
+            new_val ? "Successfully finished" : "Failed during",
+            lsn_to_string(header_out.base_version).c_str());
   if (new_val) {
     out = std::move(new_val);
     return 0;
@@ -261,6 +463,9 @@ bool ReplicatedStateMachine<T, D>::canFastForward(lsn_t lsn) {
 template <typename T, typename D>
 bool ReplicatedStateMachine<T, D>::onSnapshotRecord(
     std::unique_ptr<DataRecord>& record) {
+  rsm_debug(rsm_type_,
+            "Received record %s",
+            lsn_to_string(record->attrs.lsn).c_str());
   if (sync_state_ == SyncState::SYNC_SNAPSHOT &&
       record->attrs.lsn < snapshot_sync_) {
     // Do not deserialize this snapshot just yet. We'll look at it only when we
@@ -270,22 +475,25 @@ bool ReplicatedStateMachine<T, D>::onSnapshotRecord(
   }
 
   last_snapshot_record_.reset();
-  return processSnapshot(record);
+  return processSnapshot(record->payload,
+                         RSMSnapshotStore::SnapshotAttributes(
+                             record->attrs.lsn, record->attrs.timestamp));
 }
 
 template <typename T, typename D>
 bool ReplicatedStateMachine<T, D>::processSnapshot(
-    std::unique_ptr<DataRecord>& record) {
+    const Payload& payload,
+    const RSMSnapshotStore::SnapshotAttributes& snapshot_attrs) {
   std::unique_ptr<T> data;
   RSMSnapshotHeader header;
-  const int rv = deserializeSnapshot(*record, data, header);
+  const int rv = deserializeSnapshot(payload, snapshot_attrs, data, header);
 
   if (rv != 0) {
     // NOTE: We cannot make progress if this is the last snapshot and it's bad,
     // this means that the RSM will stall unless a newer snapshot is written.
     rsm_critical(rsm_type_,
-                 "Could not deserialize snapshot record with lsn %s: %s",
-                 lsn_to_string(record->attrs.lsn).c_str(),
+                 "Could not deserialize snapshot with version:%s, err:%s",
+                 lsn_to_string(snapshot_attrs.base_version).c_str(),
                  error_name(err));
     if (!can_skip_bad_snapshot_) {
       return false;
@@ -296,6 +504,9 @@ bool ReplicatedStateMachine<T, D>::processSnapshot(
     if (sync_state_ == SyncState::TAILING &&
         waiting_for_snapshot_ == LSN_INVALID &&
         !canFastForward(header.base_version)) {
+      rsm_debug(rsm_type_,
+                "Cannot fast forward to %s",
+                lsn_to_string(header.base_version).c_str());
       return false;
     }
 
@@ -307,27 +518,54 @@ bool ReplicatedStateMachine<T, D>::processSnapshot(
         RSMSnapshotHeader::CONTAINS_DELTA_LOG_READ_PTR_AND_LENGTH) {
       last_snapshot_last_read_ptr_ = header.delta_log_read_ptr;
     } else {
-      last_snapshot_last_read_ptr_ = LSN_OLDEST;
+      last_snapshot_last_read_ptr_ = LSN_INVALID;
     }
     delta_log_byte_offset_ = header.byte_offset;
     delta_log_offset_ = header.offset;
-    snapshot_log_timestamp_ = record->attrs.timestamp;
-
-    if (sync_state_ == SyncState::TAILING || deliver_while_replaying_) {
-      notifySubscribers();
-    }
+    snapshot_log_timestamp_ = snapshot_attrs.timestamp;
 
     rsm_info(rsm_type_,
-             "Applied snapshot record with lsn %s timestamp %lu, "
-             "base version %s, delta_log_read_ptr %s (serialization format "
-             "version was %d)",
-             lsn_to_string(record->attrs.lsn).c_str(),
-             record->attrs.timestamp.count(),
+             "Applied snapshot with lsn:%s, timestamp:%lu, base version:%s,"
+             " delta_log_read_ptr:%s (serialization format version was:%d),"
+             " sync_state_:%d, deliver_while_replaying:%d",
+             lsn_to_string(snapshot_attrs.base_version).c_str(),
+             snapshot_attrs.timestamp.count(),
              lsn_to_string(header.base_version).c_str(),
              (header.format_version >=
               RSMSnapshotHeader::CONTAINS_DELTA_LOG_READ_PTR_AND_LENGTH)
                  ? lsn_to_string(last_snapshot_last_read_ptr_).c_str()
                  : "disabled",
+             header.format_version,
+             (int)sync_state_,
+             deliver_while_replaying_);
+
+    advertiseVersions(RsmVersionType::IN_MEMORY, version_);
+    if (sync_state_ == SyncState::TAILING || deliver_while_replaying_) {
+      notifySubscribers();
+    }
+
+  } else if (header.format_version >=
+                 RSMSnapshotHeader::CONTAINS_DELTA_LOG_READ_PTR_AND_LENGTH &&
+             header.delta_log_read_ptr > last_snapshot_last_read_ptr_) {
+    // The base version did not change, however the read pointer did. This
+    // means that some deltas were ignored (or there is a gap in the delta log),
+    // but basically the snapshot covers the delta log up to the new
+    // delta_log_read_ptr. We need to update the metadata. However, we do not
+    // need to update the state or even notify subscribers since it is
+    // basically identical to previous state.
+
+    last_snapshot_last_read_ptr_ = header.delta_log_read_ptr;
+    delta_log_byte_offset_ = header.byte_offset;
+    delta_log_offset_ = header.offset;
+    snapshot_log_timestamp_ = snapshot_attrs.timestamp;
+    rsm_info(rsm_type_,
+             "Processed snapshot with lsn %s timestamp %lu, "
+             "base version %s, delta_log_read_ptr %s (serialization format "
+             "version was %d)",
+             lsn_to_string(snapshot_attrs.base_version).c_str(),
+             snapshot_attrs.timestamp.count(),
+             lsn_to_string(header.base_version).c_str(),
+             lsn_to_string(last_snapshot_last_read_ptr_).c_str(),
              header.format_version);
   }
 
@@ -341,16 +579,19 @@ bool ReplicatedStateMachine<T, D>::processSnapshot(
   }
 
   if (sync_state_ == SyncState::SYNC_SNAPSHOT &&
-      record->attrs.lsn >= snapshot_sync_) {
+      snapshot_attrs.base_version >= snapshot_sync_) {
     onBaseSnapshotRetrieved();
   }
 
-  if (version_ >= waiting_for_snapshot_) {
+  bool resume_delta_reading = false;
+  if (waiting_for_snapshot_ != LSN_INVALID &&
+      (version_ >= waiting_for_snapshot_ ||
+       last_snapshot_last_read_ptr_ >= waiting_for_snapshot_)) {
     // We were stalling reading the delta log because we saw a TRIM or
     // DATALOSS gap in it, but now we have a snapshot that accounts for the data
     // we missed, so we can resume reading the delta log.
     waiting_for_snapshot_ = LSN_INVALID;
-    resumeReadStream(delta_log_rsid_);
+    resume_delta_reading = true;
     cancelStallGracePeriod();
     if (bumped_stalled_stat_) {
       WORKER_STAT_DECR(num_replicated_state_machines_stalled);
@@ -363,6 +604,14 @@ bool ReplicatedStateMachine<T, D>::processSnapshot(
   discardSkippedPendingDeltas();
 
   cancelGracePeriodForFastForward();
+
+  if (resume_delta_reading) {
+    // Resume reading the delta log if needed, but only as the last step in
+    // this method. This may cause the stall grace period timer to be
+    // activated, as well as the fast forward grace period timer, and we don't
+    // want to cancel these timers above.
+    resumeReadStream(delta_log_rsid_);
+  }
   return true;
 }
 
@@ -380,23 +629,27 @@ void ReplicatedStateMachine<T, D>::discardSkippedPendingDeltas() {
 
 template <typename T, typename D>
 bool ReplicatedStateMachine<T, D>::onSnapshotGap(const GapRecord& gap) {
-  if (gap.type == GapType::DATALOSS) {
-    rsm_info(rsm_type_,
-             "Receiving a DATALOSS gap [%s, %s] on snapshot log %lu. This "
-             "state machine won't stall if all deltas that were accounted for "
-             "by this lost snapshot are still in the delta log. If that's not "
-             "the case, this state machine will stall until a snapshot with "
-             "high enough base version appears.",
-             lsn_to_string(gap.lo).c_str(),
-             lsn_to_string(gap.hi).c_str(),
-             snapshot_log_id_.val_);
-  }
+  // Receiving a DATALOSS gap won't stall the RSM if all deltas that were
+  // accounted for by this lost snapshot are still in the delta log. If that's
+  // not the case, this state machine will stall until a snapshot with high
+  // enough base version appears.
 
+  rsm_info(rsm_type_,
+           "Received a GAP(type:%s, lo:%s, hi:%s), sync_state_:%d, "
+           "snapshot_sync_:%s",
+           gapTypeToString(gap.type).c_str(),
+           lsn_to_string(gap.lo).c_str(),
+           lsn_to_string(gap.hi).c_str(),
+           static_cast<int>(sync_state_),
+           lsn_to_string(snapshot_sync_).c_str());
   if (sync_state_ == SyncState::SYNC_SNAPSHOT && gap.hi >= snapshot_sync_) {
     if (last_snapshot_record_) {
       // We found a snapshot record and deferred its serialization until we know
       // it's the last one. Do it now.
-      if (!processSnapshot(last_snapshot_record_)) {
+      if (!processSnapshot(last_snapshot_record_->payload,
+                           RSMSnapshotStore::SnapshotAttributes(
+                               last_snapshot_record_->attrs.lsn,
+                               last_snapshot_record_->attrs.timestamp))) {
         return false;
       }
       last_snapshot_record_.reset();
@@ -410,12 +663,16 @@ bool ReplicatedStateMachine<T, D>::onSnapshotGap(const GapRecord& gap) {
 template <typename T, typename D>
 void ReplicatedStateMachine<T, D>::onBaseSnapshotRetrieved() {
   rsm_info(rsm_type_,
-           "Base snapshot has version %s, delta_log_read_ptr %s",
+           "Base snapshot has version:%s, delta_log_read_ptr:%s",
            lsn_to_string(version_).c_str(),
            lsn_to_string(last_snapshot_last_read_ptr_).c_str());
+  advertiseVersions(RsmVersionType::IN_MEMORY, version_);
   activateGracePeriodForSnapshotting();
   gotInitialState(*data_);
   sync_state_ = SyncState::SYNC_DELTAS;
+  if (delta_read_ptr_ == LSN_INVALID) {
+    delta_read_ptr_ = last_snapshot_last_read_ptr_;
+  }
   getDeltaLogTailLSN();
 }
 
@@ -423,28 +680,27 @@ template <typename T, typename D>
 void ReplicatedStateMachine<T, D>::getDeltaLogTailLSN() {
   ld_check(version_ != LSN_INVALID);
   ld_check(data_);
+  ld_check_eq(sync_state_, SyncState::SYNC_DELTAS);
 
   rsm_info(rsm_type_, "Retrieving tail lsn of delta log...");
 
-  auto callback_ticket = callbackHelper_.ticket();
-  auto cb = [=](Status st,
-                NodeID /*seq*/,
-                lsn_t next_lsn,
-                std::unique_ptr<LogTailAttributes> /* tail_attributes */,
-                std::shared_ptr<const EpochMetaDataMap> /*metadata_map*/,
-                std::shared_ptr<TailRecord> /*tail_record*/,
-                folly::Optional<bool> /*is_log_empty*/) {
-    callback_ticket.postCallbackRequest([=](ReplicatedStateMachine<T, D>* s) {
-      if (s) {
+  sync_sequencer_request_ = std::make_unique<SyncSequencerRequest>(
+      delta_log_id_,
+      /* flags */ 0,
+      [this](Status st,
+             NodeID /*seq*/,
+             lsn_t next_lsn,
+             std::unique_ptr<LogTailAttributes> /* tail_attributes */,
+             std::shared_ptr<const EpochMetaDataMap> /*metadata_map*/,
+             std::shared_ptr<TailRecord> /*tail_record*/,
+             folly::Optional<bool> /*is_log_empty*/) {
+        sync_sequencer_request_.reset();
         lsn_t tail_lsn = next_lsn <= LSN_OLDEST ? LSN_OLDEST : next_lsn - 1;
-        s->onGotDeltaLogTailLSN(st, tail_lsn);
-      }
-    });
-  };
-
-  std::unique_ptr<Request> req =
-      std::make_unique<SyncSequencerRequest>(delta_log_id_, 0, cb);
-  postRequestWithRetrying(req);
+        onGotDeltaLogTailLSN(st, tail_lsn);
+      },
+      GetSeqStateRequest::Context::RSM);
+  int rv = sync_sequencer_request_->start();
+  ld_check(rv == 0);
 }
 
 template <typename T, typename D>
@@ -462,17 +718,10 @@ void ReplicatedStateMachine<T, D>::onGotDeltaLogTailLSN(Status st, lsn_t lsn) {
 
   delta_sync_ = lsn;
 
-  const lsn_t start_lsn = std::max(version_ + 1, last_snapshot_last_read_ptr_);
+  const lsn_t start_lsn = std::max(version_, last_snapshot_last_read_ptr_) + 1;
   // If stop_at_tail_ is true, we don't care about reading deltas past the tail
   // lsn.
   const lsn_t until_lsn = stop_at_tail_ ? delta_sync_ : LSN_MAX;
-
-  if (version_ >= delta_sync_ || delta_read_ptr_ >= delta_sync_) {
-    // The last snapshot we got already accounts for all the deltas. Or we've
-    // already read up to the tail.
-    // We can notify subscribers of the initial state immediately.
-    onReachedDeltaLogTailLSN();
-  }
 
   // It is possible to have start_lsn > until_lsn if stop_at_tail_ was used.
   // also it is possible that the readstream was already created
@@ -488,6 +737,13 @@ void ReplicatedStateMachine<T, D>::onGotDeltaLogTailLSN(Status st, lsn_t lsn) {
         [this](bool is_healthy) {
           onDeltaLogReadStreamHealthChange(is_healthy);
         });
+  }
+
+  if (version_ >= delta_sync_ || delta_read_ptr_ >= delta_sync_) {
+    // The last snapshot we got already accounts for all the deltas. Or we've
+    // already read up to the tail.
+    // We can notify subscribers of the initial state immediately.
+    onReachedDeltaLogTailLSN();
   }
 }
 
@@ -512,9 +768,15 @@ void ReplicatedStateMachine<T, D>::onDeltaLogReadStreamHealthChange(
 template <typename T, typename D>
 bool ReplicatedStateMachine<T, D>::onDeltaRecord(
     std::unique_ptr<DataRecord>& record) {
+  rsm_debug(rsm_type_,
+            "Received record %s",
+            lsn_to_string(record->attrs.lsn).c_str());
   if (waiting_for_snapshot_ != LSN_INVALID) {
     // We are stalling reading the delta log because we missed some data and are
     // waiting for a snapshot.
+    rsm_debug(rsm_type_,
+              "Waiting for snapshot >= %s",
+              lsn_to_string(waiting_for_snapshot_).c_str());
     return false;
   }
 
@@ -528,9 +790,16 @@ bool ReplicatedStateMachine<T, D>::onDeltaRecord(
     activateGracePeriodForFastForward();
   }
 
-  if (record->attrs.lsn <= version_) {
+  if (record->attrs.lsn <= version_ ||
+      record->attrs.lsn <= last_snapshot_last_read_ptr_) {
     // We already have a higher version because we read a more recent snapshot,
     // skip this delta.
+    rsm_debug(
+        rsm_type_,
+        "Skipping record %s (version_=%s, last_snapshot_last_read_ptr_=%s)",
+        lsn_to_string(record->attrs.lsn).c_str(),
+        lsn_to_string(version_).c_str(),
+        lsn_to_string(last_snapshot_last_read_ptr_).c_str());
     return true;
   }
 
@@ -591,9 +860,18 @@ bool ReplicatedStateMachine<T, D>::onDeltaRecord(
       // lsns match.
       ld_check(it->second->lsn == LSN_INVALID ||
                it->second->lsn == record->attrs.lsn);
-      it->second->cb(st, record->attrs.lsn, failure_reason);
-      pending_confirmation_.erase(it->second);
-      pending_confirmation_by_uuid_.erase(it);
+      if (state_delivery_blocked_) {
+        rsm_info(rsm_type_,
+                 "RSM just got unblocked from executing a callback on a delta "
+                 "because the EXPERIMENTATION setting (block-%s-rsm = true) "
+                 "the delta LSN is %s.",
+                 toString(rsm_type_).c_str(),
+                 lsn_to_string(record->attrs.lsn).c_str());
+      } else {
+        it->second->cb(st, record->attrs.lsn, failure_reason);
+        pending_confirmation_.erase(it->second);
+        pending_confirmation_by_uuid_.erase(it);
+      }
     }
   }
 
@@ -679,9 +957,17 @@ int ReplicatedStateMachine<T, D>::deserializeDelta(const DataRecord& record,
 
 template <typename T, typename D>
 bool ReplicatedStateMachine<T, D>::onDeltaGap(const GapRecord& gap) {
+  rsm_debug(rsm_type_,
+            "Received %s gap [%s,%s]",
+            gapTypeToString(gap.type).c_str(),
+            lsn_to_string(gap.lo).c_str(),
+            lsn_to_string(gap.hi).c_str());
   if (waiting_for_snapshot_ != LSN_INVALID) {
     // We are stalling reading the delta log because we missed some data and are
     // waiting for a snapshot.
+    rsm_debug(rsm_type_,
+              "Waiting for snapshot >= %s",
+              lsn_to_string(waiting_for_snapshot_).c_str());
     return false;
   }
 
@@ -689,9 +975,17 @@ bool ReplicatedStateMachine<T, D>::onDeltaGap(const GapRecord& gap) {
   ld_check(gap.hi > delta_read_ptr_);
   delta_read_ptr_ = gap.hi;
 
-  if (gap.hi <= version_) {
+  if (gap.hi <= version_ || gap.hi <= last_snapshot_last_read_ptr_) {
     // We already have a higher version because we read a more recent snapshot,
     // skip this delta gap.
+    rsm_debug(rsm_type_,
+              "Skipping %s gap [%s,%s] (version_=%s, "
+              "last_snapshot_last_read_ptr_=%s)",
+              gapTypeToString(gap.type).c_str(),
+              lsn_to_string(gap.lo).c_str(),
+              lsn_to_string(gap.hi).c_str(),
+              lsn_to_string(version_).c_str(),
+              lsn_to_string(last_snapshot_last_read_ptr_).c_str());
     return true;
   }
 
@@ -730,7 +1024,7 @@ bool ReplicatedStateMachine<T, D>::onDeltaGap(const GapRecord& gap) {
                "Receiving a %s gap [%s, %s] on delta log %lu. Stalling "
                "reading the delta log until we receive a snapshot with higher "
                "version.",
-               gap.type == GapType::TRIM ? "TRIM" : "DATALOSS",
+               gapTypeToString(gap.type).c_str(),
                lsn_to_string(gap.lo).c_str(),
                lsn_to_string(gap.hi).c_str(),
                delta_log_id_.val_);
@@ -738,6 +1032,7 @@ bool ReplicatedStateMachine<T, D>::onDeltaGap(const GapRecord& gap) {
       // If this does not get resolved in a timely manner, we'll bump a stat so
       // that an oncall can be notified and manually write a snapshot.
       activateStallGracePeriod();
+      activateSnapshotFetchTimer();
     }
   }
 
@@ -751,8 +1046,11 @@ bool ReplicatedStateMachine<T, D>::onDeltaGap(const GapRecord& gap) {
 template <typename T, typename D>
 void ReplicatedStateMachine<T, D>::onReachedDeltaLogTailLSN() {
   sync_state_ = SyncState::TAILING;
-
-  rsm_info(rsm_type_, "Reached tail of delta log");
+  rsm_info(
+      rsm_type_,
+      "Reached tail of delta log. deliver_while_replaying:%d, stop_at_tail_:%d",
+      deliver_while_replaying_,
+      stop_at_tail_);
 
   // If we were not already delivering updates while we were replaying the
   // backlog, now is the time to deliver the first update to subscribers.
@@ -761,8 +1059,9 @@ void ReplicatedStateMachine<T, D>::onReachedDeltaLogTailLSN() {
   }
 
   if (stop_at_tail_) {
-    // This will unblock anyone that called wait().
-    sem_.post();
+    // This will schedule deletion of client read streams, and unblock any
+    // caller waiting.
+    scheduleStop();
   }
 }
 
@@ -834,7 +1133,7 @@ void ReplicatedStateMachine<T, D>::writeDelta(
     }
   }
 
-  if (base_version.hasValue()) {
+  if (base_version.has_value()) {
     // The caller asked to write that delta only if the state is at a specific
     // version. Do the check here and fail if they don't match.
 
@@ -927,13 +1226,13 @@ void ReplicatedStateMachine<T, D>::postAppendRequest(
     });
   };
 
-  std::unique_ptr<AppendRequest> req =
-      std::make_unique<AppendRequest>(nullptr,
-                                      logid,
-                                      AppendAttributes(),
-                                      std::move(payload),
-                                      timeout,
-                                      cb_wrapper);
+  auto req = std::make_unique<AppendRequest>(
+      nullptr,
+      logid,
+      AppendAttributes(),
+      PayloadHolder::copyBuffer(payload.data(), payload.size()),
+      timeout,
+      cb_wrapper);
 
   req->bypassWriteTokenCheck();
   std::unique_ptr<Request> base_req = std::move(req);
@@ -983,38 +1282,89 @@ void ReplicatedStateMachine<T, D>::cancelStallGracePeriod() {
 }
 
 template <typename T, typename D>
-void ReplicatedStateMachine<T, D>::activateGracePeriodForSnapshotting() {
-  if (!snapshotting_timer_.isAssigned()) {
-    snapshotting_timer_.assign([this] {
-      if (canSnapshot()) {
-        // Create a snapshot if:
-        // 1. We are not already snapshotting;
-        // 2. Snapshotting is enabled in the settings;
-        // 3. This node is resposnible for snapshots
-        // (first node alive according to the FD);
-        //
-        // We always take a node regardless whether there are new deltas or not.
-        rsm_info(rsm_type_, "Taking a new time-based snapshot");
-        auto cb = [&](Status st) {
-          if (st != E::OK) {
-            rsm_error(rsm_type_,
-                      "Could not take a time-based snapshot: %s",
-                      error_name(st));
-          } else {
-            rsm_info(rsm_type_, "Time based snapshot was successful");
-          }
-        };
-        snapshot(std::move(cb));
-      } else {
-        rsm_info(rsm_type_,
-                 "Not taking a time-based snapshot on this node now because "
-                 "it's not the node responsible for snapshots!");
-      }
-      // Scheduling the next run.
-      snapshotting_timer_.activate(snapshotting_grace_period_);
-    });
+void ReplicatedStateMachine<T, D>::activateSnapshotFetchTimer() {
+  if (get_snapshot_timer_) {
+    rsm_debug(rsm_type_, "Activating get_snapshot_timer_");
+    get_snapshot_timer_->activate();
   }
-  snapshotting_timer_.activate(snapshotting_grace_period_);
+}
+
+template <typename T, typename D>
+void ReplicatedStateMachine<T, D>::initSnapshotFetchTimer() {
+  if (!get_snapshot_timer_) {
+    rsm_info(rsm_type_, "Creating timer to fetch snapshots ...");
+    get_snapshot_timer_ = std::make_unique<ExponentialBackoffTimer>(
+        std::bind(&ReplicatedStateMachine::getSnapshot, this),
+        std::chrono::seconds{1},
+        std::chrono::seconds{600});
+  }
+  activateSnapshotFetchTimer();
+}
+
+template <typename T, typename D>
+bool ReplicatedStateMachine<T, D>::canTrim() const {
+  auto w = Worker::onThisThread();
+  auto my_node_id = w->processor_->getOptionalMyNodeID();
+  if (!my_node_id.has_value() || !my_node_id.value().isNodeID()) {
+    return false;
+  }
+
+  auto cs = w->getClusterState();
+  ld_check(cs != nullptr);
+  folly::Optional<node_index_t> first_alive_node_idx = cs->getFirstNodeAlive();
+  return first_alive_node_idx.has_value() &&
+      first_alive_node_idx.value() == my_node_id.value().index();
+}
+
+template <typename T, typename D>
+void ReplicatedStateMachine<T, D>::activateGracePeriodForSnapshotting() {
+  auto snapshotting_duration = snapshotting_grace_period_;
+  bool snapshot_store_allows = snapshot_store_ && snapshot_store_->isWritable();
+
+  if (!snapshotting_timer_.isAssigned()) {
+    snapshotting_timer_.assign(
+        [this, snapshot_store_allows, snapshotting_duration] {
+          bool rsm_allows = canSnapshot();
+          rsm_debug(rsm_type_,
+                    "rsm_allows:%d, snapshot_store_allows:%d, "
+                    "snapshotting duration:%lu",
+                    rsm_allows,
+                    snapshot_store_allows,
+                    snapshotting_duration.count());
+          if (snapshot_store_allows || rsm_allows) {
+            // Create a snapshot if:
+            // 1. We are not already snapshotting;
+            // 2. Snapshotting is enabled in the settings;
+            // 3. This node is responsible for snapshots
+            // (first node alive according to the FD);
+            //
+            // We always take a snapshot regardless whether there are new deltas
+            // or not.
+            rsm_info(rsm_type_, "Taking a new time-based snapshot");
+            auto cb = [&](Status st) {
+              if (st != E::OK && st != E::UPTODATE) {
+                rsm_error(rsm_type_,
+                          "Could not take a time-based snapshot: %s",
+                          error_name(st));
+              } else {
+                rsm_info(rsm_type_, "Time based snapshot was successful");
+              }
+            };
+            snapshot(std::move(cb));
+          } else {
+            rsm_debug(
+                rsm_type_,
+                "Not taking a time-based snapshot on this node now because "
+                "it's not the node responsible for snapshots!");
+          }
+
+          // Scheduling the next run.
+          if (!snapshotting_timer_.isActive()) {
+            snapshotting_timer_.activate(snapshotting_duration);
+          }
+        });
+  }
+  snapshotting_timer_.activate(snapshotting_duration);
 }
 
 template <typename T, typename D>
@@ -1104,10 +1454,104 @@ ReplicatedStateMachine<T, D>::SubscriptionHandle::~SubscriptionHandle() {
 }
 
 template <typename T, typename D>
+void ReplicatedStateMachine<T, D>::advertiseVersions(RsmVersionType type,
+                                                     lsn_t version) {
+  Worker* w = Worker::onThisThread(false);
+  if (!w || !w->settings().server) {
+    return;
+  }
+
+  Processor* p = w->processor_;
+  if (type == RsmVersionType::IN_MEMORY) {
+    p->setRSMVersion(delta_log_id_, version);
+  } else if (type == RsmVersionType::DURABLE) {
+    p->setDurableRSMVersion(delta_log_id_, version);
+  }
+}
+
+template <typename T, typename D>
+void ReplicatedStateMachine<T, D>::notifySubscribersWithLatestState() {
+  notifySubscribers(nullptr);
+}
+
+template <typename T, typename D>
+bool ReplicatedStateMachine<T, D>::blockStateDelivery(bool blocked) {
+  bool prev = state_delivery_blocked_;
+  state_delivery_blocked_ = blocked;
+  if (prev == true && state_delivery_blocked_ == false) {
+    // We have just been unblocked. notify all subscribers;
+    if (sync_state_ == SyncState::TAILING || deliver_while_replaying_) {
+      rsm_info(
+          rsm_type_,
+          "RSM just got unblocked by unsetting the EXPERIMENTATION setting "
+          " (block-%s-rsm = false) but we cannot publish a state because the "
+          "RSM is not currently tailing or has deliver_while_replaying "
+          "enabled",
+          toString(rsm_type_).c_str());
+      notifySubscribers();
+    } else {
+      rsm_info(
+          rsm_type_,
+          "RSM just got unblocked by unsetting the EXPERIMENTATION setting "
+          " (block-%s-rsm = false) but we cannot publish a state because the "
+          "RSM is not currently tailing or has deliver_while_replaying "
+          "enabled",
+          toString(rsm_type_).c_str());
+    }
+  }
+  return prev;
+}
+
+template <typename T, typename D>
 void ReplicatedStateMachine<T, D>::notifySubscribers(const D* delta) {
+  if (subscribers_.empty()) {
+    return;
+  }
+
+  if (state_delivery_blocked_) {
+    rsm_warning(rsm_type_,
+                "Will NOT notify subscribers of new state since delivery is "
+                "blocked via an EXPERIMENTATION setting (block-%s-rsm = true). "
+                "Current version: %s, Latest published was: %s",
+                toString(rsm_type_).c_str(),
+                lsn_to_string(version_).c_str(),
+                latest_published_version_.hasValue()
+                    ? lsn_to_string(latest_published_version_.value()).c_str()
+                    : "NONE");
+    return;
+  }
+
+  rsm_debug(rsm_type_,
+            "Notifying subscribers of new state %s",
+            lsn_to_string(version_).c_str());
   for (auto& cb : subscribers_) {
     cb(*data_, delta, version_);
   }
+
+  latest_published_version_ = version_;
+  advertiseVersions(RsmVersionType::IN_MEMORY, version_);
+}
+
+template <typename T, typename D>
+Status ReplicatedStateMachine<T, D>::getSnapshotFromMemory(
+    lsn_t min_ver,
+    lsn_t& version_out,
+    std::string& snapshot_blob_out) {
+  rsm_debug(rsm_type_,
+            "min_ver:%s, version_:%s",
+            lsn_to_string(min_ver).c_str(),
+            lsn_to_string(version_).c_str());
+
+  if (min_ver > version_) {
+    version_out = version_;
+    return E::STALE;
+  }
+
+  bool include_read_ptr =
+      Worker::settings().rsm_include_read_pointer_in_snapshot;
+  snapshot_blob_out = createSnapshotPayload(*data_, version_, include_read_ptr);
+  version_out = version_;
+  return E::OK;
 }
 
 template <typename T, typename D>
@@ -1176,9 +1620,14 @@ std::string ReplicatedStateMachine<T, D>::createSnapshotPayload(
       return std::string();
     }
     compressed_buf.resize(header_sz + compressed_size);
+    rsm_debug(rsm_type_,
+              "buf size: uncompressed:%lu, compressed:%lu",
+              buf.size(),
+              compressed_buf.size());
     return compressed_buf;
   }
 
+  rsm_debug(rsm_type_, "buf size:%lu", buf.size());
   return buf;
 }
 
@@ -1219,6 +1668,17 @@ void ReplicatedStateMachine<T, D>::snapshot(std::function<void(Status st)> cb) {
       lsn_to_string(version_).c_str(),
       include_read_ptr ? lsn_to_string(delta_read_ptr_).c_str() : "disabled",
       snapshot_compression_ ? "enabled" : "disabled");
+
+  if (include_read_ptr && delta_read_ptr_ < version_) {
+    rsm_critical(rsm_type_,
+                 "RSM is in inconsistent state: delta_read_ptr_ = %s while "
+                 "version_ = %s. We cannot proceed with taking snapshot",
+                 lsn_to_string(delta_read_ptr_).c_str(),
+                 lsn_to_string(version_).c_str());
+    cb_or_noop(E::FAILED);
+    return;
+  }
+
   std::string payload =
       createSnapshotPayload(*data_, version_, include_read_ptr);
 
@@ -1226,30 +1686,74 @@ void ReplicatedStateMachine<T, D>::snapshot(std::function<void(Status st)> cb) {
   const size_t byte_offset_at_time_of_snapshot = delta_log_byte_offset_;
   const size_t offset_at_time_of_snapshot = delta_log_offset_;
 
-  auto append_cb = [=](Status st, lsn_t lsn) {
-    if (st == E::OK) {
-      // We don't want to wait for the snapshot to be read before
-      // last_snapshot_* members are modified otherwise
-      // numDeltaRecordsSinceLastSnapshot() and numBytesSinceLastSnapshot() may
-      // report stale values and the user may want to create a snapshot again.
-      // We may have read other snapshots in between so make sure we use max().
-      last_snapshot_byte_offset_ =
-          std::max(byte_offset_at_time_of_snapshot, last_snapshot_byte_offset_);
-      last_snapshot_offset_ =
-          std::max(offset_at_time_of_snapshot, last_snapshot_offset_);
-      ld_info("Snapshot was assigned LSN %s", lsn_to_string(lsn).c_str());
-    }
-    snapshot_in_flight_ = false;
+  auto ticket = callbackHelper_.ticket();
+  auto delta_read_ptr_copy = delta_read_ptr_;
+  auto snapshot_cb = [=](Status st, lsn_t lsn) {
+    ticket.postCallbackRequest([=](ReplicatedStateMachine<T, D>* s) {
+      if (!s) {
+        return;
+      }
 
-    onSnapshotCreated(st, payload.size());
+      snapshot_in_flight_ = false;
 
-    cb_or_noop(st);
+      if (st == E::OK) {
+        // We don't want to wait for the snapshot to be read before
+        // last_snapshot_* members are modified otherwise
+        // numDeltaRecordsSinceLastSnapshot() and numBytesSinceLastSnapshot()
+        // may report stale values and the user may want to create a snapshot
+        // again. We may have read other snapshots in between so make sure we
+        // use max().
+        last_snapshot_byte_offset_ = std::max(
+            byte_offset_at_time_of_snapshot, last_snapshot_byte_offset_);
+        last_snapshot_offset_ =
+            std::max(offset_at_time_of_snapshot, last_snapshot_offset_);
+        last_written_version_ = lsn;
+        last_snapshot_last_read_ptr_ = delta_read_ptr_copy;
+        rsm_info(rsm_type_,
+                 "Snapshot with base ver:%s and read_ptr:%s was written "
+                 "successfully",
+                 lsn_to_string(lsn).c_str(),
+                 lsn_to_string(delta_read_ptr_copy).c_str());
+        advertiseVersions(RsmVersionType::DURABLE, last_written_version_);
+        onSnapshotCreated(st, payload.size());
+      } else if (st == E::UPTODATE) {
+        advertiseVersions(RsmVersionType::DURABLE, lsn);
+      } else {
+        rsm_info(
+            rsm_type_, "Writing Snapshot failed with st:%s", error_name(st));
+        last_written_version_ = LSN_INVALID;
+        advertiseVersions(RsmVersionType::DURABLE, LSN_INVALID);
+      }
+      cb_or_noop(st);
+    });
   };
 
-  postAppendRequest(
-      snapshot_log_id_, payload, snapshot_append_timeout_, append_cb);
-
-  snapshot_in_flight_ = true;
+  bool writing_snapshot = !snapshot_store_ ||
+      (version_ > last_written_version_) ||
+      (include_read_ptr && last_snapshot_last_read_ptr_ < delta_read_ptr_copy);
+  rsm_info(rsm_type_,
+           "%swriting snapshot(version_:%s, delta_read_ptr:%s, payload "
+           "size:%lu), last_written_version_:%s, "
+           "last_snapshot_last_read_ptr_:%s, include_read_ptr:%d",
+           writing_snapshot ? "" : "Not ",
+           lsn_to_string(version_).c_str(),
+           lsn_to_string(delta_read_ptr_copy).c_str(),
+           payload.size(),
+           lsn_to_string(last_written_version_).c_str(),
+           lsn_to_string(last_snapshot_last_read_ptr_).c_str(),
+           include_read_ptr);
+  if (!writing_snapshot) {
+    snapshot_cb(E::UPTODATE, last_written_version_);
+    return;
+  }
+  if (snapshot_store_) {
+    snapshot_in_flight_ = true;
+    snapshot_store_->writeSnapshot(version_, std::move(payload), snapshot_cb);
+  } else {
+    postAppendRequest(
+        snapshot_log_id_, payload, snapshot_append_timeout_, snapshot_cb);
+    snapshot_in_flight_ = true;
+  }
 }
 
 template <typename T, typename D>

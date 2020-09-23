@@ -12,12 +12,10 @@
 #include <folly/ScopeGuard.h>
 #include <gtest/gtest.h>
 
-#include "event2/buffer.h"
 #include "logdevice/common/Metadata.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/debug.h"
-#include "logdevice/common/libevent/compat.h"
 #include "logdevice/common/protocol/APPEND_Message.h"
 #include "logdevice/common/protocol/CLEAN_Message.h"
 #include "logdevice/common/protocol/DELETE_Message.h"
@@ -58,8 +56,9 @@ void DO_TEST(const SomeMessage& m,
   ld_check(max_proto <= Compatibility::MAX_PROTOCOL_SUPPORTED);
 
   for (uint16_t proto = min_proto; proto <= max_proto; ++proto) {
-    struct evbuffer* evbuf = LD_EV(evbuffer_new)();
-    ProtocolWriter writer(m.type_, evbuf, proto);
+    std::unique_ptr<folly::IOBuf> iobuf =
+        folly::IOBuf::create(IOBUF_ALLOCATION_UNIT);
+    ProtocolWriter writer(m.type_, iobuf.get(), proto);
     m.serialize(writer);
     ssize_t sz = writer.result();
     ASSERT_EQ(writer.status(), proto_writer_status);
@@ -67,8 +66,7 @@ void DO_TEST(const SomeMessage& m,
       continue;
     }
     ASSERT_GT(sz, 0);
-    std::string serialized(sz, '0');
-    ASSERT_EQ(sz, LD_EV(evbuffer_copyout)(evbuf, &serialized[0], sz));
+    std::string serialized = iobuf->coalesce().str();
     std::string found_hex = hexdump_buf(&serialized[0], sz);
     std::string expected_hex = expected_fn(proto);
     if (expected_hex.empty()) {
@@ -86,34 +84,13 @@ void DO_TEST(const SomeMessage& m,
     if (!deserializer) {
       deserializer = messageDeserializers[m.type_];
     }
-    ProtocolReader reader(m.type_, evbuf, sz, proto);
+    ProtocolReader reader(m.type_, std::move(iobuf), proto);
     found = deserializer(reader).msg;
     ASSERT_NE(nullptr, found);
-    ASSERT_EQ(0, LD_EV(evbuffer_get_length)(evbuf));
     SomeMessage* found_sub = dynamic_cast<SomeMessage*>(found.get());
     ASSERT_NE(nullptr, found_sub);
     check(*found_sub, proto);
-    LD_EV(evbuffer_free)(evbuf);
   }
-}
-
-// TODO: now that Payload has toString(), we don't need this helper.
-static std::string getPayload(const Payload& p) {
-  return p.toString();
-}
-
-static std::string getPayload(const PayloadHolder& h) {
-  struct evbuffer* evbuf = LD_EV(evbuffer_new)();
-  ProtocolWriter writer(
-      MessageType::STORE, evbuf, Compatibility::MAX_PROTOCOL_SUPPORTED);
-  h.serialize(writer);
-  ssize_t sz = writer.result();
-  EXPECT_GE(sz, 0);
-  std::string s(sz, '\0');
-  EXPECT_EQ(sz, LD_EV(evbuffer_remove)(evbuf, &s[0], sz));
-  EXPECT_EQ(0, LD_EV(evbuffer_get_length)(evbuf));
-  LD_EV(evbuffer_free)(evbuf);
-  return s;
 }
 
 class MessageSerializationTest : public ::testing::Test {
@@ -170,13 +147,13 @@ class MessageSerializationTest : public ::testing::Test {
           recv.optional_keys_.find(key_pair.first)->second, key_pair.second);
     }
 
-    ASSERT_EQ(sent.e2e_tracing_context_, recv.e2e_tracing_context_);
     if (sent.header_.flags & STORE_Header::OFFSET_MAP) {
       ASSERT_EQ(
           sent.extra_.offsets_within_epoch, recv.extra_.offsets_within_epoch);
     }
 
-    ASSERT_EQ(getPayload(*sent.payload_), getPayload(*recv.payload_));
+    ASSERT_EQ(sent.payload_.getPayload().toString(),
+              recv.payload_.getPayload().toString());
   }
 
   void checkAPPEND(const APPEND_Message& m,
@@ -197,8 +174,8 @@ class MessageSerializationTest : public ::testing::Test {
       ASSERT_EQ(flag1, flag2);
     }
     ASSERT_EQ(m.attrs_.optional_keys, m2.attrs_.optional_keys);
-    ASSERT_EQ(m.attrs_.counters.hasValue(), m2.attrs_.counters.hasValue());
-    if (m.attrs_.counters.hasValue()) {
+    ASSERT_EQ(m.attrs_.counters.has_value(), m2.attrs_.counters.has_value());
+    if (m.attrs_.counters.has_value()) {
       ASSERT_EQ(m.attrs_.counters->size(), m2.attrs_.counters->size());
       for (auto counter : m.attrs_.counters.value()) {
         auto map =
@@ -211,8 +188,8 @@ class MessageSerializationTest : public ::testing::Test {
       ASSERT_EQ(m.write_stream_request_id_.seq_num,
                 m2.write_stream_request_id_.seq_num);
     }
-    ASSERT_EQ(m.e2e_tracing_context_, m2.e2e_tracing_context_);
-    ASSERT_EQ(getPayload(m.payload_), getPayload(m2.payload_));
+    ASSERT_EQ(m.payload_.getPayload().toString(),
+              m2.payload_.getPayload().toString());
   }
 
   void checkRECORD(const RECORD_Message& m,
@@ -229,7 +206,8 @@ class MessageSerializationTest : public ::testing::Test {
                 m2.header_.flags & ~RECORD_Header::WRITE_STREAM);
     }
 
-    ASSERT_EQ(getPayload(m.payload_), getPayload(m2.payload_));
+    ASSERT_EQ(m.payload_.getPayload().toString(),
+              m2.payload_.getPayload().toString());
 
     ld_check(m.extra_metadata_ != nullptr);
     ld_check(m2.extra_metadata_ != nullptr);
@@ -339,7 +317,7 @@ namespace {
 // Helper factory for STORE messages, including their serialized forms.
 // Provides a basic STORE header so that tests don't need to copy-paste it.
 struct TestStoreMessageFactory {
-  TestStoreMessageFactory() {
+  TestStoreMessageFactory(bool empty_payload = false) {
     header_ = STORE_Header{
         RecordID(0xc5e58b03be6504ce, logid_t(0x0fbc3a81c75251e2)),
         0xeb4925bfde9dec8e,
@@ -355,7 +333,7 @@ struct TestStoreMessageFactory {
     cs_.assign({{ShardID(1, 0), ClientID(4)},
                 {ShardID(2, 0), ClientID(5)},
                 {ShardID(3, 0), ClientID(6)}});
-    payload_ = "hi";
+    payload_ = empty_payload ? "" : "hi";
   }
 
   void setWave(uint32_t wave) {
@@ -377,24 +355,15 @@ struct TestStoreMessageFactory {
     key_serialized_ = std::move(serialized);
   }
 
-  void setE2ETracingContext(std::string tracing_context,
-                            std::string serialized) {
-    e2e_tracing_context_ = std::move(tracing_context);
-    e2e_tracing_context_serialized_ = std::move(serialized);
-  }
-
   STORE_Message message() const {
-    return STORE_Message(
-        header_,
-        cs_.data(),
-        header_.copyset_offset,
-        0,
-        extra_,
-        optional_keys_,
-        std::make_shared<PayloadHolder>(
-            Payload(payload_.data(), payload_.size()), PayloadHolder::UNOWNED),
-        false,
-        e2e_tracing_context_);
+    return STORE_Message(header_,
+                         cs_.data(),
+                         header_.copyset_offset,
+                         0,
+                         extra_,
+                         optional_keys_,
+                         PayloadHolder::copyString(payload_),
+                         false);
   }
 
   template <typename IntType>
@@ -456,12 +425,7 @@ struct TestStoreMessageFactory {
       }
       rv += key_serialized_;
     }
-
-    if (header_.flags & STORE_Header::E2E_TRACING_ON) {
-      rv += e2e_tracing_context_serialized_;
-    }
-
-    rv += "6869"; // payload ("hi" in hex)
+    rv += payload_.size() ? "6869" : ""; // payload ("hi" in hex)
     return rv;
   }
 
@@ -473,8 +437,6 @@ struct TestStoreMessageFactory {
   std::string extra_serialized_;
   std::map<KeyType, std::string> optional_keys_;
   std::string key_serialized_;
-  std::string e2e_tracing_context_;
-  std::string e2e_tracing_context_serialized_;
 };
 } // namespace
 
@@ -496,7 +458,28 @@ TEST_F(MessageSerializationTest, STORE) {
           Compatibility::MIN_PROTOCOL_SUPPORTED,
           Compatibility::MAX_PROTOCOL_SUPPORTED,
           std::bind(&TestStoreMessageFactory::serialized, &factory, arg::_1),
-          [](ProtocolReader& r) { return STORE_Message::deserialize(r, 128); });
+          nullptr);
+}
+
+TEST_F(MessageSerializationTest, EmptySTORE) {
+  STORE_Extra extra;
+  extra.recovery_id = recovery_id_t(0x72555800c6fe911e);
+  extra.recovery_epoch = epoch_t(0xc2f998f6);
+
+  TestStoreMessageFactory factory(true /* empty_payload */);
+  factory.setFlags(STORE_Header::RECOVERY);
+  factory.setExtra(extra, "1E91FEC600585572F698F9C2");
+
+  STORE_Message m = factory.message();
+  auto check = [&](const STORE_Message& m2, uint16_t proto) {
+    checkSTORE(m, m2, proto);
+  };
+  DO_TEST(m,
+          check,
+          Compatibility::MIN_PROTOCOL_SUPPORTED,
+          Compatibility::MAX_PROTOCOL_SUPPORTED,
+          std::bind(&TestStoreMessageFactory::serialized, &factory, arg::_1),
+          [](ProtocolReader& r) { return STORE_Message::deserialize(r); });
 }
 
 TEST_F(MessageSerializationTest, STORE_WithKey) {
@@ -515,7 +498,7 @@ TEST_F(MessageSerializationTest, STORE_WithKey) {
           Compatibility::MIN_PROTOCOL_SUPPORTED,
           Compatibility::MAX_PROTOCOL_SUPPORTED,
           std::bind(&TestStoreMessageFactory::serialized, &factory, arg::_1),
-          [](ProtocolReader& r) { return STORE_Message::deserialize(r, 128); });
+          nullptr);
 }
 
 TEST_F(MessageSerializationTest, STORE_WithFilterableKey) {
@@ -536,14 +519,14 @@ TEST_F(MessageSerializationTest, STORE_WithFilterableKey) {
           Compatibility::MIN_PROTOCOL_SUPPORTED,
           Compatibility::MAX_PROTOCOL_SUPPORTED,
           std::bind(&TestStoreMessageFactory::serialized, &factory, arg::_1),
-          [](ProtocolReader& r) { return STORE_Message::deserialize(r, 128); });
+          nullptr);
 }
 
 TEST_F(MessageSerializationTest, STORE_WithRebuildingInfo2) {
   STORE_Extra extra;
   extra.rebuilding_version = 42;
   extra.rebuilding_wave = 3;
-  extra.rebuilding_id = log_rebuilding_id_t(10);
+  extra.rebuilding_id = chunk_rebuilding_id_t(10);
 
   TestStoreMessageFactory factory;
   factory.setFlags(STORE_Header::REBUILDING);
@@ -558,7 +541,7 @@ TEST_F(MessageSerializationTest, STORE_WithRebuildingInfo2) {
           Compatibility::MIN_PROTOCOL_SUPPORTED,
           Compatibility::MAX_PROTOCOL_SUPPORTED,
           std::bind(&TestStoreMessageFactory::serialized, &factory, arg::_1),
-          [](ProtocolReader& r) { return STORE_Message::deserialize(r, 128); });
+          nullptr);
 }
 
 TEST_F(MessageSerializationTest, STORE_WithByteOffsetInfo) {
@@ -580,7 +563,7 @@ TEST_F(MessageSerializationTest, STORE_WithByteOffsetInfo) {
           Compatibility::MIN_PROTOCOL_SUPPORTED,
           Compatibility::MAX_PROTOCOL_SUPPORTED,
           std::bind(&TestStoreMessageFactory::serialized, &factory, arg::_1),
-          [](ProtocolReader& r) { return STORE_Message::deserialize(r, 128); });
+          nullptr);
 }
 
 TEST_F(MessageSerializationTest, STORE_WithByteOffsetMapInfo) {
@@ -601,7 +584,7 @@ TEST_F(MessageSerializationTest, STORE_WithByteOffsetMapInfo) {
           Compatibility::MIN_PROTOCOL_SUPPORTED,
           Compatibility::MAX_PROTOCOL_SUPPORTED,
           std::bind(&TestStoreMessageFactory::serialized, &factory, arg::_1),
-          [](ProtocolReader& r) { return STORE_Message::deserialize(r, 128); });
+          nullptr);
 }
 
 TEST_F(MessageSerializationTest, STORE_WithFirstAmendableOffset) {
@@ -621,27 +604,7 @@ TEST_F(MessageSerializationTest, STORE_WithFirstAmendableOffset) {
           Compatibility::MIN_PROTOCOL_SUPPORTED,
           Compatibility::MAX_PROTOCOL_SUPPORTED,
           std::bind(&TestStoreMessageFactory::serialized, &factory, arg::_1),
-          [](ProtocolReader& r) { return STORE_Message::deserialize(r, 128); });
-}
-
-TEST_F(MessageSerializationTest, STORE_WithE2ETracingContext) {
-  TestStoreMessageFactory factory;
-
-  factory.setFlags(STORE_Header::E2E_TRACING_ON);
-  factory.setE2ETracingContext("abcdefgh",
-                               "0800000000000000"
-                               "6162636465666768");
-
-  STORE_Message m = factory.message();
-  auto check = [&](const STORE_Message& m2, uint16_t proto) {
-    checkSTORE(m, m2, proto);
-  };
-  DO_TEST(m,
-          check,
-          Compatibility::MIN_PROTOCOL_SUPPORTED,
-          Compatibility::MAX_PROTOCOL_SUPPORTED,
-          std::bind(&TestStoreMessageFactory::serialized, &factory, arg::_1),
-          [](ProtocolReader& r) { return STORE_Message::deserialize(r, 128); });
+          nullptr);
 }
 
 TEST_F(MessageSerializationTest, STORE_WithWriteStreamFlagSet) {
@@ -658,7 +621,7 @@ TEST_F(MessageSerializationTest, STORE_WithWriteStreamFlagSet) {
           Compatibility::MIN_PROTOCOL_SUPPORTED,
           Compatibility::MAX_PROTOCOL_SUPPORTED,
           std::bind(&TestStoreMessageFactory::serialized, &factory, arg::_1),
-          [](ProtocolReader& r) { return STORE_Message::deserialize(r, 128); });
+          nullptr);
 }
 
 TEST_F(MessageSerializationTest, SHUTDOWN_WithServerInstanceId) {
@@ -787,13 +750,10 @@ TEST_F(MessageSerializationTest, APPEND) {
                      APPEND_Header::CHECKSUM_64BIT |
                          APPEND_Header::REACTIVATE_IF_PREEMPTED |
                          APPEND_Header::BUFFERED_WRITER_BLOB};
-  auto deserializer = [](ProtocolReader& reader) {
-    return APPEND_Message::deserialize(reader, 128);
-  };
   auto expected_fn = [](uint16_t) { return std::string(); };
   AppendAttributes attrs;
   {
-    APPEND_Message m(h, LSN_INVALID, attrs, PayloadHolder(strdup("hello"), 5));
+    APPEND_Message m(h, LSN_INVALID, attrs, PayloadHolder::copyString("hello"));
     auto check = [&](const APPEND_Message& m2, uint16_t proto) {
       checkAPPEND(m, m2, proto);
     };
@@ -802,13 +762,13 @@ TEST_F(MessageSerializationTest, APPEND) {
             Compatibility::MIN_PROTOCOL_SUPPORTED,
             Compatibility::MAX_PROTOCOL_SUPPORTED,
             expected_fn,
-            deserializer);
+            nullptr);
   }
   {
     h.flags |= APPEND_Header::CUSTOM_KEY;
     std::string key{"abcdefgh"};
     attrs.optional_keys[KeyType::FINDKEY] = std::move(key);
-    APPEND_Message m(h, LSN_INVALID, attrs, PayloadHolder(strdup("hello"), 5));
+    APPEND_Message m(h, LSN_INVALID, attrs, PayloadHolder::copyString("hello"));
     auto check = [&](const APPEND_Message& m2, uint16_t proto) {
       checkAPPEND(m, m2, proto);
     };
@@ -817,7 +777,7 @@ TEST_F(MessageSerializationTest, APPEND) {
             Compatibility::MIN_PROTOCOL_SUPPORTED,
             Compatibility::MAX_PROTOCOL_SUPPORTED,
             expected_fn,
-            deserializer);
+            nullptr);
   }
   {
     h.flags |= APPEND_Header::CUSTOM_KEY;
@@ -825,7 +785,7 @@ TEST_F(MessageSerializationTest, APPEND) {
     std::string key2{"12345678"};
     attrs.optional_keys[KeyType::FINDKEY] = std::move(key);
     attrs.optional_keys[KeyType::FILTERABLE] = std::move(key2);
-    APPEND_Message m(h, LSN_INVALID, attrs, PayloadHolder(strdup("hello"), 5));
+    APPEND_Message m(h, LSN_INVALID, attrs, PayloadHolder::copyString("hello"));
     auto check = [&](const APPEND_Message& m2, uint16_t proto) {
       checkAPPEND(m, m2, proto);
     };
@@ -834,7 +794,7 @@ TEST_F(MessageSerializationTest, APPEND) {
             Compatibility::MIN_PROTOCOL_SUPPORTED,
             Compatibility::MAX_PROTOCOL_SUPPORTED,
             expected_fn,
-            deserializer);
+            nullptr);
   }
   {
     h.flags |= APPEND_Header::CUSTOM_COUNTERS;
@@ -843,7 +803,7 @@ TEST_F(MessageSerializationTest, APPEND) {
     counters[2] = 2;
     counters[3] = 3;
     attrs.counters.emplace(std::move(counters));
-    APPEND_Message m(h, LSN_INVALID, attrs, PayloadHolder(strdup("hello"), 5));
+    APPEND_Message m(h, LSN_INVALID, attrs, PayloadHolder::copyString("hello"));
     auto check = [&](const APPEND_Message& m2, uint16_t proto) {
       checkAPPEND(m, m2, proto);
     };
@@ -852,7 +812,7 @@ TEST_F(MessageSerializationTest, APPEND) {
             Compatibility::MIN_PROTOCOL_SUPPORTED,
             Compatibility::MAX_PROTOCOL_SUPPORTED,
             expected_fn,
-            deserializer);
+            nullptr);
   }
   {
     h.flags |= APPEND_Header::CUSTOM_KEY;
@@ -864,7 +824,7 @@ TEST_F(MessageSerializationTest, APPEND) {
     counters[2] = 2;
     counters[3] = 3;
     attrs.counters.emplace(std::move(counters));
-    APPEND_Message m(h, LSN_INVALID, attrs, PayloadHolder(strdup("hello"), 5));
+    APPEND_Message m(h, LSN_INVALID, attrs, PayloadHolder::copyString("hello"));
     auto check = [&](const APPEND_Message& m2, uint16_t proto) {
       checkAPPEND(m, m2, proto);
     };
@@ -873,24 +833,7 @@ TEST_F(MessageSerializationTest, APPEND) {
             Compatibility::MIN_PROTOCOL_SUPPORTED,
             Compatibility::MAX_PROTOCOL_SUPPORTED,
             expected_fn,
-            deserializer);
-  }
-  {
-    h.flags |= APPEND_Header::E2E_TRACING_ON;
-    APPEND_Message m(h,
-                     LSN_INVALID,
-                     attrs,
-                     PayloadHolder(strdup("hello"), 5),
-                     "TRACING_INFORMATION");
-    auto check = [&](const APPEND_Message& m2, uint16_t proto) {
-      checkAPPEND(m, m2, proto);
-    };
-    DO_TEST(m,
-            check,
-            Compatibility::MIN_PROTOCOL_SUPPORTED,
-            Compatibility::MAX_PROTOCOL_SUPPORTED,
-            expected_fn,
-            deserializer);
+            nullptr);
   }
   {
     h.flags |= APPEND_Header::WRITE_STREAM_REQUEST;
@@ -899,8 +842,7 @@ TEST_F(MessageSerializationTest, APPEND) {
     APPEND_Message m(h,
                      LSN_INVALID,
                      attrs,
-                     PayloadHolder(strdup("hello"), 5),
-                     "TRACING_INFORMATION",
+                     PayloadHolder::copyString("hello"),
                      stream_req_id);
     auto check = [&](const APPEND_Message& m2, uint16_t proto) {
       checkAPPEND(m, m2, proto);
@@ -910,7 +852,7 @@ TEST_F(MessageSerializationTest, APPEND) {
             Compatibility::MIN_PROTOCOL_SUPPORTED,
             Compatibility::MAX_PROTOCOL_SUPPORTED,
             expected_fn,
-            deserializer);
+            nullptr);
   }
   {
     h.flags |= APPEND_Header::WRITE_STREAM_REQUEST;
@@ -920,8 +862,7 @@ TEST_F(MessageSerializationTest, APPEND) {
     APPEND_Message m(h,
                      LSN_INVALID,
                      attrs,
-                     PayloadHolder(strdup("hello"), 5),
-                     "TRACING_INFORMATION",
+                     PayloadHolder::copyString("hello"),
                      stream_req_id);
     auto check = [&](const APPEND_Message& m2, uint16_t proto) {
       checkAPPEND(m, m2, proto);
@@ -931,7 +872,7 @@ TEST_F(MessageSerializationTest, APPEND) {
             Compatibility::MIN_PROTOCOL_SUPPORTED,
             Compatibility::MAX_PROTOCOL_SUPPORTED,
             expected_fn,
-            deserializer);
+            nullptr);
   }
 }
 
@@ -959,7 +900,7 @@ TEST_F(MessageSerializationTest, RECORD) {
   byte_offsets.setCounter(BYTE_OFFSET, 10);
   RECORD_Message m(h,
                    TrafficClass::REBUILD,
-                   Payload(payload.data(), payload.size()).dup(),
+                   PayloadHolder::copyString(payload),
                    std::make_unique<ExtraMetadata>(reb),
                    RECORD_Message::Source::LOCAL_LOG_STORE,
                    std::move(byte_offsets));
@@ -1009,7 +950,7 @@ TEST_F(MessageSerializationTest, RECORD_WithWriteStream) {
   byte_offsets.setCounter(BYTE_OFFSET, 10);
   RECORD_Message m(h,
                    TrafficClass::REBUILD,
-                   Payload(payload.data(), payload.size()).dup(),
+                   PayloadHolder::copyString(payload),
                    std::make_unique<ExtraMetadata>(reb),
                    RECORD_Message::Source::LOCAL_LOG_STORE,
                    std::move(byte_offsets));
@@ -1046,9 +987,6 @@ TailRecord genTailRecord(bool include_payload) {
   TailRecordHeader::flags_t flags =
       (include_payload ? TailRecordHeader::HAS_PAYLOAD : 0);
   flags |= TailRecordHeader::OFFSET_WITHIN_EPOCH;
-  void* payload_flat = malloc(20);
-  memset(payload_flat, 0, 20);
-  std::strncpy((char*)payload_flat, "Tail Record Test.", 20);
   return TailRecord(
       TailRecordHeader{
           logid_t(0xBBC18E8AA44783D3),
@@ -1058,8 +996,9 @@ TailRecord genTailRecord(bool include_payload) {
           flags,
           {}},
       OffsetMap({{BYTE_OFFSET, 2349045994592}}),
-      include_payload ? std::make_shared<PayloadHolder>(payload_flat, 20)
-                      : nullptr);
+      include_payload ? PayloadHolder::copyString(
+                            std::string("Tail Record Test.\0\0\0", 20))
+                      : PayloadHolder());
 }
 } // namespace
 
@@ -1106,7 +1045,7 @@ TEST_F(MessageSerializationTest, SEALED) {
         "22020000030200000000000018000000140000005461696C205265636F726420546573"
         "742E000000";
 
-    // this test involves contructing an evbuffer based payload holder and has
+    // this test involves contructing an payload holder and has
     // to be done on a worker thread
     auto test = [&] {
       DO_TEST(m,
@@ -1132,7 +1071,7 @@ TEST_F(MessageSerializationTest, SEALED) {
         "0000000060540DEE22020000030200000000000018000000140000005461696C205265"
         "636F726420546573742E000000";
 
-    // this test involves contructing an evbuffer based payload holder and has
+    // this test involves contructing an payload holder and has
     // to be done on a worker thread
     auto test = [&] {
       DO_TEST(m,
@@ -1435,9 +1374,9 @@ TEST_F(MessageSerializationTest, CLEAN) {
 
 namespace {
 template <typename MSG, MessageType Type>
-std::unique_ptr<MSG> deserialize(struct evbuffer* evbuf, size_t size) {
+std::unique_ptr<MSG> deserialize(std::unique_ptr<folly::IOBuf> iobuf) {
   const auto proto = Compatibility::MAX_PROTOCOL_SUPPORTED;
-  ProtocolReader reader(Type, evbuf, size, proto);
+  ProtocolReader reader(Type, std::move(iobuf), proto);
   std::unique_ptr<Message> msg = MSG::deserialize(reader).msg;
   return checked_downcast<std::unique_ptr<MSG>>(std::move(msg));
 }
@@ -1447,10 +1386,7 @@ std::unique_ptr<MSG> deserialize(struct evbuffer* evbuf, size_t size) {
 // a) the message itself is correctly deserialized (extra bytes are ignored)
 // b) the next message in the evbuffer can be successfully deserialized
 TEST_F(MessageSerializationTest, DrainExtraBytes) {
-  struct evbuffer* evbuf = LD_EV(evbuffer_new)();
-  SCOPE_EXIT {
-    LD_EV(evbuffer_free)(evbuf);
-  };
+  auto iobuf = folly::IOBuf::create(IOBUF_ALLOCATION_UNIT);
 
   const uint16_t proto = Compatibility::MAX_PROTOCOL_SUPPORTED;
   const std::string extra = "foo";
@@ -1461,13 +1397,13 @@ TEST_F(MessageSerializationTest, DrainExtraBytes) {
       HELLO_flags_t(0),
       request_id_t(0),
   }};
-  ProtocolWriter w1(hello_msg.type_, evbuf, proto);
+  ProtocolWriter w1(hello_msg.type_, iobuf.get(), proto);
   hello_msg.serialize(w1);
   size_t hello_size = w1.result();
   ASSERT_LT(0, hello_size);
   // write some extra bytes after the HELLO message
-
-  ASSERT_EQ(0, LD_EV(evbuffer_add)(evbuf, extra.data(), extra.size()));
+  memcpy(iobuf->writableTail(), extra.data(), extra.size());
+  iobuf->append(extra.size());
   hello_size += extra.size();
 
   // Now write a FixedSizeMessage followed by a couple of trailing bytes (this
@@ -1475,20 +1411,21 @@ TEST_F(MessageSerializationTest, DrainExtraBytes) {
   DELETE_Message delete_msg{DELETE_Header{
       RecordID(esn_t(1), epoch_t(1), logid_t(1)), 1, 0 /* shard */
   }};
-  ProtocolWriter w2(delete_msg.type_, evbuf, proto);
+  ProtocolWriter w2(delete_msg.type_, iobuf.get(), proto);
   delete_msg.serialize(w2);
   size_t delete_size = w2.result();
   ASSERT_LT(0, delete_size);
 
-  // Deserialize each message from the evbuffer and verify that they match.
+  // Deserialize each message from the iobuf and verify that they match.
   auto hello_deserialized =
-      deserialize<HELLO_Message, MessageType::HELLO>(evbuf, hello_size);
+      deserialize<HELLO_Message, MessageType::HELLO>(iobuf->clone());
   ASSERT_EQ(0,
             memcmp(&hello_msg.header_,
                    &hello_deserialized->header_,
                    sizeof(hello_msg.header_)));
+  iobuf->trimStart(hello_size);
   auto delete_deserialized =
-      deserialize<DELETE_Message, MessageType::HELLO>(evbuf, delete_size);
+      deserialize<DELETE_Message, MessageType::HELLO>(iobuf->clone());
   ASSERT_EQ(0,
             memcmp(&delete_msg.getHeader(),
                    &delete_deserialized->getHeader(),
@@ -1558,7 +1495,7 @@ TEST_F(MessageSerializationTest, GET_SEQ_STATE) {
     EXPECT_EQ(7, m2.request_id_.val());
     EXPECT_EQ(flags8, m2.flags_);
     EXPECT_EQ(GetSeqStateRequest::Context::GET_TAIL_RECORD, m2.calling_ctx_);
-    EXPECT_FALSE(m2.min_epoch_.hasValue());
+    EXPECT_FALSE(m2.min_epoch_.has_value());
   };
   auto check8_with_min_epoch = [&](const GET_SEQ_STATE_Message& m2,
                                    uint16_t /*proto*/) {
@@ -1566,8 +1503,8 @@ TEST_F(MessageSerializationTest, GET_SEQ_STATE) {
     EXPECT_EQ(7, m2.request_id_.val());
     EXPECT_EQ(flags8 | GET_SEQ_STATE_Message::MIN_EPOCH, m2.flags_);
     EXPECT_EQ(GetSeqStateRequest::Context::GET_TAIL_RECORD, m2.calling_ctx_);
-    EXPECT_TRUE(m2.min_epoch_.hasValue());
-    if (m2.min_epoch_.hasValue()) {
+    EXPECT_TRUE(m2.min_epoch_.has_value());
+    if (m2.min_epoch_.has_value()) {
       EXPECT_EQ(min_ep, m2.min_epoch_.value());
     }
   };
@@ -1579,7 +1516,7 @@ TEST_F(MessageSerializationTest, GET_SEQ_STATE) {
         m2.flags_,
         proto < Compatibility::IS_LOG_EMPTY_IN_GSS_REPLY ? flags8 : flags32);
     EXPECT_EQ(GetSeqStateRequest::Context::GET_TAIL_RECORD, m2.calling_ctx_);
-    EXPECT_FALSE(m2.min_epoch_.hasValue());
+    EXPECT_FALSE(m2.min_epoch_.has_value());
   };
   auto check32_with_min_epoch = [&](const GET_SEQ_STATE_Message& m2,
                                     uint16_t proto) {
@@ -1590,8 +1527,8 @@ TEST_F(MessageSerializationTest, GET_SEQ_STATE) {
                   ? flags8 | GET_SEQ_STATE_Message::MIN_EPOCH
                   : flags32 | GET_SEQ_STATE_Message::MIN_EPOCH);
     EXPECT_EQ(GetSeqStateRequest::Context::GET_TAIL_RECORD, m2.calling_ctx_);
-    EXPECT_TRUE(m2.min_epoch_.hasValue());
-    if (m2.min_epoch_.hasValue()) {
+    EXPECT_TRUE(m2.min_epoch_.has_value());
+    if (m2.min_epoch_.has_value()) {
       EXPECT_EQ(min_ep, m2.min_epoch_.value());
     }
   };

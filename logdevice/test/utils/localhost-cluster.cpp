@@ -83,7 +83,7 @@ void parse_command_line(int argc, const char* argv[]) {
     ("nracks",
      value<int>(&options::nracks)
      ->default_value(options::nracks),
-     "number of racks in the cluster to spread the nodes accross")
+     "number of racks in the cluster to spread the nodes across")
 
     ("nodeset-size",
      value<int>(&options::nodeset_size),
@@ -389,16 +389,28 @@ int shell(Cluster& cluster) {
 
   if (options::enable_logsconfig_manager) {
     // If logs config manager is enabled, print steps to create a log range
-    auto cfg = cluster.getConfig()->getServerConfig();
     int nstorage_nodes =
-        std::count_if(cfg->getNodes().begin(),
-                      cfg->getNodes().end(),
-                      [](Configuration::Nodes::value_type kv) {
-                        return kv.second.isReadableStorageNode();
-                      });
+        cluster.getConfig()->getNodesConfiguration()->getStorageNodes().size();
+
+    auto* admin_server = cluster.getAdminServer();
+    auto admin_address = admin_server->address_;
+    std::string ldshell_admin_arg;
+    if (admin_address.isUnixAddress()) {
+      ldshell_admin_arg = folly::sformat(
+          "--admin-server-unix-path={}", admin_address.getPath());
+    } else {
+      ldshell_admin_arg =
+          folly::sformat("--admin-server-host={} --admin-server-port={}",
+                         admin_address.toStringNoPort(),
+                         admin_address.port());
+    }
+
+    std::cout << "\033[1;31mTo connect to the cluster via ldshell:\033[1;0m"
+              << std::endl;
+    std::cout << "\tldshell " << ldshell_admin_arg << std::endl;
 
     std::cout << "\033[1;31mTo create a log range:\033[1;0m" << std::endl;
-    std::cout << "\tldshell -c " << cluster.getConfigPath() << " logs create"
+    std::cout << "\tldshell " << ldshell_admin_arg << " logs create"
               << " --from 1 --to " << options::nlogs
               << " --replicate-across \"node: " << std::min(2, nstorage_nodes)
               << "\" test_logs" << std::endl
@@ -409,8 +421,7 @@ int shell(Cluster& cluster) {
       std::cout << "(We've already created one for you)";
     }
     std::cout << "\033[1;0m" << std::endl;
-    std::cout << "\tldshell -c " << cluster.getConfigPath() << " logs show"
-              << std::endl
+    std::cout << "\tldshell " << ldshell_admin_arg << " logs show" << std::endl
               << std::endl;
   }
 
@@ -472,20 +483,18 @@ int shell(Cluster& cluster) {
   }
 #endif
 
+  auto* admin_server = cluster.getAdminServer();
+  ld_check(admin_server != nullptr);
   auto& first_node = cluster.getNode(0);
   std::cout << "\033[1;31mTo tail the error log of a node:\033[1;0m"
             << std::endl;
   std::cout << "\ttail -f " << first_node.getLogPath() << std::endl
             << std::endl;
-  auto first_node_cmd_addr = first_node.getCommandSockAddr();
-  std::cout << "\033[1;31mTo send an admin command to a node:\033[1;0m"
+
+  std::cout << "\033[1;31mTo tail the error log of the admin server:\033[1;0m"
             << std::endl;
-  if (first_node_cmd_addr.isUnixAddress()) {
-    std::cout << "\techo info | nc -U " << first_node_cmd_addr.getPath();
-  } else {
-    std::cout << "\techo info | nc 0 " << first_node_cmd_addr.port();
-  }
-  std::cout << std::endl;
+  std::cout << "\ttail -f " << admin_server->getLogPath() << std::endl
+            << std::endl;
 
   // The user can stop by sending SIGTERM or SIGINT
   struct sigaction sa;
@@ -528,6 +537,7 @@ int main(int argc, const char* argv[]) {
   parse_command_line(argc, argv);
 
   IntegrationTestUtils::ClusterFactory factory;
+  factory.useStandaloneAdminServer(true);
   factory.setNumLogs(options::nlogs);
   factory.setNumLogsConfigManagerLogs(options::nlogs);
   factory.useDefaultTrafficShapingConfig(options::traffic_shaping);
@@ -546,22 +556,22 @@ int main(int argc, const char* argv[]) {
     factory.setLogGroupName(options::range_name);
   }
   if (options::replication != -1) {
-    log_attrs.set_replicationFactor(options::replication);
+    log_attrs = log_attrs.with_replicationFactor(options::replication);
   }
   if (options::extra_copies != -1) {
-    log_attrs.set_extraCopies(options::extra_copies);
+    log_attrs = log_attrs.with_extraCopies(options::extra_copies);
   }
   if (options::synced_copies != -1) {
-    log_attrs.set_syncedCopies(options::synced_copies);
+    log_attrs = log_attrs.with_syncedCopies(options::synced_copies);
   }
   if (options::backlog.count() >= 0) {
-    log_attrs.set_backlogDuration(options::backlog);
+    log_attrs = log_attrs.with_backlogDuration(options::backlog);
   }
   if (options::scd_enabled) {
-    log_attrs.set_scdEnabled(true);
+    log_attrs = log_attrs.with_scdEnabled(true);
   }
   if (options::nodeset_size != -1) {
-    log_attrs.set_nodeSetSize(options::nodeset_size);
+    log_attrs = log_attrs.with_nodeSetSize(options::nodeset_size);
   }
   if (options::use_tcp) {
     factory.useTcp();
@@ -572,19 +582,20 @@ int main(int argc, const char* argv[]) {
 
   factory.setLogAttributes(log_attrs);
 
-  logsconfig::LogAttributes event_log_attrs;
-  event_log_attrs.set_backlogDuration(folly::none);
-  event_log_attrs.set_replicationFactor(
-      options::nodeset_size == -1
-          ? std::min(5, (options::nnodes + 1) / 2)
-          : std::min(5, (options::nodeset_size + 1) / 2));
+  auto event_log_attrs =
+      logsconfig::LogAttributes()
+          .with_backlogDuration(folly::none)
+          .with_replicationFactor(
+              options::nodeset_size == -1
+                  ? std::min(5, (options::nnodes + 1) / 2)
+                  : std::min(5, (options::nodeset_size + 1) / 2));
   factory.setEventLogAttributes(event_log_attrs);
 
   if (!options::root.empty()) {
     factory.setRootPath(options::root);
   }
 
-  if (options::cluster_name.hasValue()) {
+  if (options::cluster_name.has_value()) {
     factory.setClusterName(options::cluster_name.value());
   }
 
@@ -609,6 +620,12 @@ int main(int argc, const char* argv[]) {
     factory.setParam("--disable-rebuilding", "false");
   }
 
+  // TODO, these should be the default. This is temporary override until we do
+  // that.
+  factory.setParam("--enable-cluster-maintenance-state-machine", "true");
+  factory.setParam("--enable-self-initiated-rebuilding", "true");
+  factory.setParam("--event-log-snapshotting", "true");
+  factory.setParam("--enable-config-synchronization", "false");
   factory.eventLogMode(
       IntegrationTestUtils::ClusterFactory::EventLogMode::SNAPSHOTTED);
   factory.setNumDBShards(options::nshards);
@@ -618,7 +635,9 @@ int main(int argc, const char* argv[]) {
   std::unique_ptr<Cluster> cluster = nullptr;
   try {
     if (options::config_path != "") {
-      auto config = Configuration::fromJsonFile(options::config_path.c_str());
+      auto config = Configuration::fromJsonFile(options::config_path.c_str())
+                        ->withNodesConfiguration(
+                            createSimpleNodesConfig(options::nnodes));
       if (config == nullptr) {
         ld_error("Unable to load config. Could not create cluster");
         return 1;

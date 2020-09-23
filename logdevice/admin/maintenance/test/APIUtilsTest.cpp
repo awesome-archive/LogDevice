@@ -23,7 +23,7 @@ TEST(APIUtilsTest, Validate) {
   {
     MaintenanceDefinition def1;
     auto failed = APIUtils::validateDefinition(def1);
-    ASSERT_TRUE(failed.hasValue());
+    ASSERT_TRUE(failed.has_value());
     ASSERT_EQ("At least one of shards or sequencer_nodes must be set",
               failed->get_message());
   }
@@ -36,27 +36,27 @@ TEST(APIUtilsTest, Validate) {
   def1.set_shard_target_state(ShardOperationalState::DRAINED);
   // user must be set
   auto failed = APIUtils::validateDefinition(def1);
-  ASSERT_TRUE(failed.hasValue());
+  ASSERT_TRUE(failed.has_value());
   ASSERT_EQ("user must be set for the definition to non-empty string",
+            failed->get_message());
+  def1.set_user(INTERNAL_USER);
+  failed = APIUtils::validateDefinition(def1);
+  ASSERT_TRUE(failed.has_value());
+  ASSERT_EQ("This is a reserved user, cannot be used through the API",
             failed->get_message());
   def1.set_user("bunny");
   failed = APIUtils::validateDefinition(def1);
   ASSERT_EQ(folly::none, failed);
 
-  def1.set_user("bun ny");
-  failed = APIUtils::validateDefinition(def1);
-  ASSERT_TRUE(failed.hasValue());
-  ASSERT_EQ("user cannot contain whitespaces", failed->get_message());
-
   def1.set_user("bunny");
   def1.set_sequencer_nodes({node1});
   failed = APIUtils::validateDefinition(def1);
-  ASSERT_TRUE(failed.hasValue());
+  ASSERT_TRUE(failed.has_value());
   ASSERT_EQ("sequencer_target_state must be DISABLED if sequencer_nodes is set",
             failed->get_message());
   def1.set_sequencer_target_state(SequencingState::BOYCOTTED);
   failed = APIUtils::validateDefinition(def1);
-  ASSERT_TRUE(failed.hasValue());
+  ASSERT_TRUE(failed.has_value());
   ASSERT_EQ("sequencer_target_state must be DISABLED if sequencer_nodes is set",
             failed->get_message());
   def1.set_sequencer_target_state(SequencingState::DISABLED);
@@ -65,19 +65,12 @@ TEST(APIUtilsTest, Validate) {
   shards.push_back(mkShardID(2, -10));
   def1.set_shards(shards);
   failed = APIUtils::validateDefinition(def1);
-  ASSERT_TRUE(failed.hasValue());
+  ASSERT_TRUE(failed.has_value());
   ASSERT_EQ("Cannot accept shard_index smaller than -1", failed->get_message());
   shards.pop_back();
   def1.set_shards(shards);
   ASSERT_EQ(folly::none, APIUtils::validateDefinition(def1));
 
-  {
-    MaintenanceDefinition def2 = def1;
-    def2.set_force_restore_rebuilding(true);
-    auto failed2 = APIUtils::validateDefinition(def2);
-    ASSERT_EQ("Setting force_restore_rebuilding is not allowed",
-              failed2->get_message());
-  }
   {
     MaintenanceDefinition def2 = def1;
     def2.set_ttl_seconds(-1);
@@ -269,7 +262,7 @@ TEST(APIUtilsTest, ExpandMaintenances2) {
     auto output = APIUtils::expandMaintenances(request, nodes_config);
     ASSERT_TRUE(output.hasValue());
     ASSERT_EQ(output.value().size(), 1);
-    ASSERT_TRUE(output.value().front().sequencer_nodes.empty());
+    ASSERT_TRUE(output.value().front().sequencer_nodes_ref()->empty());
   }
   {
     // make sure we ignore a node with a wrong role (2)
@@ -278,7 +271,7 @@ TEST(APIUtilsTest, ExpandMaintenances2) {
     auto output = APIUtils::expandMaintenances(request, nodes_config);
     ASSERT_TRUE(output.hasValue());
     ASSERT_EQ(output.value().size(), 1);
-    ASSERT_TRUE(output.value().front().shards.empty());
+    ASSERT_TRUE(output.value().front().shards_ref()->empty());
   }
 }
 

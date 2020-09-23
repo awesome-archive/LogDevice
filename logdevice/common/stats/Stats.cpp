@@ -20,6 +20,7 @@
 
 #include "logdevice/common/stats/ClientHistograms.h"
 #include "logdevice/common/stats/Histogram.h"
+#include "logdevice/common/stats/PerMonitoringTagHistograms.h"
 #include "logdevice/common/stats/PerShardHistograms.h"
 #include "logdevice/common/stats/ServerHistograms.h"
 
@@ -57,7 +58,7 @@ static void aggregateStat(StatsAgg agg,
                           StatsAggOptional override,
                           StatsCounter& out,
                           int64_t in) {
-  aggregateStat(override.hasValue() ? override.value() : agg, out, in);
+  aggregateStat(override.has_value() ? override.value() : agg, out, in);
 }
 
 template <typename H>
@@ -148,6 +149,32 @@ void PerTrafficClassStats::reset() {
 #define RESETTING_STATS
 #define STAT_DEFINE(name, _) name = {};
 #include "logdevice/common/stats/per_traffic_class_stats.inc" // nolint
+}
+
+PerMonitoringTagStats::PerMonitoringTagStats()
+    : histograms{std::make_unique<PerMonitoringTagHistograms>()} {}
+
+PerMonitoringTagStats::PerMonitoringTagStats(const PerMonitoringTagStats& other)
+    : histograms{
+          std::make_unique<PerMonitoringTagHistograms>(*other.histograms)} {
+#define STAT_DEFINE(name, agg) name = other.name;
+#include "logdevice/common/stats/per_monitoring_tag_stats.inc" // nolint
+}
+
+void PerMonitoringTagStats::aggregate(PerMonitoringTagStats const& other,
+                                      StatsAggOptional agg_override) {
+  aggregateHistogram(agg_override, *histograms, *other.histograms);
+#define STAT_DEFINE(name, agg) \
+  aggregateStat(StatsAgg::agg, agg_override, name, other.name);
+#include "logdevice/common/stats/per_monitoring_tag_stats.inc" // nolint
+}
+
+void PerMonitoringTagStats::reset() {
+  histograms->clear();
+
+#define RESETTING_STATS
+#define STAT_DEFINE(name, _) name = {};
+#include "logdevice/common/stats/per_monitoring_tag_stats.inc" // nolint
 }
 
 PerShapingPriorityStats::PerShapingPriorityStats()
@@ -407,6 +434,16 @@ void Stats::aggregateCompoundStats(Stats const& other,
         other.per_traffic_class_stats[i], agg_override);
   }
 
+  // per_monitoring_tag_stats
+  per_monitoring_tag_stats.withWLock(
+      [&agg_override,
+       other_copy = other.synchronizedCopy(&Stats::per_monitoring_tag_stats)](
+          auto& stats) {
+        for (const auto& [tag, other_stats] : other_copy) {
+          stats[tag].aggregate(other_stats, agg_override);
+        }
+      });
+
   for (int i = 0; i < per_flow_group_stats.size(); ++i) {
     per_flow_group_stats[i].aggregate(
         other.per_flow_group_stats[i], agg_override);
@@ -518,6 +555,8 @@ void Stats::reset() {
       for (auto& tcs : per_traffic_class_stats) {
         tcs.reset();
       }
+
+      per_monitoring_tag_stats.wlock()->clear();
 
       for (auto& fgs : per_flow_group_stats) {
         fgs.reset();
@@ -674,6 +713,15 @@ void Stats::enumerate(EnumerationCallbacks* cb, bool list_all) const {
     PerTrafficClassStats total = totalPerTrafficClassStats();
 #define STAT_DEFINE(c, _) cb->stat(#c, total.c);
 #include "logdevice/common/stats/per_traffic_class_stats.inc" // nolint
+  }
+
+  // Per monitoring tag
+  for (const auto& [tag, stats] : *per_monitoring_tag_stats.ulock()) {
+    for (auto& i : stats.histograms->map()) {
+      cb->histogramWithTag(i.first, tag, *i.second);
+    }
+#define STAT_DEFINE(c, _) cb->statWithTag(#c, tag, stats.c);
+#include "logdevice/common/stats/per_monitoring_tag_stats.inc" // nolint
   }
 
   /* Network Traffic Shaping specific stats */

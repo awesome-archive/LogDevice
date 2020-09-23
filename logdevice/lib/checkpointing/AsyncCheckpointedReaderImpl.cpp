@@ -50,12 +50,22 @@ void AsyncCheckpointedReaderImpl::startReadingFromCheckpoint(
 
 void AsyncCheckpointedReaderImpl::setRecordCallback(
     std::function<bool(std::unique_ptr<DataRecord>&)> cb) {
-  reader_->setRecordCallback(cb);
+  auto save_cb = [this, cb](std::unique_ptr<DataRecord>& record) {
+    setLastLSNInMap(record->logid, record->attrs.lsn);
+    return cb(record);
+  };
+  reader_->setRecordCallback(std::move(save_cb));
 }
 
 void AsyncCheckpointedReaderImpl::setGapCallback(
     std::function<bool(const GapRecord&)> cb) {
-  reader_->setGapCallback(cb);
+  auto save_cb = [this, cb](const GapRecord& record) {
+    if (record.hi != LSN_MAX) {
+      setLastLSNInMap(record.logid, record.hi);
+    }
+    return cb(record);
+  };
+  reader_->setGapCallback(std::move(save_cb));
 }
 
 void AsyncCheckpointedReaderImpl::setDoneCallback(
@@ -73,6 +83,7 @@ int AsyncCheckpointedReaderImpl::startReading(
     lsn_t from,
     lsn_t until,
     const ReadStreamAttributes* attrs) {
+  last_read_lsn_.erase(log_id);
   return reader_->startReading(log_id, from, until, attrs);
 }
 
@@ -83,6 +94,13 @@ int AsyncCheckpointedReaderImpl::stopReading(logid_t log_id,
 
 int AsyncCheckpointedReaderImpl::resumeReading(logid_t log_id) {
   return reader_->resumeReading(log_id);
+}
+
+void AsyncCheckpointedReaderImpl::setMonitoringTier(MonitoringTier tier) {
+  return reader_->setMonitoringTier(tier);
+}
+void AsyncCheckpointedReaderImpl::addMonitoringTag(std::string tag) {
+  return reader_->addMonitoringTag(std::move(tag));
 }
 
 void AsyncCheckpointedReaderImpl::withoutPayload() {
@@ -113,4 +131,10 @@ void AsyncCheckpointedReaderImpl::getBytesBuffered(
     std::function<void(size_t)> callback) {
   reader_->getBytesBuffered(callback);
 }
+
+void AsyncCheckpointedReaderImpl::setReaderName(
+    const std::string& reader_name) {
+  reader_->setReaderName(reader_name);
+}
+
 }} // namespace facebook::logdevice

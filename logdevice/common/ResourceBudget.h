@@ -40,6 +40,7 @@ class ResourceBudget {
     }
     Token const& operator=(Token&& rhs) {
       if (this != &rhs) {
+        release();
         budget_ = rhs.budget_;
         count_ = rhs.count_;
         rhs.budget_ = nullptr;
@@ -124,6 +125,10 @@ class ResourceBudget {
   // called with a lower limit
   int64_t available() const {
     return int64_t(limit_.load()) - used_.load();
+  }
+
+  uint64_t used() const {
+    return used_.load();
   }
 
   // How much of the budget is currently used.

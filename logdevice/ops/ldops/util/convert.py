@@ -18,13 +18,8 @@ import re
 from typing import Dict, List, Mapping, Optional, Pattern
 
 from ldops.const import ALL_SHARDS
-from logdevice.admin.common.types import (
-    LocationScope,
-    NodeID,
-    ReplicationProperty,
-    ShardID,
-)
 from logdevice.admin.nodes.types import ShardStorageState
+from logdevice.common.types import LocationScope, NodeID, ReplicationProperty, ShardID
 
 
 __all__: List[str] = ["to_shard_id", "to_storage_state", "to_replication"]
@@ -45,7 +40,7 @@ def to_shard_id(scope: str) -> ShardID:
     """
     scope = scope.upper()
     if not scope:
-        raise ValueError(f"Cannot parse empty scope")
+        raise ValueError("Cannot parse empty scope")
     match = SHARD_PATTERN.match(scope)
     if match is None:
         # There were no shards, or invalid.
@@ -69,7 +64,7 @@ def to_storage_state(raw_state: str) -> ShardStorageState:
     """
     normal_state = raw_state.upper().replace("-", "_")
     if not normal_state:
-        raise ValueError(f"Cannot parse empty storage-state")
+        raise ValueError("Cannot parse empty storage-state")
     return ShardStorageState[normal_state]
 
 

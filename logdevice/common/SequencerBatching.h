@@ -17,6 +17,7 @@
 #include "logdevice/common/Sender.h"
 #include "logdevice/common/Timestamp.h"
 #include "logdevice/common/buffered_writer/BufferedWriterImpl.h"
+#include "logdevice/common/configuration/logs/LogsConfigTree.h"
 #include "logdevice/common/protocol/APPEND_Message.h"
 
 namespace facebook { namespace logdevice {
@@ -83,8 +84,7 @@ namespace facebook { namespace logdevice {
  */
 
 class Appender;
-class Socket;
-class SocketProxy;
+struct Settings;
 
 class SequencerBatching : public BufferedWriterImpl::AppendCallbackInternal,
                           public BufferedWriterAppendSink {
@@ -143,7 +143,7 @@ class SequencerBatching : public BufferedWriterImpl::AppendCallbackInternal,
   appendBuffered(logid_t,
                  const BufferedWriter::AppendCallback::ContextSet& contexts,
                  AppendAttributes attrs,
-                 const Payload&,
+                 PayloadHolder&&,
                  BufferedWriterAppendSink::AppendRequestCallback,
                  worker_id_t target_worker,
                  int checksum_bits) override;
@@ -180,7 +180,7 @@ class SequencerBatching : public BufferedWriterImpl::AppendCallbackInternal,
   virtual folly::Optional<APPENDED_Header>
   runBufferedAppend(logid_t logid,
                     AppendAttributes attrs,
-                    const Payload& payload,
+                    PayloadHolder&& payload,
                     InternalAppendRequest::Callback callback,
                     APPEND_flags_t flags,
                     int checksum_bits,
@@ -192,7 +192,7 @@ class SequencerBatching : public BufferedWriterImpl::AppendCallbackInternal,
  private:
   Processor* processor_;
   std::atomic<bool> shutting_down_{false};
-  // Processes one incoming APPEND message / buffer() call
+  // Processes one incoming APPEND message / buffer() call.
   struct AppendMessageState {
     // Worker that received the original APPEND message over the wire, on
     // which buffer() was called and on which we need to send the reply.
@@ -200,9 +200,9 @@ class SequencerBatching : public BufferedWriterImpl::AppendCallbackInternal,
     // right thread.
     std::atomic<int> owner_worker;
     ClientID reply_to;
-    // Socket proxy instance which ensures that clientID does not get reused
+    // Socket token instance which ensures that clientID does not get reused
     // even if the socket closes.
-    std::unique_ptr<SocketProxy> socket_proxy;
+    std::shared_ptr<const std::atomic<bool>> socket_token;
     logid_t log_id;
     request_id_t append_request_id;
     folly::IntrusiveListHook list_hook;
@@ -225,7 +225,9 @@ class SequencerBatching : public BufferedWriterImpl::AppendCallbackInternal,
   // sequencers.
   std::atomic<size_t> totalBufferedAppendSize_{0};
 
-  bool shouldPassthru(const Appender& appender) const;
+  bool shouldPassthru(const Appender& appender,
+                      const logsconfig::LogGroupNode* group,
+                      const Settings& settings) const;
 
   // Common handling of BufferedWriter success and failure
   class DispatchResultsRequest;

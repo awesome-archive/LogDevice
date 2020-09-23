@@ -9,11 +9,10 @@
 
 #include "logdevice/common/AdminCommandTable.h"
 #include "logdevice/common/request_util.h"
-#include "logdevice/server/LogRebuilding.h"
-#include "logdevice/server/RebuildingCoordinator.h"
 #include "logdevice/server/ServerWorker.h"
 #include "logdevice/server/admincommands/AdminCommand.h"
 #include "logdevice/server/rebuilding/ChunkRebuilding.h"
+#include "logdevice/server/rebuilding/RebuildingCoordinator.h"
 
 namespace facebook { namespace logdevice { namespace commands {
 
@@ -40,30 +39,28 @@ class InfoRebuildingShards : public AdminCommand {
 
   static void runImpl(bool json, Server* server, folly::io::Appender& out) {
     InfoRebuildingShardsTable table(!json,
-                                    "Shard id",                     // 0
-                                    "Rebuilding set",               // 1
-                                    "Version",                      // 2
-                                    "Global window end",            // 3
-                                    "Local window end",             // 4
-                                    "Num logs waiting for plan",    // 5
-                                    "Num logs catching up",         // 6
-                                    "Num logs queued for catch up", // 7
-                                    "Num logs in restart queue",    // 8
-                                    "Total memory used",            // 9
-                                    "Stall timer active",           // 10
-                                    "Num Restart timers active",    // 11
-                                    "Num active logs",              // 12
-                                    "Participating",                // 13
-                                    "Time by state",                // 14
-                                    "Task in flight",               // 15
-                                    "Persistent error",             // 16
-                                    "Read buffer bytes",            // 17
-                                    "Records in flight",            // 18
-                                    "Read pointer",                 // 19
-                                    "Progress");                    // 20
+                                    "Shard id",                  // 0
+                                    "Rebuilding set",            // 1
+                                    "Version",                   // 2
+                                    "Global window end",         // 3
+                                    "Progress timestamp",        // 4
+                                    "Num logs waiting for plan", // 5
+                                    "Total memory used",         // 6
+                                    "Num active logs",           // 7
+                                    "Participating",             // 8
+                                    "Time by state",             // 9
+                                    "Task in flight",            // 10
+                                    "Persistent error",          // 11
+                                    "Read buffer bytes",         // 12
+                                    "Records in flight",         // 13
+                                    "Read pointer",              // 14
+                                    "Progress");                 // 15
 
+    auto workerType = EventLogStateMachine::workerType(server->getProcessor());
+    auto workerIdx = EventLogStateMachine::getWorkerIdx(
+        server->getProcessor()->getWorkerCount(workerType));
     auto tables =
-        run_on_workers(server->getProcessor(), {0}, WorkerType::GENERAL, [&]() {
+        run_on_workers(server->getProcessor(), {workerIdx}, workerType, [&]() {
           InfoRebuildingShardsTable t(table);
           if (server->getRebuildingCoordinator()) {
             server->getRebuildingCoordinator()->getDebugInfo(t);
@@ -102,48 +99,26 @@ class InfoRebuildingLogs : public AdminCommand {
 
   static void runImpl(bool json, Server* server, folly::io::Appender& out) {
     InfoRebuildingLogsTable table(!json,
-                                  "Log id",                    // 0
-                                  "Shard",                     // 1
-                                  "Started",                   // 2
-                                  "Rebuilding set",            // 3
-                                  "Version",                   // 4
-                                  "Until LSN",                 // 5
-                                  "Max timestamp",             // 6
-                                  "Rebuilt up to",             // 7
-                                  "Num replicated",            // 8
-                                  "Bytes replicated",          // 9
-                                  "RR In flight",              // 10
-                                  "NonDurable Stores",         // 11
-                                  "Durable Stores",            // 12
-                                  "RRA In Flight",             // 13
-                                  "NonDurable Amends",         // 14
-                                  "Last storage task status"); // 15
+                                  "Log id",            // 0
+                                  "Shard",             // 1
+                                  "Until LSN",         // 2
+                                  "Rebuilt up to",     // 3
+                                  "Num replicated",    // 4
+                                  "Bytes replicated"); // 5
 
-    if (server->getParameters()->getRebuildingSettings()->enable_v2) {
-      auto funcs = run_on_workers(
-          server->getProcessor(), {0}, WorkerType::GENERAL, [&]() {
-            if (server->getRebuildingCoordinator()) {
-              return server->getRebuildingCoordinator()
-                  ->beginGetLogsDebugInfo();
-            }
-            return std::function<void(InfoRebuildingLogsTable&)>();
-          });
-      ld_check_le(funcs.size(), 1);
-      if (funcs.size() == 1 && funcs[0]) {
-        funcs[0](table);
-      }
-    } else {
-      auto tables = run_on_all_workers(server->getProcessor(), [&]() {
-        InfoRebuildingLogsTable t(table);
-        for (auto& r : Worker::onThisThread()->runningLogRebuildings().map) {
-          checked_downcast<LogRebuilding*>(r.second.get())->getDebugInfo(t);
-        }
-        return t;
-      });
-
-      for (int i = 0; i < tables.size(); ++i) {
-        table.mergeWith(std::move(tables[i]));
-      }
+    auto workerType = EventLogStateMachine::workerType(server->getProcessor());
+    auto workerIdx = EventLogStateMachine::getWorkerIdx(
+        server->getProcessor()->getWorkerCount(workerType));
+    auto funcs =
+        run_on_workers(server->getProcessor(), {workerIdx}, workerType, [&]() {
+          if (server->getRebuildingCoordinator()) {
+            return server->getRebuildingCoordinator()->beginGetLogsDebugInfo();
+          }
+          return std::function<void(InfoRebuildingLogsTable&)>();
+        });
+    ld_check_le(funcs.size(), 1);
+    if (funcs.size() == 1 && funcs[0]) {
+      funcs[0](table);
     }
 
     json ? table.printJson(out) : table.print(out);
@@ -199,8 +174,9 @@ class InfoRebuildingChunks : public AdminCommand {
   }
 };
 
-// TODO (#35636262): Migrate ldquery away from it and remove.
-//                   Also get rid of the runImpl()s above.
+// TODO (#35636262): Remove this after ldquery stops using it. If you're reading
+//                   this after June 2020, please go ahead and remove this
+//                   class along with its usage in AdminCommandFactory.cpp
 class InfoRebuildingsLegacy : public AdminCommand {
   using AdminCommand::AdminCommand;
 

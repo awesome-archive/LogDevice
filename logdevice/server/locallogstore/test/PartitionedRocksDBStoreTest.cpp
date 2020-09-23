@@ -31,7 +31,9 @@
 #include "logdevice/common/util.h"
 #include "logdevice/server/ServerProcessor.h"
 #include "logdevice/server/locallogstore/PartitionMetadata.h"
+#include "logdevice/server/locallogstore/PartitionedRocksDBStoreIterators.h"
 #include "logdevice/server/locallogstore/RocksDBCompactionFilter.h"
+#include "logdevice/server/locallogstore/RocksDBCustomiser.h"
 #include "logdevice/server/locallogstore/RocksDBEnv.h"
 #include "logdevice/server/locallogstore/RocksDBKeyFormat.h"
 #include "logdevice/server/locallogstore/RocksDBListener.h"
@@ -46,7 +48,6 @@
 using namespace facebook::logdevice;
 using RocksDBKeyFormat::CopySetIndexKey;
 using RocksDBKeyFormat::DataKey;
-using RocksDBKeyFormat::LogMetaKey;
 using RocksDBKeyFormat::PartitionDirectoryKey;
 using DirectoryEntry = PartitionedRocksDBStore::DirectoryEntry;
 using Params = ServerSettings::StoragePoolParams;
@@ -101,6 +102,7 @@ class TestPartitionedRocksDBStore : public PartitionedRocksDBStore {
                                 path,
                                 std::move(rocksdb_config),
                                 config,
+                                RocksDBCustomiser::defaultInstance(),
                                 stats,
                                 /* io_tracing */ nullptr,
                                 DeferInit::YES),
@@ -149,9 +151,9 @@ class TestPartitionedRocksDBStore : public PartitionedRocksDBStore {
     auto& state = states_[(int)type];
     std::unique_lock<std::mutex> lock(test_mutex_);
 
-    if (state.current_promise_.hasValue()) {
+    if (state.current_promise_.has_value()) {
       state.current_promise_.value().set_value();
-      state.current_promise_.clear();
+      state.current_promise_.reset();
     }
 
     state.cv_.wait(lock, [&] {
@@ -693,7 +695,7 @@ class PartitionedRocksDBStoreTest : public ::testing::Test {
                Type type,
                folly::Optional<std::string> key)
         : type(type), logid(logid), lsn(lsn) {
-      if (key.hasValue()) {
+      if (key.has_value()) {
         optional_keys.insert(std::make_pair(KeyType::FINDKEY, key.value()));
       }
     }
@@ -703,7 +705,7 @@ class PartitionedRocksDBStoreTest : public ::testing::Test {
                uint64_t timestamp,
                folly::Optional<std::string> key)
         : logid(logid), lsn(lsn), timestamp(timestamp), index(index) {
-      if (key.hasValue()) {
+      if (key.has_value()) {
         optional_keys.insert(std::make_pair(KeyType::FINDKEY, key.value()));
       }
     }
@@ -718,7 +720,7 @@ class PartitionedRocksDBStoreTest : public ::testing::Test {
           lsn(lsn),
           timestamp(timestamp),
           durability(d) {
-      if (key.hasValue()) {
+      if (key.has_value()) {
         optional_keys.insert(std::make_pair(KeyType::FINDKEY, key.value()));
       }
     }
@@ -756,40 +758,43 @@ class PartitionedRocksDBStoreTest : public ::testing::Test {
     // 7-day retention for logs 300-399,
     // Infinite retention for logs 400-409.
     auto logs_config = std::make_shared<configuration::LocalLogsConfig>();
-    logsconfig::LogAttributes log_attrs;
-
-    log_attrs.set_backlogDuration(std::chrono::seconds(3600 * 24 * 1));
-    log_attrs.set_replicationFactor(3);
+    auto log_attrs =
+        logsconfig::LogAttributes()
+            .with_backlogDuration(std::chrono::seconds(3600 * 24 * 1))
+            .with_replicationFactor(3);
     logs_config->insert(
         boost::icl::right_open_interval<logid_t::raw_type>(1, 100),
         "lg1",
         log_attrs);
-    log_attrs.set_backlogDuration(std::chrono::seconds(3600 * 24 * 2));
+    log_attrs =
+        log_attrs.with_backlogDuration(std::chrono::seconds(3600 * 24 * 2));
     logs_config->insert(
         boost::icl::right_open_interval<logid_t::raw_type>(100, 200),
         "lg2",
         log_attrs);
-    log_attrs.set_backlogDuration(std::chrono::seconds(3600 * 24 * 3));
+    log_attrs =
+        log_attrs.with_backlogDuration(std::chrono::seconds(3600 * 24 * 3));
     logs_config->insert(
         boost::icl::right_open_interval<logid_t::raw_type>(200, 300),
         "lg3",
         log_attrs);
 
-    log_attrs.set_backlogDuration(std::chrono::seconds(3600 * 24 * 7));
+    log_attrs =
+        log_attrs.with_backlogDuration(std::chrono::seconds(3600 * 24 * 7));
     logs_config->insert(
         boost::icl::right_open_interval<logid_t::raw_type>(300, 400),
         "logs_can_disappear",
         log_attrs);
 
-    log_attrs.set_backlogDuration(folly::none);
+    log_attrs = log_attrs.with_backlogDuration(folly::none);
     logs_config->insert(
         boost::icl::right_open_interval<logid_t::raw_type>(400, 410),
         "infinite_retention",
         log_attrs);
 
     // Event log.
-    log_attrs.set_backlogDuration(folly::none);
-    log_attrs.set_replicationFactor(3);
+    log_attrs =
+        log_attrs.with_backlogDuration(folly::none).with_replicationFactor(3);
     configuration::InternalLogs internal_logs;
     ld_check(internal_logs.insert("event_log_deltas", log_attrs));
 
@@ -803,9 +808,10 @@ class PartitionedRocksDBStoreTest : public ::testing::Test {
     gossip_settings.enabled = false; // we don't need failure detector
     UpdateableSettings<GossipSettings> ugossip_settings(
         std::move(gossip_settings));
+
     processor_ = ServerProcessor::createNoInit(
-        /* audit log */ nullptr,
         /* sharded storage thread pool */ nullptr,
+        /* log storage state map */ nullptr,
         UpdateableSettings<ServerSettings>(
             create_default_settings<ServerSettings>()),
         std::move(ugossip_settings),
@@ -813,11 +819,12 @@ class PartitionedRocksDBStoreTest : public ::testing::Test {
             create_default_settings<AdminServerSettings>()),
         updateable_config,
         updateable_settings,
+        folly::none,
         true,
         300,
         &stats_);
 
-    temp_dir_ = createTemporaryDir("TemporaryLogStore");
+    temp_dir_ = std::make_unique<TemporaryDirectory>("TemporaryLogStore");
     ld_check(temp_dir_);
     path_ = temp_dir_->path().string();
     openStore();
@@ -858,7 +865,10 @@ class PartitionedRocksDBStoreTest : public ::testing::Test {
     if (!env_) {
       rocksdb_settings_ = UpdateableSettings<RocksDBSettings>(
           RocksDBSettings::defaultTestSettings());
-      settings_updater_ = std::make_unique<SettingsUpdater>();
+
+      if (!settings_updater_) {
+        settings_updater_ = std::make_unique<SettingsUpdater>();
+      }
       settings_updater_->registerSettings(rocksdb_settings_);
 
       settings_overrides_.clear();
@@ -1021,7 +1031,7 @@ class PartitionedRocksDBStoreTest : public ::testing::Test {
       // lifetime is a superset of DB lifelime.
       return LSN_INVALID;
     }
-    return state->getTrimPoint().value_or(LSN_INVALID);
+    return state->getTrimPoint();
   }
 
   epoch_t getPerEpochLogMetadataTrimPoint(logid_t log_id) {
@@ -1031,7 +1041,7 @@ class PartitionedRocksDBStoreTest : public ::testing::Test {
       return EPOCH_INVALID;
     }
     auto mtp = state->getPerEpochLogMetadataTrimPoint();
-    return mtp.hasValue() ? mtp.value() : EPOCH_INVALID;
+    return mtp.has_value() ? mtp.value() : EPOCH_INVALID;
   }
 
   int updateTrimPoint(logid_t log_id, lsn_t trim_point) {
@@ -1529,7 +1539,7 @@ class PartitionedRocksDBStoreTest : public ::testing::Test {
     return res;
   }
 
-  std::unique_ptr<folly::test::TemporaryDirectory> temp_dir_;
+  std::unique_ptr<TemporaryDirectory> temp_dir_;
   std::string path_;
 
   Settings settings_;
@@ -4323,7 +4333,8 @@ TEST_F(PartitionedRocksDBStoreTest, IOPrio) {
   CompactionFilter filter;
 
   auto customize_config = [&](RocksDBLogStoreConfig& cfg) {
-    env = std::make_unique<RocksDBEnv>(cfg.rocksdb_settings_,
+    env = std::make_unique<RocksDBEnv>(rocksdb::Env::Default(),
+                                       cfg.rocksdb_settings_,
                                        /* stats */ nullptr,
                                        std::vector<IOTracing*>());
     cfg.options_.env = env.get();
@@ -5788,8 +5799,10 @@ TEST_F(PartitionedRocksDBStoreTest, DeleteRatelimit) {
   // SstFileManager, which ratelimits deletes, needs RocksDBEnv for OS
   // functionality like the filesystem
   if (!env_) {
-    env_ = std::make_unique<RocksDBEnv>(
-        rocksdb_settings_, /* stats */ nullptr, std::vector<IOTracing*>());
+    env_ = std::make_unique<RocksDBEnv>(rocksdb::Env::Default(),
+                                        rocksdb_settings_,
+                                        /* stats */ nullptr,
+                                        std::vector<IOTracing*>());
   }
 
   // Measure with fast settings.
@@ -7235,6 +7248,15 @@ TEST_F(PartitionedRocksDBStoreTest, PrependingSmokeTest) {
         }
         partition_id_t new_p1 = p2 - target_cnt + 1;
 
+        // Thread sanitizer's deadlock detector currently has a hard limit of
+        // 64 simultaneous locks. Don't drop more than 20 partitions at a time
+        // because dropPartitionsUpTo() locks each partition's mutex.
+#if defined(FOLLY_SANITIZE_THREAD)
+        if (new_p1 + 20 < p2) {
+          new_p1 = p2 - 20;
+        }
+#endif
+
         // We'll update first_partition and drop/prepend partitions.
         // Do these 2 operations in random order, defined by this boolean.
         bool order = rnd() % 2 == 0;
@@ -8033,13 +8055,15 @@ TEST_F(PartitionedRocksDBStoreTest, AllLogsIter) {
   LocalLogStore::ReadOptions read_options(
       "PartitionedRocksDBStoreTest.AllLogsIter");
   read_options.allow_copyset_index = true;
+  LocalLogStore::ReadStats stats;
   auto it = store_->readAllLogs(read_options, folly::none);
 
   auto set_it = records.begin();
   std::unique_ptr<LocalLogStore::AllLogsIterator::Location> mid_location,
       last_location, location_21;
-  for (it->seek(*it->minLocation()); it->state() == IteratorState::AT_RECORD;
-       it->next()) {
+  for (it->seek(*it->minLocation(), nullptr, &stats);
+       it->state() == IteratorState::AT_RECORD;
+       it->next(nullptr, &stats)) {
     if (set_it == records.end()) {
       ADD_FAILURE();
     } else {
@@ -8050,7 +8074,7 @@ TEST_F(PartitionedRocksDBStoreTest, AllLogsIter) {
 
     verifyRecord(it->getLogID(), it->getLSN(), it->getRecord());
 
-    // Save some Location's along the way.
+    // Save some Location-s along the way.
     if (it->getLogID() == log1 && it->getLSN() == 300) {
       location_21 = it->getLocation();
     }
@@ -8072,16 +8096,16 @@ TEST_F(PartitionedRocksDBStoreTest, AllLogsIter) {
   store_->createPartition();
   write(log1, 400, 41);
   it->invalidate();
-  it->seek(*last_location);
+  it->seek(*last_location, nullptr, &stats);
   ASSERT_EQ(IteratorState::AT_RECORD, it->state());
-  it->next();
+  it->next(nullptr, &stats);
   EXPECT_EQ(IteratorState::AT_END, it->state());
 
   ld_info("Seeking a new iterator to a location returned by old iterator. "
           "Checking that the seek goes to the right record and that iterator "
           "sees new record.");
   auto it2 = store_->readAllLogs(read_options, folly::none);
-  it2->seek(*mid_location);
+  it2->seek(*mid_location, nullptr, &stats);
   ASSERT_EQ(IteratorState::AT_RECORD, it2->state());
   EXPECT_EQ(log2, it2->getLogID());
   EXPECT_EQ(300, it2->getLSN());
@@ -8089,7 +8113,7 @@ TEST_F(PartitionedRocksDBStoreTest, AllLogsIter) {
       std::make_tuple(store_->getPartitionList()->back()->id_ - 2, log2, 300));
   ASSERT_FALSE(set_it == records.end());
   std::unique_ptr<LocalLogStore::AllLogsIterator::Location> new_location;
-  for (; it2->state() == IteratorState::AT_RECORD; it2->next()) {
+  for (; it2->state() == IteratorState::AT_RECORD; it2->next(nullptr, &stats)) {
     if (set_it == records.end()) {
       ADD_FAILURE();
     } else {
@@ -8109,29 +8133,26 @@ TEST_F(PartitionedRocksDBStoreTest, AllLogsIter) {
   ASSERT_FALSE(new_location == nullptr);
 
   ld_info("Seeking old iterator to new location.");
-  it->seek(*new_location);
+  it->seek(*new_location, nullptr, &stats);
   EXPECT_EQ(IteratorState::AT_END, it->state());
 
   TestReadFilter filter;
-  LocalLogStore::ReadStats stats;
   using C = TestReadFilter::Call;
 
   ld_info("Reading with all partitions filtered out.");
   it->seek(*it->minLocation(), &filter, &stats);
   EXPECT_EQ(IteratorState::AT_END, it->state());
-  // Note that, as currently implemented, the time range filter is not applied
-  // to unpartitioned CF.
-  EXPECT_EQ(std::vector<C>({C::fullRange(),
-                            C::timeRange(10, 30),
-                            C::emptyRange(),
-                            C::timeRange(210, 230),
-                            C::timeRange(310, 310)}),
+  EXPECT_EQ(std::vector<C>({C::fullRange(),           // unpartitioned
+                            C::timeRange(10, 30),     // partition 0
+                            C::timeRange(210, 230),   // partition 2
+                            C::timeRange(310, 310)}), // partition 3
             filter.history);
   filter.history.clear();
 
   ld_info("Reading with filter accepting 3 records from unpartitioned and "
           "partition 2.");
   filter.time_ranges = {C::FULL_TIME_RANGE, C::EMPTY_TIME_RANGE, 210};
+  filter.record_ranges = {std::make_pair(log1, 300), std::make_pair(log2, 200)};
   filter.records = {21, 23, 2002};
   it->seek(*it->minLocation(), &filter, &stats);
   EXPECT_EQ(std::vector<C>({C::fullRange(),
@@ -8150,8 +8171,8 @@ TEST_F(PartitionedRocksDBStoreTest, AllLogsIter) {
   it->next(&filter, &stats);
   EXPECT_EQ(std::vector<C>({C::call(3001),
                             C::timeRange(10, 30),
-                            C::emptyRange(),
                             C::timeRange(210, 230),
+                            C::recordRange(log1, 300, 300),
                             C::call(21),
                             C::call(21, true),
                             IF_DEBUG(C::call(21))}),
@@ -8162,10 +8183,12 @@ TEST_F(PartitionedRocksDBStoreTest, AllLogsIter) {
   EXPECT_EQ(300, it->getLSN());
   verifyRecord(it->getLogID(), it->getLSN(), it->getRecord());
   it->next(&filter, &stats);
-  EXPECT_EQ(
-      std::vector<C>(
-          {C::call(22), C::call(23), C::call(23, true), IF_DEBUG(C::call(23))}),
-      filter.history);
+  EXPECT_EQ(std::vector<C>({C::recordRange(log2, 200, 300),
+                            C::call(22),
+                            C::call(23),
+                            C::call(23, true),
+                            IF_DEBUG(C::call(23))}),
+            filter.history);
   filter.history.clear();
   ASSERT_EQ(IteratorState::AT_RECORD, it->state());
   EXPECT_EQ(log2, it->getLogID());
@@ -8178,10 +8201,12 @@ TEST_F(PartitionedRocksDBStoreTest, AllLogsIter) {
 
   ld_info("Reading with filtering and byte limit.");
   filter.time_ranges.insert(310);
+  filter.record_ranges.emplace(log3, 100);
   // Read limit = now + 1 byte.
   stats.max_bytes_to_read = stats.read_record_bytes + stats.read_csi_bytes + 1;
   it->seek(*mid_location, &filter, &stats);
   EXPECT_EQ(std::vector<C>({C::timeRange(210, 230),
+                            C::recordRange(log2, 200, 300),
                             C::call(23),
                             C::call(23, true),
                             IF_DEBUG(C::call(23))}),
@@ -8193,8 +8218,10 @@ TEST_F(PartitionedRocksDBStoreTest, AllLogsIter) {
   verifyRecord(it->getLogID(), it->getLSN(), it->getRecord());
   auto limit_reached_location = it->getLocation();
   it->next(&filter, &stats);
-  EXPECT_EQ(
-      std::vector<C>({C::timeRange(310, 310), C::call(31)}), filter.history);
+  EXPECT_EQ(std::vector<C>({C::timeRange(310, 310),
+                            C::recordRange(log3, 100, 100),
+                            C::call(31)}),
+            filter.history);
   filter.history.clear();
   ASSERT_EQ(IteratorState::LIMIT_REACHED, it->state());
   EXPECT_EQ(log3, it->getLogID());
@@ -8208,22 +8235,22 @@ TEST_F(PartitionedRocksDBStoreTest, AllLogsIter) {
   ASSERT_EQ(IteratorState::AT_END, it->state());
 
   ld_info("Reading from metadataLogsBegin()");
-  it->seek(*it->metadataLogsBegin());
+  it->seek(*it->metadataLogsBegin(), nullptr, &stats);
   ASSERT_EQ(IteratorState::AT_RECORD, it->state());
   EXPECT_EQ(meta_log1, it->getLogID());
   EXPECT_EQ(100, it->getLSN());
   verifyRecord(it->getLogID(), it->getLSN(), it->getRecord());
-  it->next();
+  it->next(nullptr, &stats);
   ASSERT_EQ(IteratorState::AT_RECORD, it->state());
   EXPECT_EQ(meta_log1, it->getLogID());
   EXPECT_EQ(200, it->getLSN());
   verifyRecord(it->getLogID(), it->getLSN(), it->getRecord());
-  it->next();
+  it->next(nullptr, &stats);
   ASSERT_EQ(IteratorState::AT_RECORD, it->state());
   EXPECT_EQ(meta_log2, it->getLogID());
   EXPECT_EQ(100, it->getLSN());
   verifyRecord(it->getLogID(), it->getLSN(), it->getRecord());
-  it->next();
+  it->next(nullptr, &stats);
   if (it->state() != IteratorState::AT_END) {
     EXPECT_EQ(IteratorState::AT_RECORD, it->state());
     EXPECT_FALSE(MetaDataLog::isMetaDataLog(it->getLogID()));
@@ -8234,7 +8261,7 @@ TEST_F(PartitionedRocksDBStoreTest, AllLogsIter) {
       read_options, std::unordered_map<logid_t, std::pair<lsn_t, lsn_t>>({}));
   filter.records.clear();
   filter.time_ranges = {C::FULL_TIME_RANGE};
-  it->seek(*it->minLocation(), &filter, &stats);
+  it->seek(*it->minLocation(), &filter, nullptr);
   EXPECT_EQ(IteratorState::AT_END, it->state());
   EXPECT_EQ(std::vector<C>({C::fullRange(),
                             C::call(1001),
@@ -8247,7 +8274,7 @@ TEST_F(PartitionedRocksDBStoreTest, AllLogsIter) {
 
   ld_info("Reading an empty subset of logs and some metadata records");
   filter.records = {1002, 2002};
-  it->seek(*it->minLocation(), &filter, &stats);
+  it->seek(*it->minLocation(), &filter, nullptr);
   EXPECT_EQ(IteratorState::AT_RECORD, it->state());
   EXPECT_EQ(internal_log, it->getLogID());
   EXPECT_EQ(200, it->getLSN());
@@ -8259,7 +8286,7 @@ TEST_F(PartitionedRocksDBStoreTest, AllLogsIter) {
                             IF_DEBUG(C::call(1002))}),
             filter.history);
   filter.history.clear();
-  it->next(&filter, &stats);
+  it->next(&filter, nullptr);
   EXPECT_EQ(std::vector<C>({C::call(2001),
                             C::call(2002),
                             C::call(2002, true),
@@ -8270,7 +8297,7 @@ TEST_F(PartitionedRocksDBStoreTest, AllLogsIter) {
   EXPECT_EQ(200, it->getLSN());
   verifyRecord(it->getLogID(), it->getLSN(), it->getRecord());
   filter.history.clear();
-  it->next(&filter, &stats);
+  it->next(&filter, nullptr);
   EXPECT_EQ(std::vector<C>({C::call(3001)}), filter.history);
   EXPECT_EQ(IteratorState::AT_END, it->state());
   filter.history.clear();
@@ -8505,6 +8532,109 @@ TEST_F(PartitionedRocksDBStoreTest, AllLogsIter) {
   it->next(&filter, &stats);
   EXPECT_EQ(IteratorState::AT_END, it->state());
   EXPECT_EQ(std::vector<C>({C::timeRange(410, 410)}), filter.history);
+  filter.history.clear();
+
+  ld_info("New to old.");
+  read_options.new_to_old = true;
+  it = store_->readAllLogs(read_options,
+                           std::unordered_map<logid_t, std::pair<lsn_t, lsn_t>>(
+                               {{log1, {201, LSN_MAX}},
+                                {log2, {LSN_INVALID, LSN_MAX}},
+                                {log3, {LSN_INVALID, LSN_MAX}}}));
+  filter.time_ranges = {C::FULL_TIME_RANGE, 10, 210, 410};
+  filter.record_ranges = {std::pair(log2, 100),
+                          std::pair(log1, 300),
+                          std::pair(log2, 200),
+                          std::pair(log1, 400)};
+  filter.records = {3, 21, 22, 41, 2001};
+  it->seek(*it->minLocation(), &filter, &stats);
+  EXPECT_EQ(IteratorState::AT_RECORD, it->state());
+  EXPECT_EQ(meta_log1, it->getLogID());
+  EXPECT_EQ(100, it->getLSN());
+  EXPECT_EQ(std::vector<C>({C::fullRange(),
+                            C::call(1001),
+                            C::call(1002),
+                            C::call(2001),
+                            C::call(2001, true),
+                            IF_DEBUG(C::call(2001))}),
+            filter.history);
+  filter.history.clear();
+
+  it->next(&filter, &stats);
+  EXPECT_EQ(IteratorState::AT_RECORD, it->state());
+  EXPECT_EQ(log1, it->getLogID());
+  EXPECT_EQ(400, it->getLSN());
+  EXPECT_EQ(std::vector<C>({C::call(2002),
+                            C::call(3001),
+                            C::timeRange(410, 410),
+                            C::recordRange(log1, 400, 400),
+                            C::call(41),
+                            C::call(41, true),
+                            IF_DEBUG(C::call(41))}),
+            filter.history);
+  filter.history.clear();
+
+  it->next(&filter, &stats);
+  EXPECT_EQ(IteratorState::AT_RECORD, it->state());
+  EXPECT_EQ(log1, it->getLogID());
+  EXPECT_EQ(300, it->getLSN());
+  EXPECT_EQ(std::vector<C>({C::timeRange(310, 320),
+                            C::timeRange(210, 230),
+                            C::recordRange(log1, 300, 300),
+                            C::call(21),
+                            C::call(21, true),
+                            IF_DEBUG(C::call(21))}),
+            filter.history);
+  filter.history.clear();
+
+  it->next(&filter, &stats);
+  EXPECT_EQ(IteratorState::AT_RECORD, it->state());
+  EXPECT_EQ(log2, it->getLogID());
+  EXPECT_EQ(200, it->getLSN());
+  EXPECT_EQ(std::vector<C>({C::recordRange(log2, 200, 300),
+                            C::call(22),
+                            C::call(22, true),
+                            IF_DEBUG(C::call(22))}),
+            filter.history);
+  filter.history.clear();
+
+  it->next(&filter, &stats);
+  EXPECT_EQ(IteratorState::AT_RECORD, it->state());
+  EXPECT_EQ(log2, it->getLogID());
+  EXPECT_EQ(100, it->getLSN());
+  EXPECT_EQ(std::vector<C>({C::call(23),
+                            C::timeRange(10, 30),
+                            C::recordRange(log2, 100, 100),
+                            C::call(3),
+                            C::call(3, true),
+                            IF_DEBUG(C::call(3))}),
+            filter.history);
+  filter.history.clear();
+
+  it->next(&filter, &stats);
+  EXPECT_EQ(IteratorState::AT_END, it->state());
+  EXPECT_EQ(std::vector<C>({}), filter.history);
+  filter.history.clear();
+
+  ld_info("New-to-old seek to a location taken from an old-to-new iterator.");
+  it->seek(*mid_location, &filter, &stats);
+  EXPECT_EQ(IteratorState::AT_RECORD, it->state());
+  EXPECT_EQ(log2, it->getLogID());
+  EXPECT_EQ(100, it->getLSN());
+  EXPECT_EQ(std::vector<C>({C::timeRange(210, 230),
+                            C::recordRange(log2, 200, 300),
+                            C::call(23),
+                            C::timeRange(10, 30),
+                            C::recordRange(log2, 100, 100),
+                            C::call(3),
+                            C::call(3, true),
+                            IF_DEBUG(C::call(3))}),
+            filter.history);
+  filter.history.clear();
+
+  it->next(&filter, &stats);
+  EXPECT_EQ(IteratorState::AT_END, it->state());
+  EXPECT_EQ(std::vector<C>({}), filter.history);
   filter.history.clear();
 }
 
@@ -10397,4 +10527,248 @@ TEST_F(PartitionedRocksDBStoreTest,
   it->seek(25, &filter, &stats);
   EXPECT_EQ(IteratorState::AT_END, it->state());
   EXPECT_EQ(0, stats.seen_logsdb_partitions);
+}
+
+// Test that CSI status is enabled/disabled per partition.
+TEST_F(PartitionedRocksDBStoreTest, PartitionCopysetIndexSetting) {
+  PartitionCSIMetadata csi_meta_object(false);
+
+  // Turn off write-copyset-index and create a partition. That partition
+  // shouldn't have the CSI metadata enabled.
+  closeStore();
+  ServerConfig::SettingsConfig s;
+  s["write-copyset-index"] = "false";
+  openStore(s);
+  store_->createPartition();
+  int rv = RocksDBWriter::readMetadata(
+      store_.get(),
+      RocksDBKeyFormat::PartitionMetaKey(
+          PartitionMetadataType::CSI_ENABLED,
+          store_->getPartitionList()->get(ID0 + 1)->id_),
+      &csi_meta_object,
+      store_->getMetadataCFHandle());
+  EXPECT_FALSE(csi_meta_object.isCSIEnabled());
+  // Check the cached flag is also False
+  EXPECT_FALSE(store_->getLatestPartition()->is_csi_enabled_);
+
+  // Turn on write-copyset-index and create a paritiont. Now the CSI metadata
+  // should be on for the new partition.
+  closeStore();
+  s["write-copyset-index"] = "true";
+  openStore(s);
+  store_->createPartition();
+  rv = RocksDBWriter::readMetadata(
+      store_.get(),
+      RocksDBKeyFormat::PartitionMetaKey(
+          PartitionMetadataType::CSI_ENABLED,
+          store_->getPartitionList()->get(ID0 + 2)->id_),
+      &csi_meta_object,
+      store_->getMetadataCFHandle());
+  EXPECT_TRUE(csi_meta_object.isCSIEnabled());
+  // Check the cached flag is set to true
+  EXPECT_TRUE(store_->getLatestPartition()->is_csi_enabled_);
+}
+
+TEST_F(PartitionedRocksDBStoreTest, ReadingPartitionCsiMetadataOnStartup) {
+  closeStore();
+  ServerConfig::SettingsConfig s;
+  s["write-copyset-index"] = "true";
+  openStore(s);
+  store_->createPartition();
+  store_->createPartition();
+
+  closeStore();
+  s["write-copyset-index"] = "false";
+  openStore(s);
+  store_->createPartition();
+  store_->createPartition();
+
+  closeStore();
+  openStore();
+  auto partitions = store_->getPartitionList();
+
+  // First 2 had the setting enabled while the last 2 didn't
+  EXPECT_TRUE(partitions->get(ID0 + 1)->is_csi_enabled_);
+  EXPECT_TRUE(partitions->get(ID0 + 2)->is_csi_enabled_);
+  EXPECT_FALSE(partitions->get(ID0 + 3)->is_csi_enabled_);
+  EXPECT_FALSE(partitions->get(ID0 + 4)->is_csi_enabled_);
+}
+
+// Create 4 partitions while the store is open, first 2 have CSI enabled
+// and other 2 don't. When reading, RocksDBLocalLogStore::CSIWrapper should
+// have csi_iterator_ set for the first 2 and unset for the second 2.
+TEST_F(PartitionedRocksDBStoreTest,
+       ReadingPartitionCsiStatusOnPartitionChange) {
+  const logid_t logid(1);
+
+  closeStore();
+  ServerConfig::SettingsConfig s;
+  s["write-copyset-index"] = "true";
+  openStore(s);
+  store_->createPartition();
+  put({TestRecord(logid, 20)});
+  store_->createPartition();
+  put({TestRecord(logid, 30)});
+
+  closeStore();
+  s["write-copyset-index"] = "false";
+  openStore(s);
+  store_->createPartition();
+  put({TestRecord(logid, 40)});
+  store_->createPartition();
+  put({TestRecord(logid, 50)});
+
+  auto it = store_->read(
+      logid,
+      LocalLogStore::ReadOptions("ReadingPartitionCsiStatusOnPartitionChange"));
+  auto partitioned_it =
+      dynamic_cast<PartitionedRocksDBStore::Iterator*>(it.get());
+
+  partitioned_it->seek(20);
+  EXPECT_EQ(IteratorState::AT_RECORD, partitioned_it->state());
+  EXPECT_TRUE(partitioned_it->isCSIEnabled());
+
+  partitioned_it->seek(30);
+  EXPECT_EQ(IteratorState::AT_RECORD, partitioned_it->state());
+  EXPECT_TRUE(partitioned_it->isCSIEnabled());
+
+  partitioned_it->seek(40);
+  EXPECT_EQ(IteratorState::AT_RECORD, partitioned_it->state());
+  EXPECT_FALSE(partitioned_it->isCSIEnabled());
+
+  partitioned_it->seek(50);
+  EXPECT_EQ(IteratorState::AT_RECORD, partitioned_it->state());
+  EXPECT_FALSE(partitioned_it->isCSIEnabled());
+}
+
+/**
+ * Write a few records and read them back.  This verifies that ReadIterator
+ * works as advertised and that records come back in the right order.
+ */
+TEST_F(PartitionedRocksDBStoreTest, WriteReadBackTest) {
+  put({TestRecord(logid_t(2), 1)});
+  put({TestRecord(logid_t(2), 5)});
+  put({TestRecord(logid_t(1), 6)});
+  put({TestRecord(logid_t(2), 4)});
+
+  {
+    std::unique_ptr<LocalLogStore::ReadIterator> it = store_->read(
+        logid_t(1), LocalLogStore::ReadOptions("WriteReadBackTest"));
+    it->seek(0);
+    int nread = 0;
+    for (nread = 0; it->state() == IteratorState::AT_RECORD;
+         ++nread, it->next()) {
+      if (nread == 0) {
+        EXPECT_EQ(6, it->getLSN());
+      }
+    }
+    EXPECT_EQ(1, nread);
+  }
+
+  {
+    // Test that we can get records for log 2, starting from LSN 1 (inclusive)
+    std::unique_ptr<LocalLogStore::ReadIterator> it = store_->read(
+        logid_t(2), LocalLogStore::ReadOptions("WriteReadBackTest"));
+    it->seek(1);
+    int nread = 0;
+    for (nread = 0; it->state() == IteratorState::AT_RECORD;
+         ++nread, it->next()) {
+      if (nread == 0) {
+        EXPECT_EQ(1, it->getLSN());
+      } else if (nread == 1) {
+        EXPECT_EQ(4, it->getLSN());
+      } else if (nread == 2) {
+        EXPECT_EQ(5, it->getLSN());
+      }
+    }
+    EXPECT_EQ(3, nread);
+  }
+
+  {
+    // Test that starting at LSN 2 skips the first record
+    std::unique_ptr<LocalLogStore::ReadIterator> it = store_->read(
+        logid_t(2), LocalLogStore::ReadOptions("WriteReadBackTest"));
+    it->seek(2);
+    int nread = 0;
+    for (nread = 0; it->state() == IteratorState::AT_RECORD;
+         ++nread, it->next()) {
+      if (nread == 0) {
+        EXPECT_EQ(4, it->getLSN());
+      } else if (nread == 1) {
+        EXPECT_EQ(5, it->getLSN());
+      }
+    }
+    EXPECT_EQ(2, nread);
+  }
+}
+
+TEST_F(PartitionedRocksDBStoreTest, Seek) {
+  std::array<lsn_t, 3> lsns = {compose_lsn(epoch_t(1), esn_t(1)),
+                               compose_lsn(epoch_t(1), esn_t(2)),
+                               compose_lsn(epoch_t(4), esn_t(1))};
+
+  std::vector<PutWriteOp> put_ops;
+  for (lsn_t lsn : lsns) {
+    put({TestRecord(logid_t(1), lsn)});
+    put({TestRecord(LOGID_MAX_INTERNAL, lsn)});
+  }
+
+  LocalLogStore::ReadOptions options("Seek");
+  options.tailing = false;
+
+  std::unique_ptr<LocalLogStore::ReadIterator> it =
+      store_->read(logid_t(1), options);
+
+  it->seek(lsns[1]);
+  ASSERT_EQ(IteratorState::AT_RECORD, it->state());
+  EXPECT_EQ(lsns[1], it->getLSN());
+
+  it->prev();
+  ASSERT_EQ(IteratorState::AT_RECORD, it->state());
+  EXPECT_EQ(lsns[0], it->getLSN());
+
+  it->seekForPrev(LSN_MAX);
+  ASSERT_EQ(IteratorState::AT_RECORD, it->state());
+  EXPECT_EQ(lsns[2], it->getLSN());
+
+  it = store_->read(logid_t(2), options);
+  it->seekForPrev(LSN_MAX);
+  ASSERT_EQ(IteratorState::AT_END, it->state());
+
+  it = store_->read(LOGID_MAX_INTERNAL, options);
+  it->seekForPrev(LSN_MAX);
+  ASSERT_EQ(IteratorState::AT_RECORD, it->state());
+  EXPECT_EQ(lsns[2], it->getLSN());
+}
+
+TEST_F(PartitionedRocksDBStoreTest, BatchWithDelete) {
+  std::vector<std::unique_ptr<WriteOp>> ops;
+  put({TestRecord(logid_t(1), 6),
+       TestRecord(logid_t(2), 1),
+       TestRecord(logid_t(1), 6, TestRecord::Type::DELETE)});
+
+  {
+    std::unique_ptr<LocalLogStore::ReadIterator> it =
+        store_->read(logid_t(1), LocalLogStore::ReadOptions("BatchWithDelete"));
+    it->seek(0);
+    int nread = 0;
+    for (nread = 0; it->state() == IteratorState::AT_RECORD;
+         ++nread, it->next()) {
+    }
+    EXPECT_EQ(0, nread);
+  }
+
+  {
+    std::unique_ptr<LocalLogStore::ReadIterator> it =
+        store_->read(logid_t(2), LocalLogStore::ReadOptions("BatchWithDelete"));
+    it->seek(0);
+    int nread = 0;
+    for (nread = 0; it->state() == IteratorState::AT_RECORD;
+         ++nread, it->next()) {
+      if (nread == 0) {
+        EXPECT_EQ(1, it->getLSN());
+      }
+    }
+    EXPECT_EQ(1, nread);
+  }
 }

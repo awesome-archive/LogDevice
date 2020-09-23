@@ -121,7 +121,7 @@ AllServerReadStreams::insertOrGet(ClientID client_id,
       if (on_worker_thread_) { // may be false in unit tests
         it->second.disconnect_callback.owner = this;
         Worker* worker = Worker::onThisThread();
-        int rv = worker->sender().registerOnSocketClosed(
+        int rv = worker->sender().registerOnConnectionClosed(
             Address(client_id), it->second.disconnect_callback);
         ld_check(rv == 0);
         // Since this is a new client, let's send it our view of the rebuilding
@@ -344,8 +344,10 @@ void AllServerReadStreams::onEpochOffsetTask(EpochOffsetStorageTask& task) {
 void AllServerReadStreams::onReadTaskDone(ReadStorageTask& task) {
   ld_check(read_storage_tasks_in_flight_ > 0);
   read_storage_tasks_in_flight_--;
-  if (task.catchup_queue_) {
-    task.catchup_queue_->onReadTaskDone(task);
+  // We're on worker thread.
+  CatchupQueue* q = task.catchup_queue_.get().get();
+  if (q) {
+    q->onReadTaskDone(task);
   } else {
     // Client disconnected.
   }
@@ -356,8 +358,10 @@ void AllServerReadStreams::onReadTaskDone(ReadStorageTask& task) {
 void AllServerReadStreams::onReadTaskDropped(ReadStorageTask& task) {
   ld_check(read_storage_tasks_in_flight_ > 0);
   read_storage_tasks_in_flight_--;
-  if (task.catchup_queue_) {
-    task.catchup_queue_->onStorageTaskDropped(task.stream_.get());
+  // We're on worker thread.
+  CatchupQueue* q = task.catchup_queue_.get().get();
+  if (q) {
+    q->onStorageTaskDropped(task.stream_.get().get());
   } else {
     // Client disconnected.
   }
@@ -749,7 +753,7 @@ void AllServerReadStreams::sendShardStatusToClient(ClientID cid) {
 
   Worker* worker = Worker::onThisThread();
 
-  if (worker->sender().getNodeID(Address(cid)).isNodeID()) {
+  if (worker->sender().getNodeIdx(Address(cid))) {
     // This client is another node in the tier. It is reading the event log and
     // thus does not need us to send an update.
     return;

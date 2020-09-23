@@ -24,24 +24,26 @@ set_target_properties(ldclient ldclient_static
 target_link_libraries(ldclient
   common
   Checkpoint-cpp2
-  ${LOGDEVICE_EXTERNAL_DEPS})
+)
 
 target_link_libraries(ldclient_static
   common
   Checkpoint-cpp2
-  ${LOGDEVICE_EXTERNAL_DEPS})
+  ${LOGDEVICE_EXTERNAL_DEPS}
+)
 
 set_target_properties(ldclient_static
-  PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  PROPERTIES POSITION_INDEPENDENT_CODE ON
+)
 
-add_dependencies(ldclient rocksdb folly)
+add_dependencies(ldclient rocksdb folly fbthrift)
 
 # Tests
 if (${BUILD_TESTS})
   file(GLOB test_hfiles "${LOGDEVICE_CLIENT_SRC_DIR}/test/*.h")
   file(GLOB test_files  "${LOGDEVICE_CLIENT_SRC_DIR}/test/*.cpp")
 
-  add_executable(ldclient_test ${test_hfiles} ${test_files})
+  add_executable(ldclient_test ${LOGDEVICE_PHONY_MAIN} ${test_hfiles} ${test_files})
 
   target_link_libraries(ldclient_test
     ldclient_static
@@ -50,14 +52,16 @@ if (${BUILD_TESTS})
     ${LOGDEVICE_EXTERNAL_DEPS}
     ${GMOCK_LIBRARY}
     ${GTEST_LIBRARY}
-    ${LIBGFLAGS_LIBRARY})
+    ${LIBGFLAGS_LIBRARY}
+  )
 
   add_dependencies(ldclient_test rocksdb)
 
   set_target_properties(ldclient_test
     PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY ${UNIT_TEST_OUTPUT_DIRECTORY}
-      OUTPUT_NAME logdevice_client_test)
+      OUTPUT_NAME logdevice_client_test
+  )
 
   enable_testing()
   if(HAVE_CMAKE_GTEST)
@@ -67,7 +71,8 @@ if (${BUILD_TESTS})
   add_test(
     NAME LdClientTest
     COMMAND ${UNIT_TEST_OUTPUT_DIRECTORY}/logdevice_client_test
-    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+  )
   endif()
 endif() # ${BUILD_TESTS}
 
@@ -75,11 +80,13 @@ install(DIRECTORY ${LOGDEVICE_CLIENT_HEADER_DIR}/
   COMPONENT devel
   DESTINATION
   include/logdevice
-  FILES_MATCHING PATTERN "*.h")
+  FILES_MATCHING PATTERN "*.h"
+)
 
 install(TARGETS ldclient
   COMPONENT runtime
-  DESTINATION lib)
+  DESTINATION lib
+)
 
 # Ensure dynamic lib is in search path, configure ld and apply it
 # when installing to /usr/lib, it will already be there, so no specific

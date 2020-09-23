@@ -31,10 +31,6 @@ class ServerWorkerImpl;
 struct ChunkRebuildingMap;
 struct PurgeUncleanEpochsMap;
 
-struct SettingOverrideTTLRequestMap {
-  std::unordered_map<std::string, std::unique_ptr<Request>> map;
-};
-
 class ServerWorker : public Worker {
  public:
   ServerWorker(WorkContext::KeepAlive,
@@ -74,9 +70,6 @@ class ServerWorker : public Worker {
   // need to get shutdown with the worker.
   PurgeUncleanEpochsMap& activePurges() const;
 
-  // a map of all currently running SettingOverrideTTLRequest
-  SettingOverrideTTLRequestMap& activeSettingOverrides() const;
-
   ChunkRebuildingMap& runningChunkRebuildings() const;
 
   // Intentionally shadows `Worker::processor_' to expose a more specific
@@ -95,6 +88,8 @@ class ServerWorker : public Worker {
 
   // This overrides Worker::setupWorker() but calls it first thing
   void setupWorker() override;
+
+  void initSSLFetcher() override;
 
   /**
    * Gets the storage task queue. This is the main access point

@@ -61,15 +61,34 @@ add_executable(ld-dev-cluster
 target_link_libraries(ld-dev-cluster
   admin_command_client
   logdevice_server
+  ${GTEST_LIBRARY}
   ${LOGDEVICE_EXTERNAL_DEPS}
 )
 
-target_link_libraries(ldcat ldclient)
-target_link_libraries(ldtail ldclient)
-target_link_libraries(ldtailasync ldclient)
-target_link_libraries(ldtrim ldclient)
-target_link_libraries(ldwrite ldclient)
-target_link_libraries(ldbuffwrite ldclient)
+target_link_libraries(ldcat
+  ldclient
+  ${LOGDEVICE_EXTERNAL_DEPS}
+)
+target_link_libraries(ldtail
+  ldclient
+  ${LOGDEVICE_EXTERNAL_DEPS}
+)
+target_link_libraries(ldtailasync
+  ldclient
+  ${LOGDEVICE_EXTERNAL_DEPS}
+)
+target_link_libraries(ldtrim
+  ldclient
+  ${LOGDEVICE_EXTERNAL_DEPS}
+)
+target_link_libraries(ldwrite
+  ldclient
+  ${LOGDEVICE_EXTERNAL_DEPS}
+)
+target_link_libraries(ldbuffwrite
+  ldclient
+  ${LOGDEVICE_EXTERNAL_DEPS}
+)
 
 add_custom_target(examples)
 add_dependencies(examples ldcat ldtail ldtailasync ldtrim ldwrite ldbuffwrite)

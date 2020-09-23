@@ -17,7 +17,6 @@ builder = nop
 folly
 fb303
 wangle
-rsocket-cpp
 fizz
 fmt
 libsodium
@@ -25,11 +24,14 @@ googletest
 zstd
 fbthrift
 iproute2
-OpenNSL
 libmnl
 libusb
 libcurl
 libnl
+libsai
+OpenNSA
+re2
+python
 
 [shipit.pathmap]
 fbcode/fboss/github = .

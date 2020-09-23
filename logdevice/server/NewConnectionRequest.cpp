@@ -23,8 +23,12 @@ Request::Execution NewConnectionRequest::execute() {
     conntype_ = ConnectionType::SSL;
   }
 
-  int rv = w->sender().addClient(
-      fd_, client_addr_, std::move(conn_token_), sock_type_, conntype_);
+  int rv = w->sender().addClient(fd_,
+                                 client_addr_,
+                                 std::move(conn_token_),
+                                 sock_type_,
+                                 conntype_,
+                                 connection_kind_);
 
   if (rv == 0) {
     ld_debug("A new connection from %s is running on "
@@ -34,7 +38,7 @@ Request::Execution NewConnectionRequest::execute() {
   } else {
     RATELIMIT_ERROR(std::chrono::seconds(1),
                     10,
-                    "Failed to create a logdevice::Socket for a new client "
+                    "Failed to create a logdevice::Connection for a new client "
                     "connection from %s on worker #%d: %s",
                     client_addr_.toString().c_str(),
                     int(w->idx_),

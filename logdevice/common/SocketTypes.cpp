@@ -31,4 +31,34 @@ const char* connectionTypeToString(ConnectionType conn_type) {
   }
   return "";
 }
+
+const char* peerTypeToString(PeerType peer_type) {
+  switch (peer_type) {
+    case PeerType::CLIENT:
+      return "CLIENT";
+    case PeerType::NODE:
+      return "NODE";
+    default:
+      return "";
+  }
+  return "";
+}
+
+const char* socketDrainStatusToString(SocketDrainStatusType type) {
+  switch (type) {
+    case SocketDrainStatusType::UNKNOWN:
+      return "UNKNOWN";
+    case SocketDrainStatusType::ACTIVE:
+      return "ACTIVE";
+    case SocketDrainStatusType::STALLED:
+      return "STALLED";
+    case SocketDrainStatusType::NET_SLOW:
+      return "NET_SLOW";
+    case SocketDrainStatusType::RECV_SLOW:
+      return "RECV_SLOW";
+    case SocketDrainStatusType::IDLE:
+      return "IDLE";
+  }
+  return "";
+}
 }} // namespace facebook::logdevice

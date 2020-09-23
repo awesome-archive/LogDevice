@@ -5,7 +5,7 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
-#include "logdevice/server/ZookeeperEpochStore.h"
+#include "logdevice/server/epoch_store/ZookeeperEpochStore.h"
 
 #include <memory>
 #include <thread>
@@ -20,14 +20,17 @@
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/ZookeeperClient.h"
 #include "logdevice/common/configuration/UpdateableConfig.h"
+#include "logdevice/common/request_util.h"
 #include "logdevice/common/settings/SettingsUpdater.h"
+#include "logdevice/common/test/MockZookeeperClient.h"
 #include "logdevice/common/test/TestNodeSetSelector.h"
 #include "logdevice/common/test/TestUtil.h"
 #include "logdevice/common/test/ZookeeperClientInMemory.h"
 #include "logdevice/server/ServerProcessor.h"
-#include "logdevice/server/SetLastCleanEpochZRQ.h"
+#include "logdevice/server/epoch_store/SetLastCleanEpochZRQ.h"
 
 using namespace facebook::logdevice;
+using testing::_;
 
 #define TEST_CLUSTER "epochstore_test" // fake LD cluster name to use
 
@@ -48,7 +51,8 @@ class ZookeeperEpochStoreTest : public ::testing::Test {
     settings.server = true; // ZookeeperEpochStore requires this
 
     auto cfg_in =
-        Configuration::fromJsonFile(TEST_CONFIG_FILE(TEST_CLUSTER ".conf"));
+        Configuration::fromJsonFile(TEST_CONFIG_FILE(TEST_CLUSTER ".conf"))
+            ->withNodesConfiguration(createSimpleNodesConfig(2));
 
     if (!cfg_in)
       return;
@@ -61,15 +65,16 @@ class ZookeeperEpochStoreTest : public ::testing::Test {
 
     auto znodes = getPrefillZnodes();
 
-    std::shared_ptr<ZookeeperClientFactory> zookeeper_client_factory =
-        std::make_shared<ZookeeperClientInMemoryFactory>(znodes);
+    zkclient = std::make_shared<ZookeeperClientInMemory>(
+        config->getZookeeperConfig()->getQuorumString(), std::move(znodes));
     epochstore = std::make_unique<ZookeeperEpochStore>(
         TEST_CLUSTER,
-        processor.get(),
-        config->updateableZookeeperConfig(),
+        processor->getRequestExecutor(),
+        zkclient,
         config->updateableNodesConfiguration(),
         processor->updateableSettings(),
-        zookeeper_client_factory);
+        processor->getOptionalMyNodeID(),
+        processor->stats_);
 
     dbg::assertOnData = true;
   }
@@ -103,6 +108,7 @@ class ZookeeperEpochStoreTest : public ::testing::Test {
   std::shared_ptr<Processor> processor;
   std::shared_ptr<Processor> other_node_processor;
   std::shared_ptr<UpdateableConfig> config;
+  std::shared_ptr<ZookeeperClientInMemory> zkclient;
   std::unique_ptr<ZookeeperEpochStore> epochstore;
 
  private:
@@ -129,7 +135,7 @@ TailRecord gen_tail_record(logid_t logid,
        0,
        {}},
       std::move(offsets),
-      std::shared_ptr<PayloadHolder>());
+      PayloadHolder());
 }
 
 TailRecord gen_tail_record_with_payload(logid_t logid,
@@ -137,8 +143,8 @@ TailRecord gen_tail_record_with_payload(logid_t logid,
                                         uint64_t timestamp,
                                         OffsetMap offsets) {
   TailRecordHeader::flags_t flags = TailRecordHeader::HAS_PAYLOAD;
-  void* payload_flat = malloc(333);
-  std::strncpy((char*)payload_flat, "Tail Record Test Payload", 50);
+  std::array<char, 333> payload_flat{};
+  std::strncpy(&payload_flat[0], "Tail Record Test Payload", 50);
   return TailRecord(
       {logid,
        lsn,
@@ -147,7 +153,7 @@ TailRecord gen_tail_record_with_payload(logid_t logid,
        0,
        {}},
       std::move(offsets),
-      std::make_shared<PayloadHolder>(payload_flat, 333));
+      PayloadHolder::copyBuffer(&payload_flat[0], payload_flat.size()));
 }
 } // namespace
 
@@ -392,7 +398,7 @@ class UpdateMetaDataRequest : public Request {
     int rv1 = epochstore_->createOrUpdateMetaData(
         logid_,
         std::make_shared<EpochMetaDataUpdateToNextEpoch>(
-            config_, config_->getNodesConfigurationFromServerConfigSource()),
+            config_, config_->getNodesConfiguration()),
         [this](Status st1,
                logid_t lid,
                std::unique_ptr<EpochMetaData> info,
@@ -421,7 +427,7 @@ class UpdateMetaDataRequest : public Request {
               logid_,
               std::make_shared<CustomEpochMetaDataUpdater>(
                   config_,
-                  config_->getNodesConfigurationFromServerConfigSource(),
+                  config_->getNodesConfiguration(),
                   nodeset_selector_,
                   /* use_storage_set_format */ true,
                   /* provision_if_empty */ true),
@@ -448,7 +454,7 @@ class UpdateMetaDataRequest : public Request {
                     logid_,
                     std::make_shared<CustomEpochMetaDataUpdater>(
                         config_,
-                        config_->getNodesConfigurationFromServerConfigSource(),
+                        config_->getNodesConfiguration(),
                         nodeset_selector_,
                         true),
                     [prev_info, this](Status st3,
@@ -502,15 +508,14 @@ TEST_F(ZookeeperEpochStoreTest, LastCleanEpochMetaDataZnodePath) {
       logid,
       epoch_t(1),
       gen_tail_record(logid, LSN_INVALID, 0, OffsetMap()),
-      [](Status, logid_t, epoch_t, TailRecord) {},
-      epochstore.get());
+      [](Status, logid_t, epoch_t, TailRecord) {});
   SetLastCleanEpochZRQ lce_metadata_zrq(
       meta_logid,
       epoch_t(1),
       gen_tail_record(meta_logid, LSN_INVALID, 0, OffsetMap()),
-      [](Status, logid_t, epoch_t, TailRecord) {},
-      epochstore.get());
-  ASSERT_NE(lce_data_zrq.getZnodePath(), lce_metadata_zrq.getZnodePath());
+      [](Status, logid_t, epoch_t, TailRecord) {});
+  ASSERT_NE(lce_data_zrq.getZnodePath(epochstore->rootPath()),
+            lce_metadata_zrq.getZnodePath(epochstore->rootPath()));
 }
 
 /**
@@ -659,8 +664,7 @@ TEST_F(ZookeeperEpochStoreTestEmpty, NoRootNodeEpochMetaDataTestNoCreation) {
     rv = epochstore->createOrUpdateMetaData(
         logid,
         std::make_shared<EpochMetaDataUpdateToNextEpoch>(
-            config->get(),
-            config->get()->getNodesConfigurationFromServerConfigSource()),
+            config->get(), config->get()->getNodesConfiguration()),
         [&sem](Status st,
                logid_t,
                std::unique_ptr<EpochMetaData>,
@@ -676,55 +680,6 @@ TEST_F(ZookeeperEpochStoreTestEmpty, NoRootNodeEpochMetaDataTestNoCreation) {
   while (n_operations_pending--) {
     sem.wait();
   }
-}
-
-TEST_F(ZookeeperEpochStoreTest, QuorumChangeTest) {
-  // Change the quorum to one that points somewhere else
-  auto orig_zk_config = config->getZookeeperConfig();
-  ASSERT_NE(orig_zk_config, nullptr);
-  const std::vector<Sockaddr> new_quorum = {
-      Sockaddr("2401:db00:21:3:face:0:43:0", 2183),
-      Sockaddr("2401:db00:21:3:face:0:45:0", 2183),
-      Sockaddr("2401:db00:2030:6103:face:0:27:0", 2183),
-      Sockaddr("2401:db00:2030:6103:face:0:1d:0", 2183),
-      Sockaddr("2401:db00:2030:6103:face:0:17:0", 2183)};
-  config->updateableZookeeperConfig()->update(
-      std::make_shared<configuration::ZookeeperConfig>(
-          new_quorum, orig_zk_config->getSessionTimeout()));
-
-  // Run a ZK request
-  Semaphore sem;
-  Status zk_req_st = E::OK;
-
-  int rv = epochstore->getLastCleanEpoch(
-      logid_t(1),
-      [&](Status st, logid_t /*logid*/, epoch_t /*read_epoch*/, TailRecord) {
-        ld_info("get LCE completed with %s", error_description(st));
-        zk_req_st = st;
-        sem.post();
-      });
-  ASSERT_EQ(0, rv);
-  ld_info("Posted request");
-  // Change the quorum back to the original
-  config->updateableZookeeperConfig()->update(orig_zk_config);
-  ld_info("Changed quorum");
-
-  ld_info("Waiting for request to complete");
-  sem.wait();
-  ASSERT_EQ(E::CONNFAILED, zk_req_st);
-  ld_info("Request completed");
-
-  // Try again
-  rv = epochstore->getLastCleanEpoch(
-      logid_t(1),
-      [&](Status st, logid_t /*logid*/, epoch_t /*read_epoch*/, TailRecord) {
-        zk_req_st = st;
-        sem.post();
-      });
-
-  ASSERT_EQ(0, rv);
-  sem.wait();
-  ASSERT_NE(E::SHUTDOWN, zk_req_st);
 }
 
 /*
@@ -755,7 +710,7 @@ class CheckNodeIDRequest : public Request {
           ASSERT_NE(nullptr, info);
           EXPECT_TRUE(info->isValid());
           ASSERT_NE(nullptr, meta_props);
-          ASSERT_TRUE(meta_props->last_writer_node_id.hasValue());
+          ASSERT_TRUE(meta_props->last_writer_node_id.has_value());
           ASSERT_EQ(Worker::onThisThread()->processor_->getMyNodeID(),
                     meta_props->last_writer_node_id.value());
           ++completedRequestCnt;
@@ -944,4 +899,165 @@ TEST_F(ZookeeperEpochStoreTest, LastCleanEpochWithTailRecord) {
 
   ASSERT_EQ(0, rv);
   sem.wait();
+}
+
+/**
+ *  Provision a new log and make sure that epoch store creates its znodes.
+ */
+TEST_F(ZookeeperEpochStoreTest, ProvisionNewLog) {
+  auto get_znode = [&](std::string znode) {
+    Status status;
+    Semaphore sem;
+    auto cb = [&](int rc, std::string, zk::Stat) {
+      status = ZookeeperClientBase::toStatus(rc);
+      sem.post();
+    };
+    zkclient->getData(znode, std::move(cb));
+    sem.wait();
+    return status;
+  };
+
+  const std::array<std::string, 4> log4_znodes{
+      "/logdevice/epochstore_test/logs/4",
+      "/logdevice/epochstore_test/logs/4/sequencer",
+      "/logdevice/epochstore_test/logs/4/lce",
+      "/logdevice/epochstore_test/logs/4/metadatalog_lce",
+  };
+
+  // Make sure that the znodes don't exist.
+  for (const auto& znode : log4_znodes) {
+    const auto status = get_znode(znode);
+    ASSERT_EQ(E::NOTFOUND, status)
+        << "Initially znode: " << znode
+        << " shouldn't exist for the test correctness";
+  }
+
+  // Modify the config to add a new log.
+  {
+    auto logs_cfg = config->getLocalLogsConfig()->copyLocal();
+    logs_cfg->insert(boost::icl::right_open_interval<logid_t::raw_type>(4, 5),
+                     "logs4",
+                     logsconfig::LogAttributes().with_replicateAcross(
+                         {{NodeLocationScope::NODE, 1}}));
+    config->updateableLogsConfig()->update(std::move(logs_cfg));
+  }
+
+  // Now try to provision the log
+  Semaphore sem;
+  auto rq = FuncRequest::make(
+      worker_id_t(-1), WorkerType::GENERAL, RequestType::MISC, [&]() {
+        int rv = epochstore->createOrUpdateMetaData(
+            logid_t(4),
+            std::make_shared<EpochMetaDataUpdateToNextEpoch>(
+                config->get(), config->get()->getNodesConfiguration()),
+            [&sem](Status st,
+                   logid_t,
+                   std::unique_ptr<EpochMetaData> info,
+                   std::unique_ptr<EpochStoreMetaProperties> /*meta_props*/) {
+              EXPECT_EQ(Status::OK, st);
+              EXPECT_EQ(epoch_t(2), info->h.epoch);
+              sem.post();
+            },
+            MetaDataTracer());
+        ASSERT_EQ(0, rv);
+      });
+  ASSERT_EQ(0, processor->blockingRequest(rq));
+  sem.wait();
+
+  // Znodes should have been created by now
+  for (const auto& znode : log4_znodes) {
+    const auto status = get_znode(znode);
+    ASSERT_EQ(E::OK, status) << " znode: " << znode
+                             << " should exist after provisioning the metadata";
+  }
+}
+
+/**
+ * Creates a mock zookeeper client and checks how epoch store handle different
+ * failure scenarios.
+ */
+TEST_F(ZookeeperEpochStoreTest, ZookeeperFailures) {
+  // The epoch metadata that the mock zookeeper client will return
+  std::string epoch_metadata_payload(
+      "\x31\x35\x35\x32\x31\x33\x40\x4e\x30\x3a\x31\x23"
+      "\x02\x00\x00\x00\x4d\x5e\x02\x00\x4c\x5e\x02\x00"
+      "\x01\x00\x01\x00\x00\x00\x00\x00\x00\x00",
+      34);
+
+  // Runs an EpochMetadDataUpdateToNextEpoch and validates the expected
+  const auto run_epoch_update = [&](Status expected_status) {
+    Semaphore sem;
+    auto rq = FuncRequest::make(
+        worker_id_t(-1), WorkerType::GENERAL, RequestType::MISC, [&]() {
+          int rv = epochstore->createOrUpdateMetaData(
+              logid_t(1),
+              std::make_shared<EpochMetaDataUpdateToNextEpoch>(
+                  config->get(), config->get()->getNodesConfiguration()),
+              [&sem, expected_status](
+                  Status st,
+                  logid_t,
+                  std::unique_ptr<EpochMetaData> /* info */,
+                  std::unique_ptr<EpochStoreMetaProperties> /*meta_props*/) {
+                EXPECT_EQ(expected_status, st);
+                sem.post();
+              },
+              MetaDataTracer());
+          ASSERT_EQ(0, rv);
+        });
+    ASSERT_EQ(0, processor->blockingRequest(rq));
+    sem.wait();
+  };
+
+  // A helper function to easily create a zookeeper callback.
+  const auto build_read_cb =
+      [](int rc, std::string data = "", zk::Stat stat = zk::Stat{}) {
+        return [=](std::string, ZookeeperClientBase::data_callback_t* cb) {
+          (*cb)(rc, data, stat);
+        };
+      };
+
+  auto mock_zk = std::make_shared<MockZookeeperClient>();
+  epochstore = std::make_unique<ZookeeperEpochStore>(
+      TEST_CLUSTER,
+      processor->getRequestExecutor(),
+      mock_zk,
+      config->updateableNodesConfiguration(),
+      processor->updateableSettings(),
+      processor->getOptionalMyNodeID(),
+      processor->stats_);
+
+  {
+    // When epoch store fails auth, epoch update should fail with E::ACCESS
+    EXPECT_CALL(
+        *mock_zk, getData("/logdevice/epochstore_test/logs/1/sequencer", _))
+        .WillOnce(testing::Invoke(build_read_cb(ZAUTHFAILED)));
+    run_epoch_update(E::ACCESS);
+  }
+
+  {
+    // When epoch store connection drops, epoch update should fail with
+    // E::CONNFAILED
+    EXPECT_CALL(
+        *mock_zk, getData("/logdevice/epochstore_test/logs/1/sequencer", _))
+        .WillOnce(testing::Invoke(build_read_cb(ZCONNECTIONLOSS)));
+    run_epoch_update(E::CONNFAILED);
+  }
+
+  {
+    // When epoch store tries to update the epoch and there's a version mismatch
+    // it should return E::AGAIN.
+    EXPECT_CALL(
+        *mock_zk, getData("/logdevice/epochstore_test/logs/1/sequencer", _))
+        .WillOnce(testing::Invoke(
+            build_read_cb(ZOK, epoch_metadata_payload, zk::Stat{123})));
+    EXPECT_CALL(
+        *mock_zk,
+        setData("/logdevice/epochstore_test/logs/1/sequencer", _, _, 123))
+        .WillOnce(testing::Invoke(
+            [](std::string,
+               std::string,
+               ZookeeperClientBase::stat_callback_t* cb,
+               zk::version_t) { (*cb)(ZBADVERSION, zk::Stat{}); }));
+    run_epoch_update(E::AGAIN);
+  }
 }

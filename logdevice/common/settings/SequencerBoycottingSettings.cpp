@@ -115,7 +115,7 @@ void SequencerBoycottingSettings::defineSettings(SettingEasyInit& init) {
        "smaller than the average success ratio of all nodes in the cluster. "
        "While node-stats-boycott-sensitivity is an absolute threshold, this "
        "setting defines a sensitivity threshold relative to the average of all "
-       "success ratios. Only used if node-stats-boycott-use-rmsd is true",
+       "success ratios.",
        SERVER,
        SettingsCategory::SequencerBoycotting);
   init("node-stats-controller-check-period",
@@ -154,11 +154,11 @@ void SequencerBoycottingSettings::defineSettings(SettingEasyInit& init) {
        SERVER,
        SettingsCategory::SequencerBoycotting);
   init("node-stats-boycott-use-rmsd",
-       &node_stats_boycott_use_rmsd,
+       &node_stats_boycott_use_rmsd_DEPRECATED,
        "true",
        nullptr, // no validation
        "Use a new outlier detection algorithm",
-       SERVER,
+       SERVER | DEPRECATED,
        SettingsCategory::SequencerBoycotting);
 
   init(
@@ -175,7 +175,7 @@ void SequencerBoycottingSettings::defineSettings(SettingEasyInit& init) {
        &node_stats_boycott_min_adaptive_duration,
        "30min",
        validate_positive<ssize_t>(),
-       "(experimental) The minmum (and default) adaptive boycotting duration",
+       "(experimental) The minimum (and default) adaptive boycotting duration",
        SERVER | EXPERIMENTAL,
        SettingsCategory::SequencerBoycotting);
 
@@ -191,7 +191,7 @@ void SequencerBoycottingSettings::defineSettings(SettingEasyInit& init) {
        &node_stats_boycott_adaptive_duration_increase_factor,
        "2",
        validate_positive<ssize_t>(),
-       "(experimental) the multiplicative increase factor of the adaptive"
+       "(experimental) the multiplicative increase factor of the adaptive "
        "boycotting duration",
        SERVER | EXPERIMENTAL,
        SettingsCategory::SequencerBoycotting);
@@ -200,18 +200,19 @@ void SequencerBoycottingSettings::defineSettings(SettingEasyInit& init) {
        &node_stats_boycott_adaptive_duration_decrease_rate,
        "1min",
        validate_positive<ssize_t>(),
-       "(experimental) the additive decrease rate of the adaptive boycotting"
+       "(experimental) the additive decrease rate of the adaptive boycotting "
        "duration",
        SERVER | EXPERIMENTAL,
        SettingsCategory::SequencerBoycotting);
 
-  init("node-stats-boycott-adaptive-duration-decrease-time-step",
-       &node_stats_boycott_adaptive_duration_decrease_time_step,
-       "30s",
-       validate_positive<ssize_t>(),
-       "(experimental) the time step of the decrease of the adaptive boycotting"
-       "duration",
-       SERVER | EXPERIMENTAL,
-       SettingsCategory::SequencerBoycotting);
+  init(
+      "node-stats-boycott-adaptive-duration-decrease-time-step",
+      &node_stats_boycott_adaptive_duration_decrease_time_step,
+      "30s",
+      validate_positive<ssize_t>(),
+      "(experimental) the time step of the decrease of the adaptive boycotting "
+      "duration",
+      SERVER | EXPERIMENTAL,
+      SettingsCategory::SequencerBoycotting);
 }
 }} // namespace facebook::logdevice

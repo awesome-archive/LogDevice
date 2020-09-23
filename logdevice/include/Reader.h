@@ -165,6 +165,24 @@ class Reader {
   virtual void waitOnlyWhenNoData() = 0;
 
   /**
+   * Defines monitoring tier for this reader. Each tier is tracked separately,
+   * allowing for different alarming, SLAs, etc for each.
+   *
+   * Only affects subsequent startReading() calls.
+   *
+   * ** DEPRECATED, use addMonitoringTag instead **
+   */
+  virtual void setMonitoringTier(MonitoringTier tier) = 0;
+
+  /**
+   * Adds a tag to this reader. Tags are a generic mechanism that can help
+   * identify readers that belong to a particular user, use case, function, etc.
+   *
+   * Only affects subsequent startReading() calls.
+   */
+  virtual void addMonitoringTag(std::string tag) = 0;
+
+  /**
    * If called, data records read by this Reader will not include payloads.
    *
    * This makes reading more efficient when payloads are not needed (they won't
@@ -179,7 +197,7 @@ class Reader {
    * configured to support it. Each data record will be sent by all storage
    * nodes that have a copy instead of exactly one.
    * This greatly increases read availability at the cost of higher network
-   * bandwith and cpu usage.
+   * bandwidth and cpu usage.
    *
    * Only affects subsequent startReading() calls.
    */
@@ -236,6 +254,8 @@ class Reader {
    * can be used to decode the blobs.
    */
   virtual void doNotDecodeBufferedWrites() = 0;
+
+  virtual void setReaderName(const std::string&) = 0;
 
   /**
    * Get next lowest recommended LSN to read from when servers appear stuck.

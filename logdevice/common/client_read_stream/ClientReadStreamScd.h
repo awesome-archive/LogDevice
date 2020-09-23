@@ -136,6 +136,10 @@ class ClientReadStreamScd : public boost::noncopyable {
     return mode_ == Mode::LOCAL_SCD;
   }
 
+  inline Mode getMode() const {
+    return mode_;
+  }
+
   /**
    * Called when settings are updated.
    */
@@ -489,12 +493,14 @@ class ClientReadStreamScd : public boost::noncopyable {
 
   // Returns true if a transition to the given mode is scheduled.
   bool scheduledTransitionTo(Mode mode) {
-    return scheduled_mode_transition_.hasValue() &&
+    return scheduled_mode_transition_.has_value() &&
         scheduled_mode_transition_.value() == mode;
   }
 
   friend class ClientReadStreamTest;
   friend class ClientReadStreamScd_FilteredOutTest;
 };
+
+std::string toString(ClientReadStreamScd::Mode);
 
 }} // namespace facebook::logdevice

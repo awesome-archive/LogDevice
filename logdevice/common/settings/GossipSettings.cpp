@@ -10,6 +10,9 @@
 #include <iostream>
 
 #include "logdevice/common/commandline_util_chrono.h"
+#include "logdevice/common/settings/Validators.h"
+
+using namespace facebook::logdevice::setting_validators;
 
 namespace facebook { namespace logdevice {
 
@@ -49,10 +52,8 @@ void GossipSettings::defineSettings(SettingEasyInit& init) {
        &gossip_failure_threshold,
        "30",
        nullptr, // no validation
-       "Specifies after how many gossip intervals of inactivity a node "
-       "is "
-       "marked as dead. Lower values reduce detection time, but make "
-       "false "
+       "Specifies after how many gossip intervals of inactivity a node is "
+       "marked as dead. Lower values reduce detection time, but make false "
        "positives more likely.",
        SERVER,
        SettingsCategory::FailureDetector);
@@ -115,6 +116,15 @@ void GossipSettings::defineSettings(SettingEasyInit& init) {
        "after server comes up.",
        SERVER,
        SettingsCategory::FailureDetector);
+  init("gossip-intervals-without-processing-threshold",
+       &gossip_intervals_without_processing_threshold,
+       "0",
+       parse_nonnegative<int32_t>(),
+       "How many intervals is a node allowed to go through without processing"
+       "gossip messages. If this is crossed, the node will be marked as DEAD"
+       "even if it's still sending OUT gossip messages.",
+       SERVER,
+       SettingsCategory::FailureDetector);
   init("gossip-mode",
        &mode,
        "random",
@@ -148,6 +158,15 @@ void GossipSettings::defineSettings(SettingEasyInit& init) {
        "sent after this"
        " reply comes or after "
        "timeout",
+       SERVER,
+       SettingsCategory::FailureDetector);
+  init("gossip-include-rsm-versions-frequency",
+       &gossip_include_rsm_versions_frequency,
+       "10",
+       parse_positive<int32_t>(),
+       "How frequently to send RSM and NCM version information in a GOSSIP "
+       "message. If the value is 10, it means the versions will be present in "
+       "1/10th of the GOSSIP_Messages.",
        SERVER,
        SettingsCategory::FailureDetector);
 };

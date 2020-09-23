@@ -129,23 +129,21 @@ class TailRecord : public SerializableData {
 
   // use compiler generated copy constructor and assignment operator
   // since members can be safely copied with low cost
-  TailRecord(const TailRecord& rhs) noexcept = default;
-  TailRecord& operator=(const TailRecord& rhs) noexcept = default;
+  TailRecord(const TailRecord& rhs) = default;
+  TailRecord& operator=(const TailRecord& rhs) = default;
 
   TailRecord(TailRecord&& rhs) noexcept;
   TailRecord& operator=(TailRecord&& rhs) noexcept;
 
   /**
    * Construct a TailRecord with an OffsetMap and an optional linear payload.
-   * Note: payload must be backed by linear buffer. For evbuffer-based
-   * payload, use the constructor below.
    */
   TailRecord(const TailRecordHeader& header,
              OffsetMap offset_map,
-             std::shared_ptr<PayloadHolder> payload);
+             PayloadHolder payload);
 
   /**
-   * Construct a TailRecord with and OffsetMap and an optional evbuffer-based
+   * Construct a TailRecord with and OffsetMap and an optional
    * payload encapsulated in a ZeroCopiedRecord
    */
   TailRecord(const TailRecordHeader& header,
@@ -157,8 +155,7 @@ class TailRecord : public SerializableData {
   }
 
   bool isValid() const {
-    return header.log_id != LOGID_INVALID &&
-        (!hasPayload() || (!payload_ != !zero_copied_record_));
+    return header.log_id != LOGID_INVALID;
   }
 
   bool containOffsetWithinEpoch() const {
@@ -170,7 +167,7 @@ class TailRecord : public SerializableData {
   }
 
   void reset(const TailRecordHeader& h,
-             std::shared_ptr<PayloadHolder> payload,
+             PayloadHolder payload,
              OffsetMap offset_map) {
     header = h;
     payload_ = std::move(payload);
@@ -182,7 +179,7 @@ class TailRecord : public SerializableData {
              std::shared_ptr<ZeroCopiedRecord> record,
              OffsetMap offset_map) {
     header = h;
-    payload_.reset();
+    payload_ = zero_copied_record_->payload;
     zero_copied_record_ = std::move(record);
     offsets_map_ = std::move(offset_map);
   }
@@ -257,10 +254,9 @@ class TailRecord : public SerializableData {
   OffsetMap offsets_map_;
 
  private:
-  // container of the actual payload, can be one of
-  // 1) a flat, self-owned payload
-  // 2) ZeroCopiedRecord containing zero-copied evbuffer
-  std::shared_ptr<PayloadHolder> payload_;
+  // container of the actual payload.
+  PayloadHolder payload_;
+  // ZeroCopiedRecord containing zero-copied from network buffer.
   std::shared_ptr<ZeroCopiedRecord> zero_copied_record_;
 
   // calculate the size of the variable length blob for serialization

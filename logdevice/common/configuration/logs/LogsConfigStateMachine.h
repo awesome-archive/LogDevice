@@ -13,7 +13,6 @@
 #include "logdevice/common/configuration/logs/LogsConfigDeltaTypes.h"
 #include "logdevice/common/configuration/logs/LogsConfigTree.h"
 #include "logdevice/common/replicated_state_machine/ReplicatedStateMachine.h"
-#include "logdevice/common/replicated_state_machine/TrimRSMRetryHandler.h"
 #include "logdevice/include/ConfigSubscriptionHandle.h"
 
 namespace facebook { namespace logdevice {
@@ -37,6 +36,7 @@ class LogsConfigStateMachine
   LogsConfigStateMachine(
       UpdateableSettings<Settings> settings,
       std::shared_ptr<UpdateableServerConfig> updateable_server_config,
+      std::unique_ptr<RSMSnapshotStore> snapshot_store,
       bool is_writable,
       bool allow_snapshotting = true);
 
@@ -69,8 +69,39 @@ class LogsConfigStateMachine
    * Currently called by AdminCommand class
    */
   virtual void snapshot(std::function<void(Status st)> cb) override;
+  void trim(trim_cb_t cb);
+
+  /**
+   * Starts executing the state machine
+   */
+  void start();
+
+  /**
+   * Mark that something about the tree received a delta and should
+   * be deduplicated at some point.
+   */
+  void scheduleDeduplication();
+
+  /**
+   * Decides if the tree's LogAttributes should be deduplicated
+   * afer certain number of deltas.
+   */
+  bool shouldBeDeduplicated() const;
+
+  /**
+   * Must be called when the tree was deduplicated.
+   */
+  void wasDeduplicated();
 
  protected:
+  // Deduplication of a whole tree is expensive,
+  // and doing it on each delta arrival is not worth it.
+  // Each LogAttributes::CommonValues weights around 1KB.
+  // The number guarantees we don't do it too often but,
+  // at the same time limits the the upper bound of not duplicated
+  // memory to ~128KB.
+  static constexpr size_t kNumDeltasBeforeDeduplication = 128;
+
   virtual bool canSnapshot() const override;
 
   bool canTrimAndSnapshot() const;
@@ -86,8 +117,6 @@ class LogsConfigStateMachine
   // Snapshot creation completion callback. On success, also issue a request to
   // trim the RSM if possible.
   void onSnapshotCreated(Status st, size_t snapshotSize) override;
-
-  void trim();
 
   std::unique_ptr<logsconfig::LogsConfigTree>
   makeDefaultState(lsn_t version) const override;
@@ -116,8 +145,8 @@ class LogsConfigStateMachine
   folly::Synchronized<std::string> delimiter_;
   ConfigSubscriptionHandle server_config_updates_handle_;
   std::unique_ptr<SubscriptionHandle> self_subscription_;
-  std::unique_ptr<TrimRSMRetryHandler> trim_retry_handler_;
-  bool is_writable_;
+  bool is_writable_; // this is for delta log
   bool allow_snapshotting_;
+  size_t deduplication_scheduled_{0};
 };
 }} // namespace facebook::logdevice

@@ -34,23 +34,37 @@ constexpr auto READERS_FLOW_TRACER = "readers_flow_tracer";
 class ClientReadersFlowTracer : public SampledTracer {
  public:
   using SystemClock = std::chrono::system_clock;
+  using SteadyClock = std::chrono::steady_clock;
   using TimePoint = SystemClock::time_point;
   template <typename T>
   using CircularBuffer = boost::circular_buffer_space_optimized<T>;
 
   struct Sample {
-    int64_t time_lag;
-    int64_t time_lag_correction{
+    std::chrono::milliseconds time_lag{0};
+    std::chrono::milliseconds time_lag_correction{
         0}; // `time_lag_correction` is the amount of time lag accumulated due
             // to client rejecting records from the time the sample was first
             // recorded until the next sample is recorded (in
             // `time_lag_record_`).
-    uint16_t ttl; // for how many periods do we keep this sample
+    uint16_t ttl{0}; // for how many periods do we keep this sample
+  };
+
+  enum class State {
+    HEALTHY,
+    STUCK,
+    STUCK_WHILE_FAILING_SYNC_SEQ_REQ,
+    LAGGING
+  };
+
+  struct Parameters {
+    std::chrono::milliseconds tracer_period;
+    const bool push_samples{true};
+    const bool ignore_overload{false};
   };
 
   struct TailInfo {
     OffsetMap offsets;
-    int64_t timestamp;
+    std::chrono::milliseconds timestamp;
     lsn_t lsn_approx;
 
     TailInfo(OffsetMap offset_map, int64_t ts, lsn_t lsn)
@@ -79,7 +93,7 @@ class ClientReadersFlowTracer : public SampledTracer {
     return 0.005;
   }
 
-  folly::Optional<int64_t> estimateTimeLag() const;
+  folly::Optional<std::chrono::milliseconds> estimateTimeLag() const;
   folly::Optional<int64_t> estimateByteLag() const;
 
   void onSettingsUpdated();
@@ -98,14 +112,15 @@ class ClientReadersFlowTracer : public SampledTracer {
   void updateTimeLagging(Status st = E::OK);
   void updateShouldTrack();
   void maybeBumpStats(bool force_healthy = false);
+  void bumpHistograms();
   double calculateSamplingWeight();
-  bool readerIsUnhealthy();
+  bool readerIsUnhealthy() const;
+  bool readerIsStuck() const;
+  lsn_t estimateTailLSN() const;
 
   WeakRefHolder<ClientReadersFlowTracer> ref_holder_;
 
-  std::chrono::milliseconds tracer_period_;
-  const bool push_samples_{true};
-  const bool ignore_overload_{false};
+  Parameters params_;
 
   /*
    * In case we need to ignore overload detection, let's also create a version
@@ -115,23 +130,29 @@ class ClientReadersFlowTracer : public SampledTracer {
 
   CircularBuffer<Sample> time_lag_record_;
   folly::Optional<TailInfo> latest_tail_info_;
+  Status last_sync_seq_request_result_{E::OK};
 
   size_t sample_counter_{0};
   size_t last_num_bytes_read_{0};
   size_t last_num_records_read_{0};
   bool should_track_{true};
 
-  enum class State { HEALTHY, STUCK, LAGGING };
   State last_reported_state_{State::HEALTHY};
 
   TimePoint last_time_stuck_{TimePoint::max()};
   TimePoint last_time_lagging_{TimePoint::max()};
   lsn_t last_next_lsn_to_deliver_{LSN_INVALID};
 
+  SteadyClock::time_point last_trace_time_{SteadyClock::now()};
+  double speed_records_moving_avg_{0};
+  double speed_bytes_moving_avg_{0};
+
   std::unique_ptr<Timer> timer_;
 
   ClientReadStream* const owner_;
   friend class ClientReadStream;
 };
+
+std::string toString(ClientReadersFlowTracer::State);
 
 }} // namespace facebook::logdevice

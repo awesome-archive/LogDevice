@@ -14,13 +14,10 @@
 #include "../Utils.h"
 #include "logdevice/common/configuration/Configuration.h"
 #include "logdevice/common/configuration/UpdateableConfig.h"
-#include "logdevice/common/configuration/nodes/NodesConfigLegacyConverter.h"
 #include "logdevice/common/configuration/nodes/NodesConfiguration.h"
 #include "logdevice/common/debug.h"
 #include "logdevice/common/membership/utils.h"
 #include "logdevice/lib/ClientImpl.h"
-
-using facebook::logdevice::Configuration;
 
 namespace facebook {
   namespace logdevice {
@@ -28,11 +25,15 @@ namespace facebook {
       namespace tables {
 
 TableColumns Nodes::getColumns() const {
-  return {{"node_id", DataType::BIGINT, "Id of the node"},
+  return {{"node_id", DataType::INTEGER, "Id of the node"},
+          {"name", DataType::TEXT, "Human readable name of the node"},
           {"address",
            DataType::TEXT,
            "Ip and port that should be used for communication with the node"},
           {"ssl_address", DataType::TEXT, "Same as \"address\" but with SSL"},
+          {"admin_address",
+           DataType::TEXT,
+           "The IP address, including port number, for admin server"},
           {"generation",
            DataType::BIGINT,
            "Generation of the node.  This value is bumped each time the "
@@ -45,26 +46,18 @@ TableColumns Nodes::getColumns() const {
            DataType::INTEGER,
            "1 if this node is provisioned for the sequencing role. "
            "Otherwise 0. Provisioned roles must be enabled in order "
-           "to be considered active. See 'sequencer_enabled'."},
+           "to be considered active."},
           {"storage",
            DataType::INTEGER,
            "1 if this node is provisioned for the storage role. "
            "Otherwise 0. Provisioned roles must be enabled in order "
            "to be considered active. See 'storage_state'."},
-          {"sequencer_enabled",
-           DataType::INTEGER,
-           "1 if sequencing on this node is enabled. Othewise 0."},
           {"sequencer_weight",
            DataType::REAL,
            "A non-negative value indicating how many logs this node "
            "should be a sequencer for relative to other nodes in the "
            "cluster.  A value of 0 means this node cannot run "
            "sequencers."},
-          {"is_storage",
-           DataType::INTEGER,
-           "1 if this node is provisioned for the storage role. "
-           "Otherwise 0. Provisioned roles must be enabled in order "
-           "to be considered active. See 'storage_state'."},
           {"storage_state",
            DataType::TEXT,
            "Determines the current state of the storage node. One "
@@ -101,12 +94,18 @@ std::shared_ptr<TableData> Nodes::getData(QueryContext& /*ctx*/) {
     node_index_t nid = kv.first;
     const auto& node_sd = kv.second;
     result->set("node_id", s(nid));
-    result->set("address", node_sd.address.toString());
-    if (node_sd.ssl_address.hasValue()) {
+    if (!node_sd.name.empty()) {
+      result->set("name", node_sd.name);
+    }
+    result->set("address", node_sd.default_client_data_address.toString());
+    if (node_sd.ssl_address.has_value()) {
       result->set("ssl_address", node_sd.ssl_address.value().toString());
     }
+    if (node_sd.admin_address.has_value()) {
+      result->set("admin_address", node_sd.admin_address.value().toString());
+    }
     result->set("generation", s(nodes_configuration->getNodeGeneration(nid)));
-    if (node_sd.location.hasValue()) {
+    if (node_sd.location.has_value()) {
       result->set("location", node_sd.location.value().toString());
     }
     result->set("sequencer",
@@ -129,16 +128,9 @@ std::shared_ptr<TableData> Nodes::getData(QueryContext& /*ctx*/) {
       // TODO: in compatibility mode, use the storage state of ShardID(nid, 0)
       ShardID compatibility_shard(nid, 0);
       auto state_res = storage_membership->getShardState(compatibility_shard);
-      if (state_res.hasValue()) {
-        // TODO: use the new storage state string
-        // result->set(
-        //     "storage_state",
-        //     membership::toString(state_res->storage_state).toString());
-        const auto legacy_storage_state =
-            configuration::nodes::NodesConfigLegacyConverter::
-                toLegacyStorageState(state_res->storage_state);
+      if (state_res.has_value()) {
         result->set("storage_state",
-                    configuration::storageStateToString(legacy_storage_state));
+                    membership::toString(state_res->storage_state).toString());
       } else {
         ld_warning("Node %hu does not have shard %s in storage membership!",
                    nid,

@@ -17,7 +17,6 @@
 #include "logdevice/common/Digest.h"
 #include "logdevice/common/EpochMetaDataUpdater.h"
 #include "logdevice/common/EpochStore.h"
-#include "logdevice/common/FileEpochStore.h"
 #include "logdevice/common/LegacyLogToShard.h"
 #include "logdevice/common/LocalLogStoreRecordFormat.h"
 #include "logdevice/common/Metadata.h"
@@ -35,6 +34,7 @@
 #include "logdevice/server/EpochRecordCacheEntry.h"
 #include "logdevice/server/RecordCache.h"
 #include "logdevice/server/RecordCacheDependencies.h"
+#include "logdevice/server/epoch_store/FileEpochStore.h"
 #include "logdevice/server/locallogstore/test/StoreUtil.h"
 #include "logdevice/test/utils/IntegrationTestUtils.h"
 
@@ -72,7 +72,7 @@ class RecoveryTest : public ::testing::TestWithParam<PopulateRecordCache> {
     return timeout_;
   }
   void SetUp() override {
-    dbg::currentLevel = dbg::Level::DEBUG;
+    dbg::currentLevel = getLogLevelFromEnv().value_or(dbg::Level::INFO);
     dbg::assertOnData = true;
   }
 
@@ -197,7 +197,7 @@ class RecoveryTest : public ::testing::TestWithParam<PopulateRecordCache> {
   bool bridge_empty_epoch_{false};
 
   NodeLocationScope sync_replication_scope_{NodeLocationScope::NODE};
-  folly::Optional<Configuration::Nodes> node_configs_;
+  std::shared_ptr<const NodesConfiguration> node_configs_;
   folly::Optional<Configuration::MetaDataLogsConfig> metadata_config_;
 
   // number of data logs in the config
@@ -303,48 +303,50 @@ void RecoveryTest::init(bool can_tail_optimize) {
   cache_deps_ = std::make_unique<MockRecordCacheDependencies>(this);
   populate_record_cache_ = GetParam();
 
-  populate_record_cache_ = PopulateRecordCache::YES;
   if (populate_record_cache_ == PopulateRecordCache::NO) {
     // do not use record cache at all if we don't populate data
     use_record_cache_ = false;
   }
 
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_maxWritesInFlight(max_writes_in_flight_);
-  log_attrs.set_singleWriter(false);
-  log_attrs.set_replicationFactor(replication_);
-  log_attrs.set_extraCopies(extra_);
-  log_attrs.set_syncedCopies(synced_);
-  log_attrs.set_syncReplicationScope(sync_replication_scope_);
-  log_attrs.set_stickyCopySets(true);
-  log_attrs.set_tailOptimized(tail_optimized_);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_maxWritesInFlight(max_writes_in_flight_)
+                       .with_singleWriter(false)
+                       .with_replicationFactor(replication_)
+                       .with_extraCopies(extra_)
+                       .with_syncedCopies(synced_)
+                       .with_syncReplicationScope(sync_replication_scope_)
+                       .with_stickyCopySets(true)
+                       .with_tailOptimized(tail_optimized_);
 
   // Use replication factor 3 for event log if there are enough nodes.
-  logsconfig::LogAttributes event_log_attrs;
-  event_log_attrs.set_maxWritesInFlight(256);
-  event_log_attrs.set_singleWriter(false);
-  event_log_attrs.set_replicationFactor(std::min(nodes_ - (nodes_ > 1), 3ul));
-  event_log_attrs.set_extraCopies(0);
-  event_log_attrs.set_syncedCopies(0);
-  event_log_attrs.set_syncReplicationScope(sync_replication_scope_);
+  auto event_log_attrs =
+      logsconfig::LogAttributes()
+          .with_maxWritesInFlight(256)
+          .with_singleWriter(false)
+          .with_replicationFactor(std::min(nodes_ - (nodes_ > 1), 3ul))
+          .with_extraCopies(0)
+          .with_syncedCopies(0)
+          .with_syncReplicationScope(sync_replication_scope_);
 
   // Use replication factor 3 for config-log-deltas
   // log if there are enough nodes.
-  logsconfig::LogAttributes config_attrs;
-  config_attrs.set_maxWritesInFlight(256);
-  config_attrs.set_singleWriter(false);
-  config_attrs.set_replicationFactor(std::min(nodes_ - (nodes_ > 1), 3ul));
-  config_attrs.set_extraCopies(0);
-  config_attrs.set_syncedCopies(0);
-  config_attrs.set_syncReplicationScope(sync_replication_scope_);
+  auto config_attrs =
+      logsconfig::LogAttributes()
+          .with_maxWritesInFlight(256)
+          .with_singleWriter(false)
+          .with_replicationFactor(std::min(nodes_ - (nodes_ > 1), 3ul))
+          .with_extraCopies(0)
+          .with_syncedCopies(0)
+          .with_syncReplicationScope(sync_replication_scope_);
 
-  logsconfig::LogAttributes maint_attrs;
-  maint_attrs.set_maxWritesInFlight(256);
-  maint_attrs.set_singleWriter(false);
-  maint_attrs.set_replicationFactor(std::min(nodes_ - (nodes_ > 1), 3ul));
-  maint_attrs.set_extraCopies(0);
-  maint_attrs.set_syncedCopies(0);
-  maint_attrs.set_syncReplicationScope(sync_replication_scope_);
+  auto maint_attrs =
+      logsconfig::LogAttributes()
+          .with_maxWritesInFlight(256)
+          .with_singleWriter(false)
+          .with_replicationFactor(std::min(nodes_ - (nodes_ > 1), 3ul))
+          .with_extraCopies(0)
+          .with_syncedCopies(0)
+          .with_syncReplicationScope(sync_replication_scope_);
 
   auto factory =
       IntegrationTestUtils::ClusterFactory()
@@ -379,16 +381,16 @@ void RecoveryTest::init(bool can_tail_optimize) {
   factory.setParam(
       "--enable-record-cache", use_record_cache_ ? "true" : "false");
 
-  if (seq_reactivation_limit_.hasValue()) {
+  if (seq_reactivation_limit_.has_value()) {
     factory.setParam("--reactivation-limit", seq_reactivation_limit_.value());
   }
 
-  if (recovery_timeout_.hasValue()) {
+  if (recovery_timeout_.has_value()) {
     factory.setParam("--recovery-timeout",
                      toString(recovery_timeout_.value().count()) + "ms");
   }
 
-  if (recovery_grace_period_.hasValue()) {
+  if (recovery_grace_period_.has_value()) {
     factory.setParam("--recovery-grace-period",
                      toString(recovery_grace_period_.value().count()) + "ms");
   }
@@ -402,16 +404,16 @@ void RecoveryTest::init(bool can_tail_optimize) {
     factory.doPreProvisionEpochMetaData();
   }
 
-  if (num_logs_.hasValue()) {
+  if (num_logs_.has_value()) {
     factory.setNumLogs(num_logs_.value());
   }
 
-  if (node_configs_.hasValue()) {
-    ASSERT_EQ(nodes_, node_configs_.value().size());
-    factory.setNodes(node_configs_.value());
+  if (node_configs_) {
+    ASSERT_EQ(nodes_, node_configs_->clusterSize());
+    factory.setNodes(node_configs_);
   }
 
-  if (metadata_config_.hasValue()) {
+  if (metadata_config_.has_value()) {
     factory.setMetaDataLogsConfig(metadata_config_.value());
   } else {
     // Place metadata logs on the first 3 nodes in the cluster.
@@ -496,12 +498,10 @@ void RecoveryTest::prepopulateRecordCacheForLog(
   // ensure we get cache hit later
   record_cache->neverStored();
   for (const TestRecord& tr : records) {
-    Slice payload_slice =
-        tr.payload_.hasValue() ? Slice(tr.payload_.value()) : Slice("blah", 4);
-    auto ph = (tr.payload_.hasValue()
-                   ? std::make_shared<PayloadHolder>(
-                         tr.payload_.value(), PayloadHolder::UNOWNED)
-                   : std::make_shared<PayloadHolder>(nullptr, 0));
+    auto ph = PayloadHolder::copyPayload(
+        tr.payload_.has_value() ? tr.payload_.value()
+                                : Payload(TestRecord::kDefaultPayload.data(),
+                                          TestRecord::kDefaultPayload.size()));
 
     STORE_flags_t store_flags =
         STORE_flags_t(tr.flags_ & LocalLogStoreRecordFormat::FLAG_MASK);
@@ -518,7 +518,6 @@ void RecoveryTest::prepopulateRecordCacheForLog(
         copyset_t(tr.copyset_.cbegin(), tr.copyset_.cend()),
         store_flags,
         {},
-        payload_slice,
         ph,
         tr.offsets_within_epoch_);
 
@@ -628,10 +627,9 @@ void RecoveryTest::verifyEpochRecoveryMetadata(
   // examine the local log store for the per-epoch log metadata
   for (int i = 0; i < nodes_; ++i) {
     if (!cluster_->getConfig()
-             ->get()
-             ->serverConfig()
-             ->getNode(i)
-             ->isReadableStorageNode()) {
+             ->getNodesConfiguration()
+             ->getStorageMembership()
+             ->hasShardShouldReadFrom(i)) {
       continue;
     }
 
@@ -746,19 +744,18 @@ RecoveryTest::buildDigest(epoch_t epoch,
                           epoch_t expect_seal_epoch) {
   ld_check(cluster_ != nullptr);
 
-  std::shared_ptr<Configuration> config = cluster_->getConfig()->get();
+  auto nodes_cfg = cluster_->getConfig()->getNodesConfiguration();
   auto digest = std::make_unique<Digest>(
       LOG_ID,
       epoch,
       EpochMetaData(
           shards, ReplicationProperty(replication, sync_replication_scope)),
       expect_seal_epoch,
-      config->serverConfig()->getNodesConfigurationFromServerConfigSource(),
+      nodes_cfg,
       Digest::Options({bridge_empty_epoch_}));
 
   for (ShardID shard : shards) {
-    auto* n = config->serverConfig()->getNode(shard.node());
-    if (!n || !n->isReadableStorageNode()) {
+    if (!nodes_cfg->getStorageMembership()->shouldReadFromShard(shard)) {
       continue;
     }
 
@@ -813,13 +810,6 @@ RecoveryTest::buildDigest(epoch_t epoch,
       ld_check(rv == 0);
       copyset.resize(copyset_size);
 
-      void* data = nullptr;
-      if (payload.size() > 0) {
-        data = malloc(payload.size());
-        ld_check(data != nullptr);
-        memcpy(data, payload.data(), payload.size());
-      }
-
       auto extra_metadata = std::make_unique<ExtraMetadata>();
       extra_metadata->header = {
           last_known_good, wave_or_recovery_epoch, copyset_size};
@@ -833,13 +823,13 @@ RecoveryTest::buildDigest(epoch_t epoch,
         record_flags |= RECORD_Header::INCLUDE_OFFSET_WITHIN_EPOCH;
       }
 
-      auto record =
-          std::make_unique<DataRecordOwnsPayload>(LOG_ID,
-                                                  Payload(data, payload.size()),
-                                                  lsn,
-                                                  timestamp,
-                                                  record_flags,
-                                                  std::move(extra_metadata));
+      auto record = std::make_unique<RawDataRecord>(
+          LOG_ID,
+          PayloadHolder(PayloadHolder::COPY_BUFFER, payload),
+          lsn,
+          timestamp,
+          record_flags,
+          std::move(extra_metadata));
 
       digest->onRecord(shard, std::move(record));
 
@@ -1090,9 +1080,12 @@ TEST_P(RecoveryTest, MutationsWithImmutableConsensus) {
   for (auto i = 0; i < data_.size(); ++i) {
     // each data payload is 4 bytes,
     // e1n1 as the last know good has the byteoffset 10, which we will start
-    // rebuild from
+    // rebuild froma
+    EXPECT_EQ(TestRecord::kDefaultPayload, data_[i]->payload.toString())
+        << lsn_to_string(data_[i]->attrs.lsn);
     EXPECT_EQ(
-        RecordOffset({{BYTE_OFFSET, 4 * i + 10}}), data_[i]->attrs.offsets);
+        RecordOffset({{BYTE_OFFSET, 4 * i + 10}}), data_[i]->attrs.offsets)
+        << lsn_to_string(data_[i]->attrs.lsn);
   }
 
   EXPECT_EQ(std::vector<gap_record_t>({
@@ -1328,16 +1321,8 @@ TEST_P(RecoveryTest, Purging) {
 // should be in a consistent state after they are all done.
 TEST_P(RecoveryTest, MultipleSequencers) {
   // four nodes, all of them store records and run sequencers
-  Configuration::Nodes node_configs;
-  for (node_index_t i = 0; i < 4; ++i) {
-    auto& node = node_configs[i];
-    node.generation = 1;
-    node.addSequencerRole();
-    node.addStorageRole(/*num_shards*/ 2);
-  }
-
-  node_configs_ = node_configs;
-  nodes_ = node_configs_.value().size();
+  node_configs_ = createSimpleNodesConfig(4, 2);
+  nodes_ = node_configs_->clusterSize();
   replication_ = 2;
   // prepopulating metadata to avoid throwing off the epoch math below
   pre_provision_epoch_metadata_ = true;
@@ -1782,15 +1767,17 @@ TEST_P(RecoveryTest, FailureDomainAuthoritative) {
     location.fromDomainString(domain_string);
     node_configs[i].location = location;
   }
-  node_configs_ = node_configs;
-
   // metadata logs are replicated cross-region
   // use a smaller, cross-region nodeset to ensure all records must be
   // cross-region no matter how their copysets are selected. this is
   // a workaround since we just select copyset randomly in MetaDataProvisioner.
-  Configuration::MetaDataLogsConfig meta_config = createMetaDataLogsConfig(
-      /*nodeset=*/{0, 3, 5}, /*replication=*/2, NodeLocationScope::REGION);
-  metadata_config_ = meta_config;
+  node_configs[0].metadata_node = true;
+  node_configs[3].metadata_node = true;
+  node_configs[5].metadata_node = true;
+
+  node_configs_ = NodesConfigurationTestUtil::provisionNodes(
+      std::move(node_configs),
+      ReplicationProperty{{NodeLocationScope::REGION, 2}});
 
   pre_provision_epoch_metadata_ = true;
 
@@ -2068,10 +2055,9 @@ TEST_P(RecoveryTest, PerEpochLogMetadata) {
   // examine the local log store for the per-epoch log metadata
   for (int i = 0; i < nodes_; ++i) {
     if (!cluster_->getConfig()
-             ->get()
-             ->serverConfig()
-             ->getNode(i)
-             ->isReadableStorageNode()) {
+             ->getNodesConfiguration()
+             ->getStorageMembership()
+             ->hasShardShouldReadFrom(i)) {
       continue;
     }
 
@@ -3801,9 +3787,9 @@ TEST_P(RecoveryTest, BridgeRecordForEmptyEpochs) {
   }
 }
 
-// 1) digest should respect nodes in draining and include them into f-majority;
-// 2) mutation should not happen on draining nodes
-TEST_P(RecoveryTest, AuthoritativeRecoveryWithDrainingNodes) {
+// 1) digest should respect READ_ONLY nodes and include them into f-majority;
+// 2) mutation should not happen on READ_ONLY nodes
+TEST_P(RecoveryTest, AuthoritativeRecoveryWithReadOnlyNodes) {
   nodes_ = 6;
   replication_ = 2;
   extra_ = 0;
@@ -3973,17 +3959,18 @@ TEST_P(RecoveryTest, AuthoritativeRecoveryWithDrainingNodes) {
   // start N0, N1, and N5. These nodes are enough to operate
   // event log but not enough to let LOG_ID have f-majority
   ASSERT_EQ(0, cluster_->start({0, 1, 2, 5}));
-  // request draining for N1 and N2
-  ld_info("Requesting draining for shard N1 and N2.");
-  auto client = cluster_->createClient();
-  auto flags =
-      SHARD_NEEDS_REBUILD_Header::RELOCATE | SHARD_NEEDS_REBUILD_Header::DRAIN;
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, 1, SHARD_IDX, flags));
-  const lsn_t to_sync = requestShardRebuilding(*client, 2, SHARD_IDX, flags);
-  ASSERT_NE(LSN_INVALID, to_sync);
 
-  // wait for N0 and N1 to pick up the up-to-date event log version.
-  cluster_->waitUntilEventLogSynced(to_sync, {0, 1, 2});
+  {
+    // Mark N1 & N2 as READ_ONLY
+    ld_info("Marking N1 and N2 as READ_ONLY");
+    auto nc = cluster_->getConfig()->getNodesConfiguration();
+    nc = nc->applyUpdate(NodesConfigurationTestUtil::setStorageMembershipUpdate(
+        *nc,
+        {ShardID(1, SHARD_IDX), ShardID(2, SHARD_IDX)},
+        membership::StorageState::READ_ONLY,
+        folly::none));
+    cluster_->updateNodesConfiguration(*nc);
+  }
 
   // half of the time, kill sequencer so that it does not have up-to-date
   // event log and we may fallback to intersection check
@@ -4190,4 +4177,79 @@ TEST_P(RecoveryTest, BasicWriteStream) {
                std::vector<esn_t>({esn_t(3), esn_t(4)}), // plugs
                std::vector<esn_t>({esn_t(6)})            // bridge
   );
+}
+
+TEST_P(RecoveryTest, LogRemovedBeforePurging) {
+  ld_info("Creating cluster.");
+  auto cluster = IntegrationTestUtils::ClusterFactory()
+                     .setLogAttributes(
+                         logsconfig::LogAttributes().with_replicationFactor(2))
+                     .setInternalLogsReplicationFactor(2)
+                     .create(4);
+
+  // Wait for sequencer to activate and finish recovery.
+  ld_info("Waiting for sequencers.");
+  cluster->waitUntilAllSequencersQuiescent();
+  EXPECT_FALSE(cluster->getNode(0).sequencerInfo(logid_t(1)).empty());
+
+  // Stop N1, reactivate sequencer, and wait for recovery. N1 won't participate
+  // in recovery, so it'll have to purge later.
+  ld_info("Stopping N1.");
+  cluster->getNode(1).shutdown();
+  ld_info("Restarting N0.");
+  cluster->getNode(0).restart();
+  ld_info("Waiting for sequencers.");
+  cluster->waitUntilAllSequencersQuiescent();
+  EXPECT_FALSE(cluster->getNode(0).sequencerInfo(logid_t(1)).empty());
+
+  // Also stop N2 and reactivate sequencer. Recovery should get stuck.
+  ld_info("Stopping N2.");
+  cluster->getNode(2).shutdown();
+  ld_info("Restarting N0.");
+  cluster->getNode(0).restart();
+  // Check that recovery is stuck, at least for a few seconds.
+  ld_info("Checking sequencers and recoveries.");
+  wait_until("sequencer is activated", [&] {
+    return !cluster->getNode(0).sequencerInfo(logid_t(1)).empty();
+  });
+  wait_until("recovery is started", [&] {
+    return !cluster->getNode(0)
+                .sendJsonCommand("info recoveries 1 --json")
+                .empty();
+  });
+  EXPECT_NE(0,
+            cluster->waitUntilAllSequencersQuiescent(
+                std::chrono::steady_clock::now() + std::chrono::seconds(5)));
+
+  // Remove the log from config.
+  {
+    ld_info("Removing log from config.");
+    auto logs_config_changed =
+        cluster->getConfig()->getLocalLogsConfig()->copyLocal();
+    EXPECT_NE(nullptr, logs_config_changed->getLogGroupByIDShared(logid_t(1)));
+    logs_config_changed->erase("/ns/test_logs");
+    EXPECT_EQ(nullptr, logs_config_changed->getLogGroupByIDShared(logid_t(1)));
+    cluster->writeLogsConfig(logs_config_changed.get());
+    ld_info("Waiting for config propagation.");
+    cluster->waitForServersToPartiallyProcessConfigUpdate();
+  }
+
+  // Start N1.
+  ld_info("Starting N1.");
+  cluster->getNode(1).start();
+
+  // Recovery should notice that the log is no longer in config and cancel.
+  ld_info("Waiting for sequencers.");
+  EXPECT_EQ(0, cluster->waitUntilAllSequencersQuiescent());
+  EXPECT_EQ(
+      0, cluster->getNode(0).sendJsonCommand("info recoveries --json").size());
+  auto info_seq = cluster->getNode(0).sequencerInfo(logid_t(1));
+  ASSERT_FALSE(info_seq.empty());
+  EXPECT_EQ("UNAVAILABLE", info_seq.at("State"));
+
+  // Make sure N1's purging (if any) doesn't get stuck in a retry loop.
+  ld_info("Waiting for purges.");
+  wait_until("no purges on N1", [&] {
+    return cluster->getNode(1).sendJsonCommand("info purges --json").empty();
+  });
 }

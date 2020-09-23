@@ -24,9 +24,17 @@ ExternalProject_Add(rocksdb
     DOWNLOAD_COMMAND ""
     CMAKE_ARGS -DUSE_RTTI=1 -DPORTABLE=${PORTABLE}
         -DCMAKE_CXX_STANDARD=17
+        -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
         -DWITH_TESTS=OFF
+        -DWITH_TOOLS=OFF
+        -DWITH_BZ2=ON
+        -DWITH_LZ4=ON
+        -DWITH_SNAPPY=ON
+        -DWITH_ZLIB=ON
+        # Disable ZSTD for now as it breaks internal build
+        -DWITH_ZSTD=OFF
         -DCMAKE_POSITION_INDEPENDENT_CODE=True
-    INSTALL_COMMAND make install DESTDIR=${LOGDEVICE_STAGING_DIR}
+    INSTALL_COMMAND $(MAKE) install DESTDIR=${LOGDEVICE_STAGING_DIR}
     )
 
 ExternalProject_Get_Property(rocksdb BINARY_DIR)

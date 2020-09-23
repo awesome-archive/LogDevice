@@ -138,11 +138,6 @@ MessageReadResult START_Message::deserialize(ProtocolReader& reader) {
   return reader.resultMsg(std::move(m));
 }
 
-bool START_Message::allowUnencrypted() const {
-  return MetaDataLog::isMetaDataLog(header_.log_id) &&
-      Worker::settings().read_streams_use_metadata_log_only;
-}
-
 std::vector<std::pair<std::string, folly::dynamic>>
 START_Message::getDebugInfo() const {
   std::vector<std::pair<std::string, folly::dynamic>> res;
@@ -162,6 +157,14 @@ START_Message::getDebugInfo() const {
   add("scd_copyset_reordering", int(header_.scd_copyset_reordering));
   add("flags", header_.flags);
   return res;
+}
+
+PermissionParams START_Message::getPermissionParams() const {
+  PermissionParams params;
+  params.requiresPermission = true;
+  params.action = ACTION::READ;
+  params.log_id = header_.log_id;
+  return params;
 }
 
 }} // namespace facebook::logdevice

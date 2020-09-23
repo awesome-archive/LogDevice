@@ -19,13 +19,12 @@
 #include "logdevice/common/GetTrimPointRequest.h"
 #include "logdevice/common/LogRecoveryRequest.h"
 #include "logdevice/common/MetaDataLog.h"
+#include "logdevice/common/MetaDataLogTrimmer.h"
 #include "logdevice/common/MetaDataLogWriter.h"
 #include "logdevice/common/NodeID.h"
-#include "logdevice/common/NodeSetFinder.h"
 #include "logdevice/common/PeriodicReleases.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/SequencerBackgroundActivator.h"
-#include "logdevice/common/Socket.h"
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/configuration/Configuration.h"
 #include "logdevice/common/debug.h"
@@ -235,7 +234,6 @@ ActivateResult Sequencer::completeActivationWithMetaData(
 
   ld_check(metadata_for_provisioning);
   ml_manager_.considerWritingMetaDataLogRecord(metadata_for_provisioning, cfg);
-
   switch (metadata_result.first) {
     case UpdateMetaDataMapResult::UPDATED: {
       ld_check(metadata_result.second != nullptr);
@@ -258,6 +256,13 @@ ActivateResult Sequencer::completeActivationWithMetaData(
 
     // 7. start timer to periodically read and refresh the metadata map.
     getHistoricalMetaData(GetHistoricalMetaDataMode::PERIODIC);
+
+    // 8. start periodic trimming of metdata log
+    if (metadata_log_trimmer_.get() == nullptr) {
+      metadata_log_trimmer_.update(std::make_shared<MetaDataLogTrimmer>(this));
+      metadata_log_trimmer_.get()->setRunInterval(
+          settings_->metadata_log_trim_interval);
+    }
   }
 
   return (draining_started ? ActivateResult::GRACEFUL_DRAINING
@@ -275,7 +280,7 @@ void Sequencer::startGetTrimPointRequest() {
 
 void Sequencer::updateTrimPoint(Status status, lsn_t tp) {
   if (status == E::OK) {
-    trim_point_.fetchMax(tp);
+    atomic_fetch_max(trim_point_, tp);
   }
 }
 
@@ -285,11 +290,11 @@ std::pair<Status, bool> Sequencer::isLogEmpty() {
   // Tell the client to try again in a bit if
   // 1) activation or recovery haven't finished,
   // 2) we're in some error state. Client should get routed elsewhere.
-  if (!tail_record || !tail_record->isValid() || !getTrimPoint().hasValue()) {
+  if (!tail_record || !tail_record->isValid()) {
     return {E::AGAIN, false};
   }
 
-  return {E::OK, tail_record->header.lsn <= getTrimPoint().value()};
+  return {E::OK, tail_record->header.lsn <= getTrimPoint()};
 }
 
 void Sequencer::noteDrainingCompleted(epoch_t epoch, Status drain_status) {
@@ -434,6 +439,21 @@ class GetHistoricalMetaDataRequest : public FireAndForgetRequest {
         current_epoch_(current_epoch),
         mode_(mode) {
     ld_check(!MetaDataLog::isMetaDataLog(log_id_));
+
+    if (mode_ == Sequencer::GetHistoricalMetaDataMode::IMMEDIATE) {
+      ld_spew("[sequencer_activity_in_progress++] Created "
+              "GetHistoricalMetaDataRequest for log %lu",
+              log_id.val());
+      WORKER_STAT_INCR(sequencer_activity_in_progress);
+    }
+  }
+  ~GetHistoricalMetaDataRequest() override {
+    if (mode_ == Sequencer::GetHistoricalMetaDataMode::IMMEDIATE) {
+      ld_spew("[sequencer_activity_in_progress--] Destroyed "
+              "GetHistoricalMetaDataRequest for log %lu",
+              log_id_.val());
+      WORKER_STAT_DECR(sequencer_activity_in_progress);
+    }
   }
 
   void executionBody() override {
@@ -466,14 +486,16 @@ class GetHistoricalMetaDataRequest : public FireAndForgetRequest {
     bool should_retry = false;
     if (seq) {
       std::shared_ptr<const EpochMetaDataMap::Map> result_map;
+      NodeSetFinder::MetaDataExtrasMap extras_map;
       if (status == E::OK) {
         auto result = nodeset_finder_->getResult();
         ld_check(result != nullptr);
         result_map = result->getMetaDataMap();
+        extras_map = nodeset_finder_->getMetaDataExtras();
       }
 
       should_retry = seq->onHistoricalMetaData(
-          status, current_epoch_, std::move(result_map));
+          status, current_epoch_, std::move(result_map), std::move(extras_map));
     }
 
     if (should_retry) {
@@ -716,7 +738,8 @@ void Sequencer::getHistoricalMetaData(GetHistoricalMetaDataMode mode) {
 bool Sequencer::onHistoricalMetaData(
     Status status,
     epoch_t request_epoch,
-    std::shared_ptr<const EpochMetaDataMap::Map> historical_metadata) {
+    std::shared_ptr<const EpochMetaDataMap::Map> historical_metadata,
+    NodeSetFinder::MetaDataExtrasMap metadata_extras) {
   if (getCurrentEpoch() > request_epoch) {
     // the epoch has advanced since we made the request, this is a stale result,
     // nothing to do
@@ -794,6 +817,9 @@ bool Sequencer::onHistoricalMetaData(
           /*effective_until=*/current_epoch);
       ld_check(new_map != nullptr);
       metadata_map_.update(new_map);
+      metadata_extras_map_.update(
+          std::make_shared<NodeSetFinder::MetaDataExtrasMap>(
+              std::move(metadata_extras)));
     }
   }
 
@@ -1122,7 +1148,7 @@ int Sequencer::startRecovery(std::chrono::milliseconds delay) {
                          TailRecordHeader::CHECKSUM_PARITY, // flags
                          {}},
         OffsetMap::fromLegacy(0),
-        std::shared_ptr<PayloadHolder>()};
+        PayloadHolder()};
 
     onRecoveryCompleted(E::OK,
                         epoch,
@@ -1295,6 +1321,11 @@ std::shared_ptr<const EpochMetaDataMap> Sequencer::getMetaDataMap() const {
   return metadata_map_.get();
 }
 
+std::shared_ptr<const NodeSetFinder::MetaDataExtrasMap>
+Sequencer::getMetaDataExtrasMap() const {
+  return metadata_extras_map_.get();
+}
+
 bool Sequencer::hasAvailableLsns() const {
   auto current = getCurrentEpochSequencer();
   return current != nullptr ? current->hasAvailableLsns() : false;
@@ -1335,21 +1366,45 @@ const char* Sequencer::stateString(State st) {
 void Sequencer::setState(State state) {
   last_state_change_timestamp_ =
       std::chrono::steady_clock::now().time_since_epoch();
-  state_.store(state);
+
+  State prev_state = state_.exchange(state);
+
+  if ((state == State::ACTIVATING) != (prev_state == State::ACTIVATING)) {
+    ld_spew("[sequencer_activity_in_progress%s] Sequencer for log %lu changed "
+            "state from %s to %s",
+            state == State::ACTIVATING ? "++" : "--",
+            log_id_.val(),
+            stateString(prev_state),
+            stateString(state));
+    STAT_ADD(stats_,
+             sequencer_activity_in_progress,
+             state == State::ACTIVATING ? +1 : -1);
+  }
 }
 
 void Sequencer::setEpochSequencers(std::shared_ptr<EpochSequencer> current,
                                    std::shared_ptr<EpochSequencer> draining) {
-  epoch_seqs_.update(std::make_shared<EpochSequencers>(
-      EpochSequencers{std::move(current), std::move(draining)}));
+  bool have_draining = draining != nullptr;
+  std::shared_ptr<EpochSequencers> prev =
+      epoch_seqs_.exchange(std::make_shared<EpochSequencers>(
+          EpochSequencers{std::move(current), std::move(draining)}));
+
+  bool had_draining = prev != nullptr && prev->draining != nullptr;
+  if (have_draining != had_draining) {
+    ld_spew("[sequencer_activity_in_progress%s] Log %lu now has %s draining "
+            "sequencer",
+            have_draining ? "++" : "--",
+            log_id_.val(),
+            have_draining ? "a" : "no");
+    STAT_ADD(stats_, sequencer_activity_in_progress, have_draining ? +1 : -1);
+  }
 }
 
 std::shared_ptr<EpochSequencer>
 Sequencer::createEpochSequencer(epoch_t epoch,
                                 std::shared_ptr<Configuration> cfg,
                                 std::unique_ptr<EpochMetaData> metadata) {
-  const std::shared_ptr<LogsConfig::LogGroupNode> logcfg =
-      cfg->getLogGroupByIDShared(log_id_);
+  const auto logcfg = cfg->getLogGroupByIDShared(log_id_);
   ld_check(logcfg != nullptr);
 
   auto local_settings = settings_.get();
@@ -1469,15 +1524,6 @@ int Sequencer::sendReleases(lsn_t lsn,
           release_type_to_string(release_type).c_str(),
           rid.toString().c_str());
 
-  if (release_type == ReleaseType::PER_EPOCH &&
-      !epochMetaDataAvailable(epoch)) {
-    ld_debug("Trying to send per-epoch RELEASE messages, but epoch metadata "
-             "not yet available for record %s",
-             rid.toString().c_str());
-    err = E::AGAIN;
-    return -1;
-  }
-
   auto metadata_map = getMetaDataMap();
   if (metadata_map == nullptr) {
     RATELIMIT_INFO(std::chrono::seconds(10),
@@ -1526,31 +1572,12 @@ int Sequencer::sendReleases(lsn_t lsn,
 }
 
 void Sequencer::sendReleases() {
-  // Load lng_ first to avoid case where lng_ and last_released_ are
-  // concurrently updated to the same lsn, but we could see
-  // last_released_ < lng_ if last_released_ was loaded first. It is okay to
-  // see last_released_ > lng_. In this case, we can safely assume there has
-  // been a concurrent update, and we will want to send a single, global
-  // release message.
-  lsn_t lng = getLastKnownGood();
-  lsn_t last_released = last_released_.load();
-
-  // First send global release message, then possibly send per-epoch release
-  // message. No need to send per-epoch release message if ESN is invalid (no
-  // released records in epoch yet), or global last_released is caught up to
-  // per-epoch lng.
-  bool send_failed = false;
+  auto last_released = last_released_.load();
   if (last_released != LSN_INVALID) {
-    send_failed = (sendReleases(last_released, ReleaseType::GLOBAL) != 0);
-  }
-
-  if (lsn_to_esn(lng) != ESN_INVALID && lng > last_released) {
-    send_failed |= sendReleases(lng, ReleaseType::PER_EPOCH) != 0;
-  }
-
-  if (send_failed) {
-    // At least one send failed. Use PeriodicReleases to resend the message(s).
-    schedulePeriodicReleases();
+    if (!sendReleases(last_released, ReleaseType::GLOBAL)) {
+      // Send failed. Use PeriodicReleases to resend the message(s).
+      schedulePeriodicReleases();
+    }
   }
 }
 
@@ -1579,8 +1606,7 @@ bool Sequencer::epochMetaDataAvailable(epoch_t epoch) const {
   epoch_t metadata_effective_since = metadata->h.effective_since;
   ld_check(metadata_effective_since <= metadata_effective_until);
 
-  // An epoch is safe to read from (and it is thus safe to send per-epoch
-  // RELEASE message for this epoch), if its metadata has been written and the
+  // An epoch is safe to read from, if its metadata has been written and the
   // metadata is available for reads. The "metadata of epoch e" is the unique
   // metadata such that e falls in between the metadata's effective_since and
   // its effective_until.
@@ -1633,9 +1659,8 @@ Sequencer::handleAppendWithLSNBeforeRedirect(Appender* appender) {
       case RecoveredLSNs::RecoveryStatus::UNKNOWN: {
         STAT_INCR(stats_, append_redirected_maybe_stored);
         // Can we send a CANCELLED?
-        std::unique_ptr<SocketProxy> socket_proxy{
-            appender->getClientSocketProxy()};
-        if (socket_proxy && !socket_proxy->isClosed()) {
+        auto token = appender->getClientConnectionToken();
+        if (token && token->load()) {
           err = E::CANCELLED;
           return RunAppenderStatus::ERROR_DELETE;
         } else {
@@ -1721,6 +1746,7 @@ void Sequencer::processRedirectedRecords() {
               sequencer->processRedirectedRecords(st, logid);
             },
             worker_id_t{worker_idx},
+            WorkerType::GENERAL,
             E::OK,
             log_id_);
 
@@ -1743,8 +1769,7 @@ void Sequencer::noteConfigurationChanged(
   // Note: nodeset and replication factor are updated upon sequencer
   // activation, with the value from the epochstore. Here we only update
   // properties that do not require an epoch bump.
-  const std::shared_ptr<LogsConfig::LogGroupNode> log =
-      cfg->getLogGroupByIDShared(log_id_);
+  const auto log = cfg->getLogGroupByIDShared(log_id_);
   if (!log) {
     // Handle deletion of logs. Drain/abort all epoches and put the Sequencer
     // into UNAVAILABLE state.
@@ -1873,6 +1898,10 @@ void Sequencer::notifySequencerBackgroundActivator(Status st) {
 
 void Sequencer::shutdown() {
   setUnavailable(UnavailabilityReason::SHUTDOWN);
+  auto trimmer = metadata_log_trimmer_.get();
+  if (trimmer) {
+    trimmer->shutdown();
+  }
 }
 
 void Sequencer::noteReleaseSuccessful(ShardID shard,
@@ -1970,6 +1999,18 @@ std::chrono::milliseconds Sequencer::getRateEstimatorWindowSize() const {
     window = std::chrono::hours(1);
   }
   return window;
+}
+
+folly::Optional<lsn_t> Sequencer::getLatestMetaDataTrimPoint() const {
+  auto timmer = metadata_log_trimmer_.get();
+  return timmer != nullptr ? timmer->getTrimPoint() : folly::none;
+}
+
+void Sequencer::onSettingsUpdated() {
+  auto trimmer = metadata_log_trimmer_.get();
+  if (trimmer != nullptr) {
+    trimmer->setRunInterval(settings_->metadata_log_trim_interval);
+  }
 }
 
 }} // namespace facebook::logdevice

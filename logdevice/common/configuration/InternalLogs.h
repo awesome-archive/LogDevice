@@ -86,8 +86,8 @@ class InternalLogs {
    * - E::EXISTS if that internal log has already been configured;
    * - E::INVALID_CONFIG if the attributes are not valid.
    */
-  std::shared_ptr<logsconfig::LogGroupNode>
-  insert(const std::string& name, logsconfig::LogAttributes attrs);
+  logsconfig::LogGroupNodePtr insert(const std::string& name,
+                                     logsconfig::LogAttributes attrs);
 
   using const_iterator = logsconfig::LogMap::element_const_iterator;
   using const_reverse_iterator =
@@ -129,6 +129,19 @@ class InternalLogs {
    * "internal_logs" section of the main config when dumping it in json format.
    */
   folly::dynamic toDynamic() const;
+
+  bool operator!=(const InternalLogs& other) const;
+  bool operator==(const InternalLogs& other) const;
+
+  bool setDefaultAttributes(const logsconfig::LogAttributes& attrs,
+                            std::string& failure_reason) {
+    // Override backlog duration here to its default value, since backlog
+    // duration must not be specified for internal logs.
+    auto default_attrs =
+        logsconfig::LogAttributes(attrs, logsconfig::DefaultLogAttributes())
+            .with_backlogDuration(folly::Optional<std::chrono::seconds>());
+    return root_->setAttributes(default_attrs, failure_reason);
+  }
 
  private:
   void reset();

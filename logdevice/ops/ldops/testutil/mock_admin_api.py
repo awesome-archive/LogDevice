@@ -16,14 +16,6 @@ from typing import Dict, List, Optional, Type
 
 from ldops.const import ALL_SHARDS
 from ldops.types.cluster import Cluster
-from logdevice.admin.common.types import (
-    LocationScope,
-    NodeID,
-    Role,
-    ShardID,
-    SocketAddress,
-    SocketAddressFamily,
-)
 from logdevice.admin.exceptions.types import MaintenanceMatchError
 from logdevice.admin.maintenance.types import (
     MaintenanceDefinition,
@@ -49,8 +41,15 @@ from logdevice.admin.nodes.types import (
     ShardMaintenanceProgress,
     ShardOperationalState,
     ShardState,
-    ShardStorageState,
     StorageConfig,
+)
+from logdevice.common.types import (
+    LocationScope,
+    NodeID,
+    Role,
+    ShardID,
+    SocketAddress,
+    SocketAddressFamily,
 )
 from logdevice.membership.Membership.types import MetaDataStorageState, StorageState
 
@@ -127,10 +126,14 @@ class MockAdminAPI:
         self.num_distribute_across = num_distribute_across
 
         self.available_locations: Dict[LocationScope, List[str]] = {}
+        # Node Name -> NodeConfig Mapping
         self._nc_by_name: Dict[str, NodeConfig] = {}
+        # Node Name -> NodeState Mapping
         self._ns_by_name: Dict[str, NodeState] = {}
 
+        # Node ID -> NodeConfig Mapping
         self._nc_by_node_index: Dict[int, NodeConfig] = {}
+        # Node ID -> NodeState Mapping
         self._ns_by_node_index: Dict[int, NodeState] = {}
 
         self._nc_version = 0
@@ -228,7 +231,6 @@ class MockAdminAPI:
                 shard_states=[
                     ShardState(
                         data_health=ShardDataHealth.HEALTHY,
-                        current_storage_state=ShardStorageState.READ_WRITE,
                         current_operational_state=ShardOperationalState.ENABLED,
                         maintenance=None,
                         storage_state=StorageState.READ_WRITE,
@@ -244,7 +246,7 @@ class MockAdminAPI:
 
         # generate sequencer nodes
         if self.disaggregated:
-            for node_index in (
+            for node_index in range(
                 self.num_storage_nodes,
                 self.num_storage_nodes + self.num_sequencer_nodes,
             ):
@@ -283,9 +285,7 @@ class MockAdminAPI:
         self, shard: ShardID, target_state: ShardOperationalState
     ) -> None:
         assert shard.node.node_index is not None
-        # pyre-fixme[6]: Expected `int` for 1st param but got `Optional[int]`.
         nc = self._nc_by_node_index[shard.node.node_index]
-        # pyre-fixme[6]: Expected `int` for 1st param but got `Optional[int]`.
         ns = self._ns_by_node_index[shard.node.node_index]
         shard_states = []
         for shard_index, shard_state in enumerate(ns.shard_states or []):
@@ -294,7 +294,6 @@ class MockAdminAPI:
             else:
                 shard_states.append(shard_state)
         new_ns = ns(shard_states=shard_states)
-        # pyre-fixme[6]: Expected `int` for 1st param but got `Optional[int]`.
         self._ns_by_node_index[shard.node.node_index] = new_ns
         self._ns_by_name[nc.name] = new_ns
 
@@ -302,9 +301,7 @@ class MockAdminAPI:
         self, shard: ShardID, maintenance_progress: ShardMaintenanceProgress
     ) -> None:
         assert shard.node.node_index is not None
-        # pyre-fixme[6]: Expected `int` for 1st param but got `Optional[int]`.
         nc = self._nc_by_node_index[shard.node.node_index]
-        # pyre-fixme[6]: Expected `int` for 1st param but got `Optional[int]`.
         ns = self._ns_by_node_index[shard.node.node_index]
         shard_states = []
         for shard_index, shard_state in enumerate(ns.shard_states or []):
@@ -313,7 +310,6 @@ class MockAdminAPI:
             else:
                 shard_states.append(shard_state)
         new_ns = ns(shard_states=shard_states)
-        # pyre-fixme[6]: Expected `int` for 1st param but got `Optional[int]`.
         self._ns_by_node_index[shard.node.node_index] = new_ns
         self._ns_by_name[nc.name] = new_ns
 
@@ -321,31 +317,31 @@ class MockAdminAPI:
         self, node_id: NodeID, target_state: SequencingState
     ) -> None:
         assert node_id.node_index is not None
-        # pyre-fixme[6]: Expected `int` for 1st param but got `Optional[int]`.
         nc = self._nc_by_node_index[node_id.node_index]
-        # pyre-fixme[6]: Expected `int` for 1st param but got `Optional[int]`.
         ns = self._ns_by_node_index[node_id.node_index]
         assert ns.sequencer_state is not None
-        # pyre-fixme[29]: `Optional[SequencerState]` is not a function.
         new_ns = ns(sequencer_state=ns.sequencer_state(state=target_state))
-        # pyre-fixme[6]: Expected `int` for 1st param but got `Optional[int]`.
         self._ns_by_node_index[node_id.node_index] = new_ns
         self._ns_by_name[nc.name] = new_ns
+
+    def _set_maintenance_progress(
+        self, group_id: str, maintenance_progress: MaintenanceProgress
+    ) -> None:
+        mnt = self._maintenances_by_id[group_id]
+        # Since thrift structures are immutable in py3, this is the recommended
+        # way to mutate the __call__ operator is overloaded to perform a clone.
+        self._maintenances_by_id[group_id] = mnt(progress=maintenance_progress)
 
     def _set_sequencer_maintenance_progress(
         self, node_id: NodeID, maintenance_progress: SequencerMaintenanceProgress
     ) -> None:
         assert node_id.node_index is not None
-        # pyre-fixme[6]: Expected `int` for 1st param but got `Optional[int]`.
         nc = self._nc_by_node_index[node_id.node_index]
-        # pyre-fixme[6]: Expected `int` for 1st param but got `Optional[int]`.
         ns = self._ns_by_node_index[node_id.node_index]
         assert ns.sequencer_state is not None
         new_ns = ns(
-            # pyre-fixme[29]: `Optional[SequencerState]` is not a function.
             sequencer_state=ns.sequencer_state(maintenance=maintenance_progress)
         )
-        # pyre-fixme[6]: Expected `int` for 1st param but got `Optional[int]`.
         self._ns_by_node_index[node_id.node_index] = new_ns
         self._ns_by_name[nc.name] = new_ns
 
@@ -370,13 +366,10 @@ class MockAdminAPI:
             return ncs
 
         if filter.node is not None:
-            # pyre-fixme[16]: `Optional` has no attribute `node_index`.
             if filter.node.node_index is not None:
                 ncs = [nc for nc in ncs if nc.node_index == filter.node.node_index]
-            # pyre-fixme[16]: `Optional` has no attribute `address`.
             if filter.node.address is not None:
                 ncs = [nc for nc in ncs if nc.data_address == filter.node.address]
-            # pyre-fixme[16]: `Optional` has no attribute `name`.
             if filter.node.name is not None:
                 ncs = [nc for nc in ncs if nc.name == filter.node.name]
 
@@ -387,7 +380,6 @@ class MockAdminAPI:
             ncs = [
                 nc
                 for nc in ncs
-                # pyre-fixme[16]: `Optional` has no attribute `startswith`.
                 if nc.location is not None and nc.location.startswith(filter.location)
             ]
 
@@ -424,7 +416,7 @@ class MockAdminAPI:
                 r = range(sh.shard_index, sh.shard_index + 1)
 
             assert sh.node.node_index is not None
-            nc = self._nc_by_node_index[sh.node.node_index]  # pyre-ignore
+            nc = self._nc_by_node_index[sh.node.node_index]
             for shard_index in r:
                 shards.append(
                     ShardID(
@@ -442,7 +434,6 @@ class MockAdminAPI:
         seq_nodes = []
         for n in request.sequencer_nodes:
             assert n.node_index is not None
-            # pyre-fixme[6]: Expected `int` for 1st param but got `Optional[int]`.
             nc = self._nc_by_node_index[n.node_index]
             seq_nodes.append(
                 NodeID(node_index=nc.node_index, name=nc.name, address=nc.data_address)
@@ -470,7 +461,6 @@ class MockAdminAPI:
             progress=MaintenanceProgress.IN_PROGRESS,
         )
         assert mnt.group_id is not None
-        # pyre-fixme[6]: Expected `str` for 1st param but got `Optional[str]`.
         self._maintenances_by_id[mnt.group_id] = mnt
         return MaintenanceDefinitionResponse(maintenances=[mnt])
 
@@ -512,7 +502,6 @@ class MockAdminAPI:
 
         for mnt in mnts:
             assert mnt.group_id is not None
-            # pyre-fixme[6]: Expected `str` for 1st param but got `Optional[str]`.
             del self._maintenances_by_id[mnt.group_id]
 
         return RemoveMaintenancesResponse(maintenances=mnts)

@@ -7,6 +7,11 @@
  */
 #pragma once
 
+#include <queue>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
 #include "logdevice/common/ClusterState.h"
 #include "logdevice/common/Request.h"
 #include "logdevice/common/Timer.h"
@@ -28,10 +33,11 @@ struct GetClusterStateRequestMap {
 
 class GetClusterStateRequest : public Request {
  public:
-  using get_cs_callback_t =
-      std::function<void(Status status,
-                         std::vector<uint8_t> nodes_state,
-                         std::vector<node_index_t> boycotted_nodes)>;
+  using get_cs_callback_t = std::function<void(
+      Status status,
+      std::vector<std::pair<node_index_t, uint16_t>> nodes_state,
+      std::vector<node_index_t> boycotted_nodes,
+      std::vector<std::pair<node_index_t, uint16_t>> nodes_status)>;
 
   GetClusterStateRequest(std::chrono::milliseconds timeout,
                          std::chrono::milliseconds wave_timeout,
@@ -53,27 +59,31 @@ class GetClusterStateRequest : public Request {
    */
   bool onTimeout();
   bool onWaveTimeout();
+  bool onDeferredError();
   bool onReply(const Address& from,
                Status status,
-               std::vector<uint8_t> nodes_state,
-               std::vector<node_index_t> boycotted_nodes);
+               std::vector<std::pair<node_index_t, uint16_t>> nodes_state,
+               std::vector<node_index_t> boycotted_nodes,
+               std::vector<std::pair<node_index_t, uint16_t>> nodes_status);
   bool onError(Status status);
 
  protected:
   virtual void initTimers();
   virtual void activateWaveTimer();
+  virtual void activateDeferredErrorTimer();
   void initNodes();
   bool done(Status status,
-            std::vector<uint8_t> nodes_state,
-            std::vector<node_index_t> boycotted_nodes);
-  bool start();
+            std::vector<std::pair<node_index_t, uint16_t>> nodes_state,
+            std::vector<node_index_t> boycotted_nodes,
+            std::vector<std::pair<node_index_t, uint16_t>> nodes_status);
+  void start();
 
   virtual NodeID getMyNodeID() const;
   virtual std::shared_ptr<const configuration::nodes::NodesConfiguration>
   getNodesConfiguration() const;
 
   virtual ClusterState* getClusterState() const;
-  virtual bool sendTo(NodeID to);
+  virtual void sendTo(NodeID to);
 
   virtual void attachToWorker();
   virtual void destroyRequest();
@@ -90,6 +100,8 @@ class GetClusterStateRequest : public Request {
   std::chrono::milliseconds wave_timeout_;
   std::unique_ptr<Timer> timer_;
   std::unique_ptr<Timer> wave_timer_;
+  std::unique_ptr<Timer> deferred_error_timer_;
+  std::queue<Status> deferred_errors_;
   std::vector<node_index_t> nodes_;
   size_t next_node_pos_{0};
   size_t wave_size_{kMinWaveSize};

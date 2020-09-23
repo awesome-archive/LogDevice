@@ -11,6 +11,7 @@
 
 #include "logdevice/common/ClientID.h"
 #include "logdevice/common/Connection.h"
+#include "logdevice/common/ConnectionKind.h"
 #include "logdevice/common/FlowGroup.h"
 #include "logdevice/common/NodeID.h"
 #include "logdevice/common/ResourceBudget.h"
@@ -22,23 +23,24 @@
 namespace facebook { namespace logdevice {
 
 struct MockConnectionFactory : public IConnectionFactory {
-  MOCK_CONST_METHOD5(
+  MOCK_METHOD5(
       createConnection,
       std::unique_ptr<Connection>(NodeID node_id,
-                                  SocketType type,
+                                  SocketType socket_type,
                                   ConnectionType connection_type,
                                   FlowGroup& flow_group,
                                   std::unique_ptr<SocketDependencies> deps));
 
-  MOCK_CONST_METHOD8(
+  MOCK_CONST_METHOD9(
       createConnection,
       std::unique_ptr<Connection>(int fd,
                                   ClientID client_name,
                                   const Sockaddr& client_address,
                                   ResourceBudget::Token connection_token,
-                                  SocketType type,
+                                  SocketType socket_type,
                                   ConnectionType connection_type,
                                   FlowGroup& flow_group,
-                                  std::unique_ptr<SocketDependencies> deps));
+                                  std::unique_ptr<SocketDependencies> deps,
+                                  ConnectionKind connection_kind));
 };
 }} // namespace facebook::logdevice

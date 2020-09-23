@@ -33,6 +33,9 @@ class ShellFBCodeBuilder(FBCodeBuilder):
     def _render_impl(self, steps):
         return raw_shell(shell_join('\n', recursively_flatten_list(steps)))
 
+    def set_env(self, key, value):
+        return ShellQuoted("export {key}={val}").format(key=key, val=value)
+
     def workdir(self, dir):
         return [
             ShellQuoted('mkdir -p {d} && cd {d}').format(
@@ -51,7 +54,7 @@ class ShellFBCodeBuilder(FBCodeBuilder):
     def setup(self):
         steps = [
             ShellQuoted('set -exo pipefail'),
-        ] + [self.create_python_venv(), self.python_venv()]
+        ] + self.create_python_venv() + self.python_venv()
         if self.has_option('ccache_dir'):
             ccache_dir = self.option('ccache_dir')
             steps += [
@@ -96,9 +99,8 @@ if __name__ == '__main__':
     temp = persistent_temp_dir(repo_root)
 
     config = read_fbcode_builder_config('fbcode_builder_config.py')
-    builder = ShellFBCodeBuilder()
+    builder = ShellFBCodeBuilder(projects_dir=temp)
 
-    builder.add_option('projects_dir', temp)
     if distutils.spawn.find_executable('ccache'):
         builder.add_option('ccache_dir',
             os.environ.get('CCACHE_DIR', os.path.join(temp, '.ccache')))

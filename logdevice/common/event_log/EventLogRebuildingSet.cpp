@@ -189,9 +189,15 @@ int EventLogRebuildingSet::onShardNeedsRebuild(
     }
   }
 
+  // DEPRECATED. Will be removed.
   RebuildingMode requestedMode = flags & SHARD_NEEDS_REBUILD_Header::RELOCATE
       ? RebuildingMode::RELOCATE
       : RebuildingMode::RESTORE;
+
+  // FORCE_RESTORE will override the RELOCATE flag (hence the FORCE_ wording)
+  if (flags & SHARD_NEEDS_REBUILD_Header::FORCE_RESTORE) {
+    requestedMode = RebuildingMode::RESTORE;
+  }
 
   // Remove the existing node entry if it was already in the rebuilding set.
   // Before that, gather the information that is sticky about that node entry,
@@ -200,8 +206,17 @@ int EventLogRebuildingSet::onShardNeedsRebuild(
   bool is_recoverable = true;
   bool drain = false;
   folly::Optional<RebuildingMode> currentMode;
-  auto it = shards_[shardIdx].nodes_.find(nodeIdx);
-  if (it != shards_[shardIdx].nodes_.end()) {
+  RebuildingShardInfo& shard_info = shards_[shardIdx];
+
+  dd_assert(lsn > shard_info.version,
+            "Delta record LSN %s is <= than current rebuilding version %s of "
+            "shard %u. Unexpected, please investigate.",
+            lsn_to_string(lsn).c_str(),
+            lsn_to_string(shard_info.version).c_str(),
+            shardIdx);
+
+  auto it = shard_info.nodes_.find(nodeIdx);
+  if (it != shard_info.nodes_.end()) {
     if (!it->second.dc_dirty_ranges.empty()) {
       // Switching from time-ranged rebuilding to a full rebuilding.
       // Reset recoverable to true since the time-ranged rebuilding implied that
@@ -253,23 +268,14 @@ int EventLogRebuildingSet::onShardNeedsRebuild(
           return 0;
         }
       } else {
-        // Do nothing if rebuilding is requested but the shard either
-        // (a) has already been rebuilt, or (b) is already being rebuilt with
-        // the same time ranges. (a) may happen if there is a bug in
+        // Do nothing if rebuilding is requested but the shard has already
+        // been rebuilt. This may happen if there is a bug in
         // RebuildingSupervisor causing it to trigger rebuilding of a shard
-        // already being rebuilt. (b) can currently happens a lot in some
-        // circumstances when there are many deltas in the event log.
-        // TODO (#T23077142):
-        //   This is not really correct for time-ranged rebuildings: the node
-        //   may crash again and re-request rebuilding with the same time
-        //   ranges. Then rebuilding needs to be restarted to rebuild the newly
-        //   lost data in the same ranges.
-        if (currentMode.hasValue() && currentMode.value() == requestedMode &&
-            ((flags & SHARD_NEEDS_REBUILD_Header::TIME_RANGED) == 0
-                 ? it->second.auth_status !=
-                     AuthoritativeStatus::FULLY_AUTHORITATIVE
-                 : it->second.dc_dirty_ranges ==
-                     ptr->time_ranges.getDCDirtyRanges())) {
+        // already being rebuilt.
+        if (currentMode.has_value() && currentMode.value() == requestedMode &&
+            (flags & SHARD_NEEDS_REBUILD_Header::TIME_RANGED) == 0 &&
+            it->second.auth_status !=
+                AuthoritativeStatus::FULLY_AUTHORITATIVE) {
           ld_warning("Found event log record with lsn %s: %s, but this shard "
                      "is already being rebuilt in this mode. Discarding.",
                      lsn_to_string(lsn).c_str(),
@@ -296,7 +302,9 @@ int EventLogRebuildingSet::onShardNeedsRebuild(
   node_info.drain = drain;
   node_info.mode = requestedMode;
   if (flags & SHARD_NEEDS_REBUILD_Header::DRAIN) {
-    if (flags & SHARD_NEEDS_REBUILD_Header::RELOCATE) {
+    if (flags & SHARD_NEEDS_REBUILD_Header::FORCE_RESTORE) {
+      currentMode = RebuildingMode::RESTORE;
+    } else if (flags & SHARD_NEEDS_REBUILD_Header::RELOCATE) {
       RATELIMIT_INFO(std::chrono::seconds(1),
                      1,
                      "Rebuilding mode is set "
@@ -305,8 +313,9 @@ int EventLogRebuildingSet::onShardNeedsRebuild(
     }
     // When drain flag is set, preserve the existing mode
     // if one exists. Otherwise, set mode to RELOCATE.
-    node_info.mode =
-        currentMode.hasValue() ? currentMode.value() : RebuildingMode::RELOCATE;
+    // if FORCE_RESTORE is set, we always use it.
+    node_info.mode = currentMode.has_value() ? currentMode.value()
+                                             : RebuildingMode::RELOCATE;
     node_info.drain = true;
   }
 
@@ -331,11 +340,10 @@ int EventLogRebuildingSet::onShardNeedsRebuild(
     ld_check(ptr->time_ranges.empty());
   }
 
-  shards_[shardIdx].nodes_.insert(
-      std::make_pair(nodeIdx, std::move(node_info)));
-  shards_[shardIdx].version = lsn;
-  shards_[shardIdx].donor_progress.clear();
-  shards_[shardIdx].filter_relocate_shards =
+  shard_info.nodes_.insert(std::make_pair(nodeIdx, std::move(node_info)));
+  shard_info.version = lsn;
+  shard_info.donor_progress.clear();
+  shard_info.filter_relocate_shards =
       flags & SHARD_NEEDS_REBUILD_Header::FILTER_RELOCATE_SHARDS;
 
   setShardRecoverable(nodeIdx, shardIdx, is_recoverable);
@@ -401,12 +409,13 @@ int EventLogRebuildingSet::onShardAckRebuilt(
   if (node_info.drain) {
     // The node acknowledged rebuilding but a drain is still requested (the user
     // did not get a chance to write a SHARD_UNDRAIN event). This should not
-    // happen as storage nodes should wait for that message. However there are
-    // old versions of the server that may not wait for that message so do not
-    // fail.
+    // happen as storage nodes should wait for that message.
     ld_warning("Found event log record %s but the shard is being drained",
                record.describe().c_str());
+    err = E::FAILED;
+    return -1;
   }
+
   node_info.ack_lsn = lsn;
   node_info.ack_version = ptr->header.version;
 
@@ -589,15 +598,6 @@ int EventLogRebuildingSet::onShardUndrain(
     return -1;
   }
 
-  if (!shard_info.nodes_[ptr->header.nodeIdx].drain) {
-    ld_warning("Found event log record with lsn %s: %s but this shard is not "
-               "being drained. Discarding.",
-               lsn_to_string(lsn).c_str(),
-               record.describe().c_str());
-    err = E::FAILED;
-    return -1;
-  }
-
   shard_info.nodes_[ptr->header.nodeIdx].drain = false;
 
   checkConsistency();
@@ -690,21 +690,28 @@ int EventLogRebuildingSet::onShardDonorProgress(
     return -1;
   }
 
-  const auto cur_ts = shard_info.donor_progress[donor_node_id].count();
+  DonorProgress& cur = shard_info.donor_progress.at(donor_node_id);
+  RecordTimestamp ts(std::chrono::milliseconds(ptr->header.nextTimestamp));
+  bool new_to_old =
+      ptr->header.flags & SHARD_DONOR_PROGRESS_Header::FLAG_NEW_TO_OLD;
 
-  if (ptr->header.nextTimestamp <= cur_ts) {
+  if (new_to_old == cur.new_to_old &&
+      (ts == cur.timestamp || new_to_old != (ts < cur.timestamp))) {
     ld_warning("Node %u notifies us that it moved its local window for "
-               "shard %u up to timestamp %ld but it had previously moved it "
-               "to a greater timestamp %ld",
+               "shard %u %s to timestamp %s but it had previously moved it "
+               "to a %s timestamp %s",
                donor_node_id,
                shard_id,
-               ptr->header.nextTimestamp,
-               cur_ts);
+               new_to_old ? "down" : "up",
+               ts.toString().c_str(),
+               new_to_old ? "smaller" : "greater",
+               cur.timestamp.toString().c_str());
     err = E::FAILED;
     return -1;
   }
 
-  shard_info.donor_progress[donor_node_id] = ts_type(ptr->header.nextTimestamp);
+  cur.new_to_old = new_to_old;
+  cur.timestamp = ts;
 
   return 0;
 }
@@ -719,7 +726,7 @@ void EventLogRebuildingSet::recomputeShardRebuildTimeIntervals(
   shard.all_dirty_time_intervals.clear();
   for (auto node_kv : shard.nodes_) {
     auto& node = node_kv.second;
-    if (my_node_id_.hasValue() && node_kv.first == my_node_id_->index() &&
+    if (my_node_id_.has_value() && node_kv.first == my_node_id_->index() &&
         node.mode == RebuildingMode::RESTORE) {
       // In RESTORE mode, we cannot be a donor for our own records.
       continue;
@@ -915,7 +922,7 @@ void EventLogRebuildingSet::recomputeAuthoritativeStatus(
   for (auto& it_node : shard_info.nodes_) {
     for (node_index_t nid : it_node.second.donors_remaining) {
       if (!shard_info.donor_progress.count(nid)) {
-        shard_info.donor_progress[nid] = ts_type::min();
+        shard_info.donor_progress[nid] = DonorProgress();
       }
     }
   }
@@ -1200,6 +1207,17 @@ bool EventLogRebuildingSet::canTrimEventLog(
     }
   }
   return true;
+}
+
+bool EventLogRebuildingSet::DonorProgress::
+operator==(const DonorProgress& rhs) const {
+  return std::tie(timestamp, new_to_old) ==
+      std::tie(rhs.timestamp, rhs.new_to_old);
+}
+
+std::string EventLogRebuildingSet::DonorProgress::toString() const {
+  return timestamp.toString() + " [" +
+      (new_to_old ? "new-to-old" : "old-to-new") + "]";
 }
 
 }} // namespace facebook::logdevice

@@ -15,6 +15,8 @@
 
 #include <folly/Optional.h>
 #include <folly/Singleton.h>
+#include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/executors/GlobalExecutor.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
@@ -60,9 +62,6 @@ constexpr size_t MEMLOCK_MEM = 2ULL * 1024 * 1024 * 1024;
 Semaphore main_thread_sem;
 std::atomic<bool> shutdown_requested{false};
 
-// only used from main thread
-bool rotate_logs_requested{false};
-
 static void signal_shutdown() {
   shutdown_requested.store(true);
   main_thread_sem.post();
@@ -96,10 +95,11 @@ static void coredump_signal_handler(int sig) {
   handle_fatal_signal(sig);
 }
 
-static void rotate_logs_handler(int sig) {
-  ld_check(sig == SIGHUP);
-  rotate_logs_requested = true;
-  main_thread_sem.post();
+// The default for SIGHUP is to terminate the process.
+// DO NOT REMOVE it can cause large scale outage if SIGHUP is sent by
+// tooling to multiple nodes at once
+static void sighup_signal_handler(int /* sig */) {
+  ld_info("Caught SIGHUP");
 }
 
 static void setup_signal_handler(int signum, void (*handler)(int)) {
@@ -200,16 +200,6 @@ static void drop_root(UpdateableSettings<ServerSettings> server_settings) {
       exit(1);
     }
 
-    // chown() any rotating log files that we created while still root
-    // For now, this is just the audit log
-    if (!settings->audit_log.empty()) {
-      const char* audit_log = settings->audit_log.c_str();
-      if (chown(audit_log, pw->pw_uid, pw->pw_gid) < 0) {
-        ld_error("Failed to chown the file %s to user %s", audit_log, user);
-        exit(1);
-      }
-    }
-
     if (setgid(pw->pw_gid) < 0 || setuid(pw->pw_uid) < 0) {
       ld_error("Failed to assume identity of user %s", user);
       exit(1);
@@ -270,7 +260,6 @@ static void
 on_server_settings_changed(UpdateableSettings<ServerSettings> server_settings) {
   dbg::assertOnData = server_settings->assert_on_data;
   dbg::currentLevel = server_settings->loglevel;
-  dbg::externalLoggerLogLevel = server_settings->external_loglevel;
   ZookeeperClient::setDebugLevel(server_settings->loglevel);
   dbg::setLogLevelOverrides(server_settings->loglevel_overrides);
 
@@ -303,11 +292,18 @@ int main(int argc, const char** argv) {
           createPluginVector<DynamicPluginLoader,
                              StaticPluginLoader,
                              BuiltinPluginProvider>());
+
   auto ht_plugin = plugin_registry->getSinglePlugin<HotTextOptimizerPlugin>(
       PluginType::HOT_TEXT_OPTIMIZER);
   if (ht_plugin) {
+    // The program will crash if we have more than 1 thread at the time of
+    // HotTextOptimizer execution.
     (*ht_plugin)();
   }
+
+  // Don't move it before HotTextOptimizer.
+  auto global_cpu_executor = std::make_shared<folly::CPUThreadPoolExecutor>(15);
+  folly::setCPUExecutor(global_cpu_executor);
 
   {
     std::shared_ptr<Logger> logger_plugin =
@@ -424,20 +420,21 @@ int main(int argc, const char** argv) {
     ld_info("asserts on (NDEBUG not set)");
   }
 
-  std::unique_ptr<ServerParameters> params;
+  auto params = std::make_unique<ServerParameters>(settings_updater,
+                                                   server_settings,
+                                                   rebuilding_settings,
+                                                   locallogstore_settings,
+                                                   gossip_settings,
+                                                   settings,
+                                                   rocksdb_settings,
+                                                   admin_server_settings,
+                                                   plugin_registry,
+                                                   signal_shutdown);
   try {
-    params = std::make_unique<ServerParameters>(settings_updater,
-                                                server_settings,
-                                                rebuilding_settings,
-                                                locallogstore_settings,
-                                                gossip_settings,
-                                                settings,
-                                                rocksdb_settings,
-                                                admin_server_settings,
-                                                plugin_registry,
-                                                signal_shutdown);
+    params->init();
   } catch (const ConstructorFailed&) {
-    ld_critical("Unable to instantiate ServerParameters. Exiting.");
+    params.reset();
+    ld_critical("Unable to initialize ServerParameters. Exiting.");
     return 1;
   }
 
@@ -469,16 +466,12 @@ int main(int argc, const char** argv) {
   setup_signal_handler(SIGINT, shutdown_signal_handler);
   setup_signal_handler(SIGTERM, shutdown_signal_handler);
   setup_signal_handler(SIGUSR1, watchdog_stall_handler);
-  setup_signal_handler(SIGHUP, rotate_logs_handler);
+  setup_signal_handler(SIGHUP, sighup_signal_handler);
+
   for (;;) {
     main_thread_sem.wait();
     if (shutdown_requested.load()) {
       break;
-    }
-    if (rotate_logs_requested) {
-      server.rotateLocalLogs();
-      rotate_logs_requested = false;
-      continue;
     }
     ld_check(false);
   }

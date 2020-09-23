@@ -20,28 +20,19 @@ STAT_DEFINE(rebuilding_global_window_slide_num, SUM)
 STAT_DEFINE(rebuilding_global_window_slide_total, SUM)
 // 1 if we are waiting on the global window, 0 otherwise
 STAT_DEFINE(rebuilding_global_window_waiting_flag, SUM)
-// total amount of milliseconds we waited for the global window to slide
-// (updated when it finally slides). V1 only, on V2 use rebuilding_ms_stalled.
-STAT_DEFINE(rebuilding_global_window_waiting_total, SUM)
-// The end of the rebuilding local window
-STAT_DEFINE(rebuilding_local_window_end, MAX)
-// Number of times the local window was slid
-STAT_DEFINE(rebuilding_local_window_slide_num, SUM)
-// The total number of milliseconds the local window slid by
-STAT_DEFINE(rebuilding_local_window_slide_total, SUM)
 
-// Number of records read by LocalLogStoreReader in rebuilding read streams
-STAT_DEFINE(read_streams_num_records_read_rebuilding, SUM)
-// Number of bytes read by LocalLogStoreReader in rebuilding read streams
-STAT_DEFINE(read_streams_num_bytes_read_rebuilding, SUM)
-// Number of record bytes read by LocalLogStoreReader in rebuilding read streams
-STAT_DEFINE(read_streams_num_record_bytes_read_rebuilding, SUM)
-// Number of CSI bytes read by LocalLogStoreReader in rebuilding read streams
-STAT_DEFINE(read_streams_num_csi_bytes_read_rebuilding, SUM)
-// Number of CSI entries read by LocalLogStoreReader in rebuilding read streams
-STAT_DEFINE(read_streams_num_csi_entries_read_rebuilding, SUM)
+// Number of records read by RebuildingReadStorageTask
+STAT_DEFINE(rebuilding_num_records_read, SUM)
+// Number of bytes read by RebuildingReadStorageTask
+STAT_DEFINE(rebuilding_num_bytes_read, SUM)
+// Number of record bytes read by RebuildingReadStorageTask
+STAT_DEFINE(rebuilding_num_record_bytes_read, SUM)
+// Number of CSI bytes read by RebuildingReadStorageTask
+STAT_DEFINE(rebuilding_num_csi_bytes_read, SUM)
+// Number of CSI entries read by RebuildingReadStorageTask
+STAT_DEFINE(rebuilding_num_csi_entries_read, SUM)
 // Total size of rocksdb blocks read from disk by LocalLogStoreReader for rebuilding
-STAT_DEFINE(read_streams_block_bytes_read_rebuilding, SUM)
+STAT_DEFINE(rebuilding_block_bytes_read, SUM)
 
 // number of times that a storage node failed to write to the local log store
 // (err is E::LOCAL_LOG_STORE_WRITE)
@@ -78,8 +69,6 @@ STAT_DEFINE(num_memtables, SUM)
 // Cumulative sum of age for all memtables created.
 STAT_DEFINE(cumulative_memtable_age_ms, SUM)
 // Number of times metadata memtable was selected to be flushed because there
-// are active writers writing into a partition.
-STAT_DEFINE(pessimistic_metadata_memtable_flush, SUM)
 
 STAT_DEFINE(memtable_size_active, SUM)
 STAT_DEFINE(memtable_size_flushing, SUM)
@@ -116,6 +105,21 @@ STAT_DEFINE(append_stores_received, SUM)
 STAT_DEFINE(append_stores_received_bytes, SUM)
 STAT_DEFINE(rebuilding_stores_received, SUM)
 STAT_DEFINE(rebuilding_stores_received_bytes, SUM)
+
+// How many IO operations took longer than rocksdb-io-tracing-threshold.
+// Note that this counts different types of IO operations together: file
+// creations/deletions, file writes/reads, syncs, etc. And also some of the
+// tracked operations don't actually do file IO. For these reasons, it wouldn't
+// be useful to try to measure an "average" or "p99" latency here, but it still
+// makes sense to count really slow operations (IO operations are not expected
+// to take > 5 seconds under normal circumstances, regardless of the IO kind).
+STAT_DEFINE(slow_iops, SUM)
+
+// Time taken to *successfully* open a rocksDB instance. Failed instances are
+// not counted here. Since the RocksDB instnce can be local or over the network
+// this stat is useful to debug general problems as well as implementation
+// specific issues, such as slow opens on WS vs local attached disk.
+STAT_DEFINE(rocksdb_open_duration_ms, SUM)
 
 /*
  * The following stats will not be reset by Stats::reset() and the 'reset'
@@ -173,9 +177,6 @@ STAT_DEFINE(sbt_num_storage_trims, SUM)
 // incorrectly.
 STAT_DEFINE(sbt_effective_retention_seconds, SUM)
 
-#endif // RESETTING_STATS
-
-
 /*
  * These stats will not be aggregated for destroyed threads.
  */
@@ -191,7 +192,17 @@ STAT_DEFINE(pending_retention_compactions, SUM)
 // How many partitions are waiting to be compacted for coalescing.
 STAT_DEFINE(pending_partial_compactions, SUM)
 
+// The longest-running IO operation that is still running. Updated at around
+// rocksdb-io-tracing-stall-threshold granularity, and only if
+// rocksdb-io-tracing-shards is enabled.
+STAT_DEFINE(longest_ongoing_io_ms, MAX)
+
+// Number of threads currently executing an IO operation that has already took
+// longer than rocksdb-io-tracing-stall-threshold.
+STAT_DEFINE(num_threads_stalled_on_io, SUM)
+
 #endif // DESTROYING_THREAD
+#endif // RESETTING_STATS
 
 #undef STAT_DEFINE
 #undef RESETTING_STATS

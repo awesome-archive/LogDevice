@@ -12,8 +12,6 @@
 #include "logdevice/common/Timestamp.h"
 #include "logdevice/common/util.h"
 
-using std::chrono::steady_clock;
-
 namespace facebook { namespace logdevice { namespace ldquery {
 
 int VirtualTable::xOpen(sqlite3_vtab* /*pVTab*/,
@@ -131,7 +129,7 @@ int VirtualTable::xColumn(sqlite3_vtab_cursor* cur,
 
   const ColumnValue& value = col_it->second[pCur->row];
 
-  if (!value.hasValue()) {
+  if (!value.has_value()) {
     sqlite3_result_null(ctx);
     return SQLITE_OK;
   }
@@ -181,7 +179,7 @@ int VirtualTable::xColumn(sqlite3_vtab_cursor* cur,
       if (pVtab->table->getContext().pretty_output) {
         const long long ms = folly::to<long long>(v);
         std::string str =
-            format_time(RecordTimestamp(std::chrono::milliseconds(ms)));
+            RecordTimestamp(std::chrono::milliseconds(ms)).toString();
         sqlite3_result_text(ctx, str.c_str(), str.size(), SQLITE_TRANSIENT);
       } else {
         as_long = true;

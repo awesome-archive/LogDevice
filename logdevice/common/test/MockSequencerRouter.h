@@ -34,7 +34,7 @@ class MockClusterState : public ClusterState {
   createConfigFor(size_t nnodes) {
     using configuration::nodes::NodeServiceDiscovery;
     using configuration::nodes::ServiceDiscoveryConfig;
-    constexpr NodeServiceDiscovery::RoleSet both_roles{3};
+    constexpr NodeServiceDiscovery::RoleSet kBothRoles{3};
     ServiceDiscoveryConfig sdconfig;
 
     ServiceDiscoveryConfig::Update update;
@@ -43,12 +43,17 @@ class MockClusterState : public ClusterState {
       auto url = folly::sformat("127.0.0.{}", nid);
       auto nsd = std::make_unique<NodeServiceDiscovery>(
           NodeServiceDiscovery{folly::sformat("server-{}", nid),
+                               /*version=*/0,
                                Sockaddr(url, 4440),
                                Sockaddr(url, 4441),
                                /*ssl_address=*/folly::none,
                                /*admin_address=*/Sockaddr(url, 6440),
+                               /*internal_address=*/folly::none,
+                               /*server_thrift_api=*/folly::none,
+                               /*client_thrift_api=*/folly::none,
+                               /*addresses_per_priority=*/{},
                                /*location=*/folly::none,
-                               both_roles});
+                               kBothRoles});
       NodeUpdate nup{
           ServiceDiscoveryConfig::UpdateType::PROVISION, std::move(nsd)};
       update.addNode(nid, std::move(nup));
@@ -61,16 +66,14 @@ class MockClusterState : public ClusterState {
 
 class MockSequencerRouter : public SequencerRouter {
  public:
-  // TODO T41319009: allow passing NodesConfiguration and make use of it
-  // in getNodesConfiguration()
   MockSequencerRouter(logid_t log_id,
                       Handler* handler,
-                      std::shared_ptr<ServerConfig> config,
+                      std::shared_ptr<const NodesConfiguration> nodes_config,
                       std::shared_ptr<SequencerLocator> locator,
                       ClusterState* cluster_state)
       : SequencerRouter(log_id, handler),
         settings_(create_default_settings<Settings>()),
-        config_(config),
+        nodes_config_(nodes_config),
         locator_(locator),
         cluster_state_(cluster_state) {
     ld_check(locator_ != nullptr);
@@ -80,8 +83,7 @@ class MockSequencerRouter : public SequencerRouter {
 
   std::shared_ptr<const configuration::nodes::NodesConfiguration>
   getNodesConfiguration() const override {
-    // TODO: migrate it to use NodesConfiguration with switchable source
-    return config_->getNodesConfigurationFromServerConfigSource();
+    return nodes_config_;
   }
 
   const Settings& getSettings() const override {
@@ -98,17 +100,14 @@ class MockSequencerRouter : public SequencerRouter {
   void startClusterStateRefreshTimer() override {}
 
  private:
-  std::shared_ptr<ServerConfig> config_;
+  std::shared_ptr<const NodesConfiguration> nodes_config_;
   std::shared_ptr<SequencerLocator> locator_;
   ClusterState* cluster_state_;
 };
 
 class MockHashBasedSequencerLocator : public HashBasedSequencerLocator {
  public:
-  // TODO T41319009: allow passing NodesConfiguration and make use of it
-  // in getNodesConfiguration()
   MockHashBasedSequencerLocator(
-      std::shared_ptr<UpdateableServerConfig> server_config,
       ClusterState* cluster_state,
       std::shared_ptr<const Configuration> config,
       Settings settings = create_default_settings<Settings>())
@@ -133,8 +132,7 @@ class MockHashBasedSequencerLocator : public HashBasedSequencerLocator {
 
   std::shared_ptr<const configuration::nodes::NodesConfiguration>
   getNodesConfiguration() const override {
-    return config_->serverConfig()
-        ->getNodesConfigurationFromServerConfigSource();
+    return config_->getNodesConfiguration();
   }
 
  private:

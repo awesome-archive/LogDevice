@@ -64,19 +64,20 @@ class Configuration {
   using Node = facebook::logdevice::configuration::Node;
   using NodeRole = facebook::logdevice::configuration::NodeRole;
   using Nodes = facebook::logdevice::configuration::Nodes;
-  using NodesConfig = facebook::logdevice::configuration::NodesConfig;
+  using NodesConfiguration =
+      facebook::logdevice::configuration::nodes::NodesConfiguration;
   using SecurityConfig = facebook::logdevice::configuration::SecurityConfig;
   using SequencersConfig = facebook::logdevice::configuration::SequencersConfig;
-  using TraceLoggerConfig =
-      facebook::logdevice::configuration::TraceLoggerConfig;
   using TrafficShapingConfig =
       facebook::logdevice::configuration::TrafficShapingConfig;
   using MetaDataLogsConfig =
       facebook::logdevice::configuration::MetaDataLogsConfig;
 
-  Configuration(std::shared_ptr<ServerConfig> server_config,
-                std::shared_ptr<LogsConfig> logs_config,
-                std::shared_ptr<ZookeeperConfig> zookeeper_config = nullptr);
+  Configuration(
+      std::shared_ptr<ServerConfig> server_config,
+      std::shared_ptr<LogsConfig> logs_config,
+      std::shared_ptr<const NodesConfiguration> nodes_configuration = nullptr,
+      std::shared_ptr<ZookeeperConfig> zookeeper_config = nullptr);
 
   /**
    * NOTE: This returns a *reference* to the shared_ptr, but the shared_ptr and
@@ -88,9 +89,9 @@ class Configuration {
     return server_config_;
   }
 
-  const std::shared_ptr<const configuration::nodes::NodesConfiguration>&
-  getNodesConfigurationFromServerConfigSource() const {
-    return server_config_->getNodesConfigurationFromServerConfigSource();
+  const std::shared_ptr<const NodesConfiguration>&
+  getNodesConfiguration() const {
+    return nodes_configuration_;
   }
 
   /**
@@ -143,8 +144,7 @@ class Configuration {
    *         this config.  On failure, returns nullptr and sets err to:
    *           NOTFOUND       no log with given ID appears in config
    */
-  std::shared_ptr<LogsConfig::LogGroupNode>
-  getLogGroupByIDShared(logid_t id) const;
+  LogsConfig::LogGroupNodePtr getLogGroupByIDShared(logid_t id) const;
 
   /**
    * Looks up a log by ID and returns a raw pointer to the LogGroupInDirectory
@@ -174,7 +174,7 @@ class Configuration {
    */
   void getLogGroupByIDAsync(
       logid_t id,
-      std::function<void(std::shared_ptr<LogsConfig::LogGroupNode>)> cb) const;
+      std::function<void(LogsConfig::LogGroupNodePtr)> cb) const;
 
   /**
    * Creates a ServerConfig object from the given file.
@@ -186,9 +186,7 @@ class Configuration {
    *                                  config
    * @param alternative_logs_config   an alternative log configuration fetcher,
    *                                  in case log data isn't included in the
-   *                                  main config file. If null, log config
-   *                                  will be read from the file specified in
-   *                                  "include_log_config".
+   *                                  main config file.
    * @return On success, returns a new ServerConfig instance.  On
    * failure, returns nullptr and sets err to:
    *           FILE_OPEN       file could not be opened
@@ -203,13 +201,11 @@ class Configuration {
   static std::unique_ptr<Configuration>
   fromJson(const std::string& jsonPiece,
            std::shared_ptr<LogsConfig> alternative_logs_config,
-           std::function<Status(const char*, std::string*)> loadFileCallback,
            const ConfigParserOptions& options = ConfigParserOptions());
 
   static std::unique_ptr<Configuration>
   fromJson(const folly::dynamic& jsonPiece,
            std::shared_ptr<LogsConfig> alternative_logs_config,
-           std::function<Status(const char*, std::string*)> loadFileCallback,
            const ConfigParserOptions& options = ConfigParserOptions());
 
   /**
@@ -245,16 +241,23 @@ class Configuration {
   std::chrono::seconds getMaxBacklogDuration() const;
 
   std::string toString() const;
-  std::unique_ptr<Configuration> copy() const {
-    return std::make_unique<Configuration>(
-        server_config_->copy(), logs_config_->copy());
-  }
+
+  /**
+   * Creates a clone of this configuration object with a specific nodes
+   * configuration. This is meant to be temporary to ease the migration to the
+   * NodesConfiguration structure.
+   *
+   * TODO: Clean this up when the NodesConfiguration migration is done.
+   */
+  std::unique_ptr<Configuration> withNodesConfiguration(
+      std::shared_ptr<const NodesConfiguration> nodes_configuration) const;
 
  private:
   static std::unique_ptr<Configuration>
   loadFromString(const std::string& server, const std::string& logs);
   const std::shared_ptr<ServerConfig> server_config_;
   const std::shared_ptr<LogsConfig> logs_config_;
+  const std::shared_ptr<const NodesConfiguration> nodes_configuration_;
   const std::shared_ptr<ZookeeperConfig> zookeeper_config_;
 };
 }} // namespace facebook::logdevice

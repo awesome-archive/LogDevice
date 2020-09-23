@@ -31,68 +31,9 @@ namespace parser {
 
 static bool parseMetaDataLogNodes(const folly::dynamic& nodes,
                                   MetaDataLogsConfig& output);
-bool parseTraceLogger(const folly::dynamic& clusterMap,
-                      TraceLoggerConfig& output) {
-  auto iter_legacy = clusterMap.find("trace-logger");
-  auto iter_well_formed = clusterMap.find("trace_logger");
-
-  if (iter_legacy == clusterMap.items().end() &&
-      iter_well_formed == clusterMap.items().end()) {
-    return true; // trace-logger is optional and have defaults
-  } else if (iter_legacy != clusterMap.items().end() &&
-             iter_well_formed != clusterMap.items().end()) {
-    ld_error("\"trace-logger\" and \"trace_logger\" cannot be used combined");
-    err = E::INVALID_CONFIG;
-    return false;
-  }
-
-  const folly::dynamic& tracerSection = iter_legacy != clusterMap.items().end()
-      ? iter_legacy->second
-      : iter_well_formed->second;
-  if (!tracerSection.isObject()) {
-    ld_error("\"trace-logger\" entry is not a JSON object");
-    err = E::INVALID_CONFIG;
-    return false;
-  }
-
-  auto def_iter = tracerSection.find("default-sampling-percentage");
-  if (def_iter != tracerSection.items().end()) {
-    output.default_sampling = def_iter->second.asDouble();
-  }
-
-  auto iter = tracerSection.find("tracers");
-  if (iter == clusterMap.items().end()) {
-    return true; // trace-logger.tracers is optional and have defaults
-  }
-
-  const folly::dynamic& tracers = iter->second;
-  if (!tracers.isObject()) {
-    ld_error("\"trace-logger.tracers\" entry is not a JSON object");
-    err = E::INVALID_CONFIG;
-    return false;
-  }
-
-  output.percentages.clear();
-  for (auto& pair : tracers.items()) {
-    if (!pair.first.isString()) {
-      ld_error("a key in \"tracers\" section is not a string"
-               ". Expected a map from String -> Double(0, 100.0)");
-      err = E::INVALID_CONFIG;
-      return false;
-    }
-    if (!(pair.second.isDouble() || pair.second.isInt())) {
-      ld_error("a 'value' in \"tracers\" section is not a number"
-               ". Expected a map from String -> Double(0, 100.0)");
-      err = E::INVALID_CONFIG;
-      return false;
-    }
-    output.percentages.insert(
-        std::make_pair(pair.first.asString(), pair.second.asDouble()));
-  }
-  return true;
-}
 
 bool parseInternalLogs(const folly::dynamic& clusterMap,
+                       const SecurityConfig& securityConfig,
                        configuration::InternalLogs& internalLogs) {
   auto iter = clusterMap.find("internal_logs");
   if (iter == clusterMap.items().end()) {
@@ -107,6 +48,20 @@ bool parseInternalLogs(const folly::dynamic& clusterMap,
     return false;
   }
 
+  folly::Optional<LogAttributes> default_attrs;
+  if (!parseDefaults(clusterMap, "cluster", securityConfig, default_attrs)) {
+    return false;
+  } else if (default_attrs.has_value()) {
+    std::string failure_reason;
+    if (!internalLogs.setDefaultAttributes(
+            default_attrs.value(), failure_reason)) {
+      ld_error("Unable to set default internal logs attributes: %s",
+               failure_reason.c_str());
+      err = E::INVALID_CONFIG;
+      return false;
+    }
+  }
+
   for (auto& pair : section.items()) {
     if (!pair.first.isString()) {
       ld_error("a key in \"internal_logs\" section is not a string");
@@ -119,106 +74,19 @@ bool parseInternalLogs(const folly::dynamic& clusterMap,
       return false;
     }
     folly::Optional<LogAttributes> attrs =
-        parseAttributes(pair.second, pair.first.asString(), false);
-    if (!attrs.hasValue()) {
+        parseAttributes(pair.second,
+                        pair.first.asString(),
+                        securityConfig.allowPermissionsInConfig());
+    if (!attrs.has_value()) {
       return false;
     }
+
     if (!internalLogs.insert(pair.first.asString(), attrs.value())) {
       return false;
     }
   }
 
   if (!internalLogs.isValid()) {
-    return false;
-  }
-
-  return true;
-}
-
-// A copy-paste of EpochMetaData::nodesetToStorageSet(). It's a quick hack to
-// avoid having to slightly reorganize build targets.
-// TODO(TT15517759): Remove.
-static StorageSet nodesetToStorageSet(const NodeSetIndices& indices) {
-  StorageSet set;
-  set.reserve(indices.size());
-  for (node_index_t nid : indices) {
-    set.push_back(ShardID(nid, 0));
-  }
-  return set;
-}
-
-bool validateNodeCount(const ServerConfig& server_cfg,
-                       const LocalLogsConfig* logs_cfg) {
-  // number of nodes with positive weights which can be used to store records
-  int writable_node_cnt = 0;
-  // number of nodes that can run sequencers
-  int sequencer_node_cnt = 0;
-
-  for (const auto& it : server_cfg.getNodes()) {
-    const Node& node_cfg = it.second;
-    if (node_cfg.isWritableStorageNode()) {
-      writable_node_cnt++;
-    }
-    if (node_cfg.isSequencingEnabled()) {
-      sequencer_node_cnt++;
-    }
-  }
-
-  if (sequencer_node_cnt == 0) {
-    ld_error("the 'sequencer' attribute must be set to 'true' for at least "
-             "one node in the cluster. Found no such nodes.");
-    err = E::INVALID_CONFIG;
-    return false;
-  }
-
-  if (!logs_cfg) {
-    // no log config available locally - skipping log config validation.
-    return true;
-  }
-
-  const auto& nodes = server_cfg.getNodes();
-  for (auto it = logs_cfg->getLogMap().begin();
-       it != logs_cfg->getLogMap().end();
-       it++) {
-    const LogGroupInDirectory& logcfg = it->second;
-    int replication_factor =
-        ReplicationProperty::fromLogAttributes(logcfg.log_group->attrs())
-            .getReplicationFactor();
-    if (writable_node_cnt < replication_factor) {
-      ld_error("the cluster does not have enough writable storage nodes "
-               "for logs in the interval [%lu..%lu]. The log(s) in that "
-               "interval require %d node(s). Found %i node(s).",
-               it->first.lower(),
-               it->first.upper() - 1,
-               replication_factor,
-               writable_node_cnt);
-      err = E::INVALID_CONFIG;
-      return false;
-    }
-  }
-
-  const auto& meta_cfg = server_cfg.getMetaDataLogsConfig();
-  auto storage_set = nodesetToStorageSet(meta_cfg.metadata_nodes);
-  // ensure metadata_logs section is consistent with nodes section
-  if (!configuration::nodes::validStorageSet(
-          *server_cfg.getNodesConfigurationFromServerConfigSource(),
-          storage_set,
-          ReplicationProperty::fromLogAttributes(
-              meta_cfg.metadata_log_group->attrs()),
-          true // check the nodes exist
-          )) {
-    ld_error("Nodeset for metadata_logs is not compatible with its "
-             "configuration, please check if the metadata nodes satisfy "
-             "replication requirements on its replication scope. "
-             "nodeset size: %lu, replication property: %s, "
-             "total nodes in cluster: %lu.",
-             meta_cfg.metadata_nodes.size(),
-             ReplicationProperty::fromLogAttributes(
-                 meta_cfg.metadata_log_group->attrs())
-                 .toString()
-                 .c_str(),
-             nodes.size());
-    err = E::INVALID_CONFIG;
     return false;
   }
 
@@ -236,8 +104,8 @@ void setMetaDataLogsPermission(MetaDataLogsConfig& config) {
   config.setMetadataLogGroup(std::make_shared<LogGroupNode>(
       config.metadata_log_group->name(),
       config.metadata_log_group->attrs().with_permissions(
-          folly::F14FastMap<std::string,
-                            std::array<bool, static_cast<int>(ACTION::MAX)>>(
+          std::map<std::string,
+                   std::array<bool, static_cast<int>(ACTION::MAX)>>(
               {std::make_pair(Principal::DEFAULT, default_principals)})),
       config.metadata_log_group->range()));
 }
@@ -245,14 +113,17 @@ void setMetaDataLogsPermission(MetaDataLogsConfig& config) {
 bool parseMetaDataLog(const folly::dynamic& clusterMap,
                       const SecurityConfig& securityConfig,
                       MetaDataLogsConfig& output) {
+  folly::dynamic metaDataLogSection;
+
   auto iter = clusterMap.find("metadata_logs");
-  if (iter == clusterMap.items().end()) {
-    ld_error("missing \"metadata_logs\" entry for cluster");
-    err = E::INVALID_CONFIG;
-    return false;
+  if (iter != clusterMap.items().end()) {
+    metaDataLogSection = iter->second;
+  } else {
+    // This section is now optional since we have nodes-configuration-manager
+    // that store that information in NCS (NodesConfigurationStore).
+    metaDataLogSection = folly::dynamic::object();
   }
 
-  const folly::dynamic& metaDataLogSection = iter->second;
   if (!metaDataLogSection.isObject()) {
     ld_error("\"metadata_logs\" entry for cluster is not a JSON object");
     err = E::INVALID_CONFIG;
@@ -260,13 +131,8 @@ bool parseMetaDataLog(const folly::dynamic& clusterMap,
   }
 
   iter = metaDataLogSection.find("nodeset");
-  if (iter == metaDataLogSection.items().end()) {
-    ld_error("\"nodeset\" is missing in \"metadata_logs\" section");
-    err = E::INVALID_CONFIG;
-    return false;
-  }
-
-  if (!parseMetaDataLogNodes(iter->second, output)) {
+  if (iter != metaDataLogSection.items().end() &&
+      !parseMetaDataLogNodes(iter->second, output)) {
     return false;
   }
 
@@ -275,16 +141,7 @@ bool parseMetaDataLog(const folly::dynamic& clusterMap,
                       "metadata_logs",
                       /* permissions */ false,
                       /* metadata_logs */ true);
-  if (!log_attrs.hasValue()) {
-    err = E::INVALID_CONFIG;
-    return false;
-  }
-
-  std::string replication_error;
-  if (ReplicationProperty::validateLogAttributes(
-          log_attrs.value(), &replication_error) != 0) {
-    ld_error("Invalid replication settings in \"metadata_logs\" section: %s",
-             replication_error.c_str());
+  if (!log_attrs.has_value()) {
     err = E::INVALID_CONFIG;
     return false;
   }
@@ -316,7 +173,7 @@ bool parseMetaDataLog(const folly::dynamic& clusterMap,
   ld_check(output.nodeset_selector_type != NodeSetSelectorType::INVALID);
 
   // metadata version override is optional, default should be unspecified
-  ld_check(!output.metadata_version_to_write.hasValue());
+  ld_check(!output.metadata_version_to_write.has_value());
   epoch_metadata_version::type metadata_version;
   success = getIntFromMap<epoch_metadata_version::type>(
       metaDataLogSection, "metadata_version", metadata_version);
@@ -376,24 +233,6 @@ bool parseMetaDataLog(const folly::dynamic& clusterMap,
   if (securityConfig.allowPermissionsInConfig()) {
     setMetaDataLogsPermission(output);
   }
-
-  int replication_factor =
-      ReplicationProperty::fromLogAttributes(log_attrs.value())
-          .getReplicationFactor();
-  if (replication_factor + (*log_attrs).extraCopies().value() >
-      COPYSET_SIZE_MAX) {
-    ld_error("the sum (%d) of replicationFactor and extraCopies "
-             "for metadata logs exceeds COPYSET_SIZE_MAX %zu",
-             replication_factor + (*log_attrs).extraCopies().value(),
-             COPYSET_SIZE_MAX);
-    // shouldn't happend in default config
-    ld_check(false);
-    err = E::INVALID_CONFIG;
-    return false;
-  }
-
-  // consistency of metadata nodeset and replication_factor is checked later
-  // in validateNodeCount()
 
   return true;
 }

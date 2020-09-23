@@ -10,6 +10,8 @@
 #include <cstring>
 #include <functional>
 
+#include <folly/Optional.h>
+
 #include "logdevice/common/PayloadHolder.h"
 #include "logdevice/common/configuration/InternalLogs.h"
 #include "logdevice/common/configuration/logs/FBuffersLogsConfigCodec.h"
@@ -27,9 +29,11 @@ namespace facebook { namespace logdevice {
 LogsConfigStateMachine::LogsConfigStateMachine(
     UpdateableSettings<Settings> settings,
     std::shared_ptr<UpdateableServerConfig> updateable_server_config,
+    std::unique_ptr<RSMSnapshotStore> snapshot_store,
     bool is_writable,
     bool allow_snapshotting)
     : Parent(RSMType::LOGS_CONFIG_STATE_MACHINE,
+             std::move(snapshot_store),
              configuration::InternalLogs::CONFIG_LOG_DELTAS,
              configuration::InternalLogs::CONFIG_LOG_SNAPSHOTS),
       settings_(settings),
@@ -53,6 +57,11 @@ LogsConfigStateMachine::LogsConfigStateMachine(
   setSnapshottingGracePeriod(settings_->logsconfig_snapshotting_period);
 }
 
+void LogsConfigStateMachine::start() {
+  blockStateDelivery(settings_->block_logsconfig_rsm);
+  Parent::start();
+}
+
 bool LogsConfigStateMachine::canTrimAndSnapshot() const {
   // We can do neither trimming nor snapshotting if the RSM is non-writable.
   if (!is_writable_) {
@@ -62,8 +71,14 @@ bool LogsConfigStateMachine::canTrimAndSnapshot() const {
   if (!allow_snapshotting_) {
     return true;
   }
-  // Otherwise, check the node we are running on.
 
+  if (snapshot_store_) {
+    auto trimmable = Parent::canTrim();
+    auto snapshottable = snapshot_store_->isWritable();
+    return trimmable && snapshottable;
+  }
+
+  // TODO: Remove this after deprecating SnapshotStoreType::LEGACY
   auto w = Worker::onThisThread();
   NodeID my_node_id = w->processor_->getMyNodeID();
   ld_check(my_node_id.isNodeID());
@@ -73,7 +88,10 @@ bool LogsConfigStateMachine::canTrimAndSnapshot() const {
 
   // The node responsible for trimming and snapshotting is the first node
   // that's alive according to the failure detector.
-  return cs->getFirstNodeAlive() == my_node_id.index();
+  folly::Optional<node_index_t> first_fully_started_node_index =
+      cs->getFirstNodeFullyStarted();
+  return first_fully_started_node_index.has_value() &&
+      first_fully_started_node_index.value() == my_node_id.index();
 }
 
 bool LogsConfigStateMachine::shouldTrim() const {
@@ -81,7 +99,8 @@ bool LogsConfigStateMachine::shouldTrim() const {
   // 1. LogsConfig trimming is enabled in the settings;
   // 2. This node is the first node alive according to the FD;
   // 3. We use a snapshot log.
-  return !settings_->disable_logsconfig_trimming && canTrimAndSnapshot() &&
+  bool cantrim = snapshot_store_ ? Parent::canTrim() : canTrimAndSnapshot();
+  return !settings_->disable_logsconfig_trimming && cantrim &&
       snapshot_log_id_ != LOGID_INVALID;
 }
 
@@ -120,7 +139,10 @@ void LogsConfigStateMachine::onSnapshotCreated(Status st, size_t snapshotSize) {
     STAT_SET(getStats(), logsconfig_snapshot_size, snapshotSize);
     if (shouldTrim()) {
       STAT_INCR(getStats(), logsconfig_manager_trimming_requests);
-      trim();
+      auto trim_cb = [this](Status st) {
+        rsm_info(rsm_type_, "Trimming finished with status:%s", error_name(st));
+      };
+      trim(std::move(trim_cb));
     }
   } else {
     ld_error("Could not create LogsConfig snapshot: %s", error_name(st));
@@ -129,14 +151,8 @@ void LogsConfigStateMachine::onSnapshotCreated(Status st, size_t snapshotSize) {
   }
 }
 
-void LogsConfigStateMachine::trim() {
-  if (!trim_retry_handler_) {
-    trim_retry_handler_ = std::make_unique<TrimRSMRetryHandler>(
-        delta_log_id_, snapshot_log_id_, rsm_type_);
-  }
-  // Set retention to 0 as we want to trim everything up to the last snapshot
-  ld_info("Trimming LogsConfig Delta and Snapshot log...");
-  trim_retry_handler_->trim(std::chrono::milliseconds::zero());
+void LogsConfigStateMachine::trim(std::function<void(Status st)> cb) {
+  Parent::trim(std::move(cb), std::chrono::milliseconds::zero());
 }
 
 void LogsConfigStateMachine::writeDelta(
@@ -184,6 +200,10 @@ int LogsConfigStateMachine::applyDelta(const logsconfig::Delta& delta,
           std::chrono::steady_clock::now() - apply_start_time)
           .count();
   if (rv == 0) {
+    if (shouldBeDeduplicated()) {
+      tree.deduplicateAttributes();
+      wasDeduplicated();
+    }
     tree.setVersion(version);
   }
   if (delta.type() == DeltaOpType::SET_TREE) {
@@ -224,6 +244,7 @@ LogsConfigStateMachine::deserializeState(
     err = E::BADMSG;
     return nullptr;
   }
+  tree->deduplicateAttributes();
   tree->setVersion(version);
   return tree;
 }
@@ -293,6 +314,18 @@ StatsHolder* FOLLY_NULLABLE LogsConfigStateMachine::getStats() {
 void LogsConfigStateMachine::snapshot(std::function<void(Status st)> cb) {
   STAT_INCR(getStats(), logsconfig_manager_snapshot_requested);
   Parent::snapshot(cb);
+}
+
+void LogsConfigStateMachine::scheduleDeduplication() {
+  ++deduplication_scheduled_;
+}
+
+bool LogsConfigStateMachine::shouldBeDeduplicated() const {
+  return deduplication_scheduled_ >= kNumDeltasBeforeDeduplication;
+}
+
+void LogsConfigStateMachine::wasDeduplicated() {
+  deduplication_scheduled_ = 0;
 }
 
 }} // namespace facebook::logdevice

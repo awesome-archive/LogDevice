@@ -12,7 +12,6 @@
 #include "logdevice/common/event_log/EventLogRebuildingSet_generated.h"
 #include "logdevice/common/event_log/EventLogRecord.h"
 #include "logdevice/common/replicated_state_machine/ReplicatedStateMachine.h"
-#include "logdevice/common/replicated_state_machine/TrimRSMRetryHandler.h"
 
 /**
  * The Event Log is a replicated state machine that maintains the authoritative
@@ -54,7 +53,11 @@ class EventLogStateMachine
  public:
   using Parent = ReplicatedStateMachine<EventLogRebuildingSet, EventLogRecord>;
 
-  explicit EventLogStateMachine(UpdateableSettings<Settings> settings);
+  explicit EventLogStateMachine(
+      UpdateableSettings<Settings> settings,
+      std::unique_ptr<RSMSnapshotStore> snapshot_store,
+      worker_id_t worker = worker_id_t(0),
+      WorkerType worker_type = WorkerType::GENERAL);
 
   /**
    * Start reading the event log.
@@ -81,11 +84,12 @@ class EventLogStateMachine
     write_delta_header_ = true;
   }
 
-  void setWorkerId(worker_id_t worker) {
-    worker_ = worker;
-  }
   worker_id_t getWorkerId() {
     return worker_;
+  }
+
+  WorkerType getWorkerType() {
+    return worker_type_;
   }
 
   /**
@@ -125,9 +129,20 @@ class EventLogStateMachine
    * Currently called by AdminCommand class
    */
   void snapshot(std::function<void(Status st)> cb);
+  /**
+   * Trim the RSM. Called after we successfully wrote a snapshot.
+   */
+  virtual void trim(trim_cb_t cb);
 
-  static int getWorkerIdx(int /*nthreads*/) {
-    return 0;
+  static int getWorkerIdx(int nthreads) {
+    return configuration::InternalLogs::EVENT_LOG_DELTAS.val_ % nthreads;
+  }
+
+  static WorkerType workerType(Processor* processor) {
+    if (processor->getWorkerCount(WorkerType::BACKGROUND) > 0) {
+      return WorkerType::BACKGROUND;
+    }
+    return WorkerType::GENERAL;
   }
 
  protected:
@@ -157,11 +172,6 @@ class EventLogStateMachine
    * Update rebuilding set in Processor.
    */
   virtual void publishRebuildingSet();
-
-  /**
-   * Trim the RSM. Called after we successfully wrote a snapshot.
-   */
-  virtual void trim();
 
   /*
    * Trim the delta log when it is not paired with a snapshot log.
@@ -237,10 +247,11 @@ class EventLogStateMachine
   // folly::none if this object is not running on a server node.
   folly::Optional<NodeID> myNodeId_{folly::none};
 
-  std::unique_ptr<TrimRSMRetryHandler> trim_retry_handler_;
-
   // worker running this state machine
   worker_id_t worker_{-1};
+
+  // The type of worker running this state machine
+  WorkerType worker_type_;
 };
 
 /**
@@ -248,19 +259,20 @@ class EventLogStateMachine
  */
 class StartEventLogStateMachineRequest : public Request {
  public:
-  StartEventLogStateMachineRequest(EventLogStateMachine* event_log, int worker)
-      : Request(RequestType::START_EVENT_LOG_READER),
-        event_log_(event_log),
-        worker_(worker) {}
+  explicit StartEventLogStateMachineRequest(EventLogStateMachine* event_log)
+      : Request(RequestType::START_EVENT_LOG_READER), event_log_(event_log) {}
   ~StartEventLogStateMachineRequest() override {}
   Execution execute() override;
   int getThreadAffinity(int /*nthreads*/) override {
-    return worker_;
+    return event_log_->getWorkerId().val_;
+  }
+
+  WorkerType getWorkerTypeAffinity() override {
+    return event_log_->getWorkerType();
   }
 
  private:
   EventLogStateMachine* event_log_;
-  int worker_;
 };
 
 /** A request to write a delta on the worker running the event
@@ -270,12 +282,14 @@ class EventLogWriteDeltaRequest : public Request {
  public:
   EventLogWriteDeltaRequest(
       int worker,
+      WorkerType worker_type,
       std::string delta,
       std::function<void(Status st, lsn_t version, const std::string&)> cb,
       EventLogStateMachine::WriteMode mode,
       folly::Optional<lsn_t> base_version)
       : Request(RequestType::EVENT_LOG_WRITE_DELTA),
         worker_(worker),
+        worker_type_(worker_type),
         delta_(std::move(delta)),
         cb_(std::move(cb)),
         mode_(mode),
@@ -285,9 +299,13 @@ class EventLogWriteDeltaRequest : public Request {
   int getThreadAffinity(int /*nthreads*/) override {
     return worker_;
   }
+  WorkerType getWorkerTypeAffinity() override {
+    return worker_type_;
+  }
 
  private:
   int worker_;
+  WorkerType worker_type_;
   std::string delta_;
   std::function<void(Status st, lsn_t version, const std::string& /* unused */)>
       cb_;

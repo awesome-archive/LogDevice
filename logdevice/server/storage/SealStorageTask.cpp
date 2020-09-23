@@ -92,7 +92,7 @@ Status SealStorageTask::executeImpl(LocalLogStore& store,
   folly::Optional<Seal> current_seal =
       log_state->getSeal(LogStorageState::SealType::NORMAL);
 
-  if (current_seal.hasValue() && current_seal.value() > seal_) {
+  if (current_seal.has_value() && current_seal.value() > seal_) {
     // return the current value to the sequencer
     seal_ = current_seal.value();
     return E::PREEMPTED;
@@ -148,7 +148,7 @@ Status SealStorageTask::executeImpl(LocalLogStore& store,
   if (rv != 0) {
     // update seal_ to the updated value
     current_seal = log_state->getSeal(LogStorageState::SealType::NORMAL);
-    ld_check(current_seal.hasValue());
+    ld_check(current_seal.has_value());
     seal_ = current_seal.value();
     status = E::PREEMPTED;
   }
@@ -179,7 +179,7 @@ Status SealStorageTask::recoverSoftSeals(LocalLogStore& store,
   folly::Optional<Seal> soft_seal =
       log_state->getSeal(LogStorageState::SealType::SOFT);
 
-  if (!soft_seal.hasValue()) {
+  if (!soft_seal.has_value()) {
     // read soft seal from local log store if absent in memory
     SoftSealMetadata softseal_metadata;
     int rv = store.readLogMetadata(log_id_, &softseal_metadata);
@@ -208,7 +208,7 @@ Status SealStorageTask::checkSoftSeals(LocalLogStore& store,
   folly::Optional<Seal> soft_seal =
       log_state->getSeal(LogStorageState::SealType::SOFT);
 
-  if (!soft_seal.hasValue()) {
+  if (!soft_seal.has_value()) {
     Status recover_status = recoverSoftSeals(store, log_state);
     if (recover_status != E::OK) {
       return recover_status;
@@ -216,7 +216,7 @@ Status SealStorageTask::checkSoftSeals(LocalLogStore& store,
     soft_seal = log_state->getSeal(LogStorageState::SealType::SOFT);
   }
 
-  ld_check(soft_seal.hasValue());
+  ld_check(soft_seal.has_value());
   if (soft_seal.value() > seal_) {
     // If we already have a soft seal exceeding the seal just received from
     // a sequencer, it means the sequencer that tried to seal us is outdated
@@ -517,17 +517,7 @@ void SealStorageTask::onDone() {
       auto log_state = map.find(log_id_, getShardIdx());
       ld_check(log_state != nullptr);
 
-      folly::Optional<lsn_t> trim_point = log_state->getTrimPoint();
-      if (!trim_point.hasValue()) {
-        int rv = map.recoverLogState(
-            log_id_,
-            getShardIdx(),
-            LogStorageState::RecoverContext::SEAL_STORAGE_TASK);
-        std::ignore = rv;
-
-        // In the manwhile, return LSN_INVALID
-        trim_point = LSN_INVALID;
-      }
+      lsn_t trim_point = log_state->getTrimPoint();
       getAllEpochInfo(
           epoch_lng, epoch_offset_map, last_timestamp, max_seen_lsn);
       SEALED_Message::createAndSend(reply_to_,
@@ -535,7 +525,7 @@ void SealStorageTask::onDone() {
                                     getShardIdx(),
                                     seal_epoch_,
                                     status_,
-                                    trim_point.value(),
+                                    trim_point,
                                     epoch_lng,
                                     seal,
                                     epoch_offset_map,

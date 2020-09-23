@@ -11,7 +11,6 @@
 #include <folly/Random.h>
 #include <gtest/gtest.h>
 
-#include "logdevice/common/configuration/nodes/NodesConfigLegacyConverter.h"
 #include "logdevice/common/configuration/nodes/NodesConfigurationCodec.h"
 #include "logdevice/common/debug.h"
 #include "logdevice/common/test/NodesConfigurationTestUtil.h"
@@ -26,6 +25,7 @@ using namespace facebook::logdevice::membership::MembershipVersion;
 using namespace facebook::logdevice::NodesConfigurationTestUtil;
 
 using RoleSet = NodeServiceDiscovery::RoleSet;
+using TagMap = NodeServiceDiscovery::TagMap;
 
 class NodesConfigurationTest : public ::testing::Test {
  public:
@@ -46,7 +46,7 @@ class NodesConfigurationTest : public ::testing::Test {
         ld_info("Serialized config blob has %lu bytes", str_buf.size());
 
         auto version = NodesConfigurationCodec::extractConfigVersion(str_buf);
-        ASSERT_TRUE(version.hasValue());
+        ASSERT_TRUE(version.has_value());
         ASSERT_EQ(c.getVersion(), version.value());
 
         auto c_deserialized2 = NodesConfigurationCodec::deserialize(str_buf);
@@ -67,13 +67,18 @@ TEST_F(NodesConfigurationTest, ProvisionBasic) {
   ASSERT_TRUE(config->validate());
   // check service discovery info
   auto serv_discovery = config->getServiceDiscovery();
+  std::unordered_map<node_index_t, RoleSet> role_map = {
+      {1, kBothRoles}, {2, kStorageRole}, {7, kSeqRole}, {9, kStorageRole}};
   for (node_index_t n : NodeSetIndices({1, 2, 7, 9})) {
     const NodeServiceDiscovery& node_sd = serv_discovery->nodeAttributesAt(n);
-    std::map<node_index_t, RoleSet> role_map = {
-        {1, both_role}, {2, storage_role}, {7, seq_role}, {9, storage_role}};
 
+    auto is_sequencer = hasRole(role_map[n], NodeRole::SEQUENCER);
+    auto is_storage = hasRole(role_map[n], NodeRole::STORAGE);
     NodeServiceDiscovery expected = genDiscovery(
-        n, role_map[n], n % 2 == 0 ? "aa.bb.cc.dd.ee" : "aa.bb.cc.dd.ff");
+        n,
+        configuration::Node::withTestDefaults(n, is_sequencer, is_storage)
+            .setTags(kTestTags)
+            .setLocation(n % 2 == 0 ? "aa.bb.cc.dd.ee" : "aa.bb.cc.dd.ff"));
     EXPECT_EQ(expected, node_sd);
   }
 
@@ -87,7 +92,7 @@ TEST_F(NodesConfigurationTest, ProvisionBasic) {
   for (node_index_t n : NodeSetIndices({1, 7})) {
     ASSERT_TRUE(seq_membership->hasNode(n));
     auto result = seq_membership->getNodeState(n);
-    EXPECT_TRUE(result.hasValue());
+    EXPECT_TRUE(result.has_value());
     EXPECT_EQ(n == 1 ? 1.0 : 7.0, result->getConfiguredWeight());
   }
 
@@ -108,7 +113,7 @@ TEST_F(NodesConfigurationTest, ProvisionBasic) {
   for (node_index_t n : NodeSetIndices({1, 2, 9})) {
     ASSERT_TRUE(storage_membership->hasNode(n));
     auto result = storage_membership->getShardState(ShardID(n, 0));
-    EXPECT_TRUE(result.hasValue());
+    EXPECT_TRUE(result.has_value());
     // newly provisioned shards should be in rw state
     EXPECT_EQ(StorageState::READ_WRITE, result->storage_state);
 
@@ -165,9 +170,11 @@ TEST_F(NodesConfigurationTest, TestGossipDefaultingToDataAddress) {
       std::make_unique<ServiceDiscoveryConfig::Update>();
 
   // Add one node with gossip address
-  auto desc1 = genDiscovery(10, both_role, "aa.bb.cc.dd.ee");
+  auto desc1 = genDiscovery(
+      10,
+      configuration::Node::withTestDefaults(10).setLocation("aa.bb.cc.dd.ee"));
   // For the correctness of the test, assert that both addresses are differect.
-  ASSERT_NE(desc1.address, desc1.gossip_address.value());
+  ASSERT_NE(desc1.default_client_data_address, desc1.gossip_address.value());
 
   update.service_discovery_update->addNode(
       10,
@@ -176,7 +183,9 @@ TEST_F(NodesConfigurationTest, TestGossipDefaultingToDataAddress) {
           std::make_unique<NodeServiceDiscovery>(desc1)});
 
   // Add one node with gossip address
-  auto desc2 = genDiscovery(20, both_role, "aa.bb.cc.dd.ef");
+  auto desc2 = genDiscovery(
+      20,
+      configuration::Node::withTestDefaults(20).setLocation("aa.bb.cc.dd.ef"));
   desc2.gossip_address.reset();
   update.service_discovery_update->addNode(
       20,
@@ -192,11 +201,50 @@ TEST_F(NodesConfigurationTest, TestGossipDefaultingToDataAddress) {
             new_config->getNodeServiceDiscovery(10)->getGossipAddress());
 
   // Gossip address is not set on N20, should return data address.
-  EXPECT_EQ(desc2.address,
+  EXPECT_EQ(desc2.default_client_data_address,
             new_config->getNodeServiceDiscovery(20)->getGossipAddress());
 }
 
+TEST_F(NodesConfigurationTest, TestServerToServerDefaultingToDataAddress) {
+  auto config = provisionNodes();
+  ASSERT_TRUE(config->validate());
+  NodesConfiguration::Update update{};
+
+  update.service_discovery_update =
+      std::make_unique<ServiceDiscoveryConfig::Update>();
+
+  // Add one node with dedicated server-to-server address
+  auto desc1 = genDiscovery(
+      10,
+      configuration::Node::withTestDefaults(10).setLocation("aa.bb.cc.dd.ee"));
+  // For the correctness of the test, assert that both addresses are different.
+  ASSERT_NE(desc1.default_client_data_address,
+            desc1.server_to_server_address.value());
+
+  update.service_discovery_update->addNode(
+      10,
+      ServiceDiscoveryConfig::NodeUpdate{
+          ServiceDiscoveryConfig::UpdateType::PROVISION,
+          std::make_unique<NodeServiceDiscovery>(desc1)});
+
+  // Add one node without a dedicated address
+  auto desc2 = genDiscovery(
+      20,
+      configuration::Node::withTestDefaults(20).setLocation("aa.bb.cc.dd.ef"));
+  desc2.server_to_server_address.reset();
+  update.service_discovery_update->addNode(
+      20,
+      ServiceDiscoveryConfig::NodeUpdate{
+          ServiceDiscoveryConfig::UpdateType::PROVISION,
+          std::make_unique<NodeServiceDiscovery>(desc2)});
+
+  auto new_config = config->applyUpdate(update);
+  ASSERT_NE(nullptr, new_config);
+}
+
 TEST_F(NodesConfigurationTest, ChangingServiceDiscoveryAfterProvision) {
+  using Priority = NodeServiceDiscovery::ClientNetworkPriority;
+
   auto config = provisionNodes();
   ASSERT_TRUE(config->validate());
   NodesConfiguration::Update update{};
@@ -205,9 +253,11 @@ TEST_F(NodesConfigurationTest, ChangingServiceDiscoveryAfterProvision) {
     // Changing the name / addresses of the node should be allowed
     auto new_svc = *config->getNodeServiceDiscovery(2);
     new_svc.name = "NewName";
-    new_svc.address = Sockaddr("/tmp/new_addr1");
+    new_svc.default_client_data_address = Sockaddr("/tmp/new_addr1");
     new_svc.gossip_address = Sockaddr("/tmp/new_addr2");
     new_svc.ssl_address = Sockaddr("/tmp/new_addr3");
+    new_svc.addresses_per_priority[Priority::MEDIUM] =
+        Sockaddr("/tmp/new_addr4");
 
     update.service_discovery_update =
         std::make_unique<ServiceDiscoveryConfig::Update>();
@@ -220,12 +270,20 @@ TEST_F(NodesConfigurationTest, ChangingServiceDiscoveryAfterProvision) {
     auto new_config = config->applyUpdate(std::move(update));
     ASSERT_NE(nullptr, new_config);
     EXPECT_EQ("NewName", new_config->getNodeServiceDiscovery(2)->name);
-    EXPECT_EQ(Sockaddr("/tmp/new_addr1"),
-              new_config->getNodeServiceDiscovery(2)->address);
+    EXPECT_EQ(
+        Sockaddr("/tmp/new_addr1"),
+        new_config->getNodeServiceDiscovery(2)->default_client_data_address);
     EXPECT_EQ(Sockaddr("/tmp/new_addr2"),
               new_config->getNodeServiceDiscovery(2)->gossip_address);
     EXPECT_EQ(Sockaddr("/tmp/new_addr3"),
               new_config->getNodeServiceDiscovery(2)->ssl_address);
+
+    auto& addresses_per_priority =
+        new_config->getNodeServiceDiscovery(2)->addresses_per_priority;
+    EXPECT_EQ(Sockaddr("/tmp/new_addr4"),
+              addresses_per_priority.contains(Priority::MEDIUM)
+                  ? addresses_per_priority.at(Priority::MEDIUM)
+                  : Sockaddr());
   }
 
   {
@@ -295,8 +353,10 @@ TEST_F(NodesConfigurationTest, ChangingServiceDiscoveryAfterProvision) {
         9,
         ServiceDiscoveryConfig::NodeUpdate{
             ServiceDiscoveryConfig::UpdateType::PROVISION,
-            std::make_unique<NodeServiceDiscovery>(
-                genDiscovery(9, both_role, "aa.bb.cc.dd.ee"))});
+            std::make_unique<NodeServiceDiscovery>(genDiscovery(
+                9,
+                configuration::Node::withTestDefaults(9).setLocation(
+                    "aa.bb.cc.dd.ee")))});
     VLOG(1) << "update2: " << update2.toString();
     auto new_config = config->applyUpdate(std::move(update2));
     EXPECT_EQ(nullptr, new_config);
@@ -417,8 +477,10 @@ TEST_F(NodesConfigurationTest, AddingNodeWithoutServiceDiscoveryOrAttribute) {
         17,
         ServiceDiscoveryConfig::NodeUpdate{
             ServiceDiscoveryConfig::UpdateType::PROVISION,
-            std::make_unique<NodeServiceDiscovery>(
-                genDiscovery(17, both_role, "aa.bb.cc.dd.ee"))});
+            std::make_unique<NodeServiceDiscovery>(genDiscovery(
+                17,
+                configuration::Node::withTestDefaults(17).setLocation(
+                    "aa.bb.cc.dd.ee")))});
     update.storage_config_update = std::make_unique<StorageConfig::Update>();
     update.storage_config_update->membership_update =
         std::make_unique<StorageMembership::Update>(
@@ -449,8 +511,8 @@ TEST_F(NodesConfigurationTest, RoleConflict) {
   auto config = provisionNodes();
   ASSERT_TRUE(config->validate());
   {
-    // node 7 is provisioned to be sequencer-only. try adding it to the storage
-    // membership with attribute provided.
+    // node 7 is provisioned to be sequencer-only. try adding it to the
+    // storage membership with attribute provided.
     NodesConfiguration::Update update{};
     update.storage_config_update = std::make_unique<StorageConfig::Update>();
     update.storage_config_update->membership_update =
@@ -475,8 +537,8 @@ TEST_F(NodesConfigurationTest, RoleConflict) {
     EXPECT_EQ(E::INVALID_CONFIG, err);
   }
   {
-    // node 2 is provisioned to be storage-only. try adding it to the sequencer
-    // membership.
+    // node 2 is provisioned to be storage-only. try adding it to the
+    // sequencer membership.
     NodesConfiguration::Update update{};
     update.sequencer_config_update =
         std::make_unique<SequencerConfig::Update>();
@@ -554,7 +616,7 @@ TEST_F(NodesConfigurationTest, touch) {
 TEST_F(NodesConfigurationTest, SingleInvalidAddressIsInvalid) {
   auto svc = std::make_unique<NodeServiceDiscovery>();
   svc->name = "test";
-  svc->address = Sockaddr::INVALID;
+  svc->default_client_data_address = Sockaddr::INVALID;
   svc->gossip_address = Sockaddr("127.0.0.1", 1234);
   svc->roles = 3;
 
@@ -591,7 +653,8 @@ TEST_F(NodesConfigurationTest, StorageHash) {
           hash1);
   ASSERT_NE(original_hash, hash1);
 
-  // change the storage state back, verify that the hash go back to the original
+  // change the storage state back, verify that the hash go back to the
+  // original
   NodesConfiguration::Update update{};
   update.storage_config_update = std::make_unique<StorageConfig::Update>();
   update.storage_config_update->membership_update =
@@ -615,10 +678,13 @@ TEST_F(NodesConfigurationTest, StorageHash) {
 }
 
 TEST_F(NodesConfigurationTest, WritableStorageCapacity) {
-  auto config =
-      provisionNodes(initialAddShardsUpdate(
-                         {{13, both_role, "a.b.c.d.e", 1.0, /*num_shards*/ 2}}),
-                     {ShardID(13, 0), ShardID(13, 1)});
+  auto config = provisionNodes(
+      initialAddShardsUpdate({{13,
+                               configuration::Node::withTestDefaults(13)
+                                   .setLocation("a.b.c.d.e")
+                                   .addSequencerRole(true, 1.0)
+                                   .addStorageRole(2, 256.0)}}),
+      {ShardID(13, 0), ShardID(13, 1)});
   ASSERT_TRUE(config->validate());
 
   // initially N13 has 2 shards of capacity of 256.
@@ -647,35 +713,46 @@ TEST_F(NodesConfigurationTest, WritableStorageCapacity) {
   ASSERT_EQ(256.0, nc1->getNodeWritableStorageCapacity(13));
 }
 
-///////////// Legacy Format conversion //////////////
-
-TEST_F(NodesConfigurationTest, LegacyConversion1) {
-  std::shared_ptr<Configuration> config(
-      Configuration::fromJsonFile(TEST_CONFIG_FILE("sample_valid.conf")));
-  ASSERT_NE(config, nullptr);
-  const auto server_config = config->serverConfig();
-  ASSERT_TRUE(NodesConfigLegacyConverter::testWithServerConfig(*server_config));
-
-  // check serialization of the converted config
-  auto converted_nodes_config =
-      NodesConfigLegacyConverter::fromLegacyNodesConfig(
-          server_config->getNodesConfig(),
-          server_config->getMetaDataLogsConfig(),
-          server_config->getVersion());
-
-  ASSERT_NE(converted_nodes_config, nullptr);
-  checkCodecSerialization(*converted_nodes_config);
-}
-
 TEST_F(NodesConfigurationTest, ExtractVersionErrorEmptyString) {
   auto version = NodesConfigurationCodec::extractConfigVersion(std::string());
-  ASSERT_FALSE(version.hasValue());
+  ASSERT_FALSE(version.has_value());
 }
 
 TEST_F(NodesConfigurationTest, ExtractVersionError) {
   auto version =
       NodesConfigurationCodec::extractConfigVersion(std::string("123"));
-  ASSERT_FALSE(version.hasValue());
+  ASSERT_FALSE(version.has_value());
+}
+
+TEST_F(NodesConfigurationTest, ShouldMeetAddressesPerPriorityConditions) {
+  using Priority = NodeServiceDiscovery::ClientNetworkPriority;
+
+  auto svc = *provisionNodes()->getNodeServiceDiscovery(2);
+  ASSERT_TRUE(svc.isValid()) << "Initial config must be valid.";
+
+  // If an address for any priority is defined, then address for MEDIUM
+  // priority should be defined.
+  {
+    auto new_svc = svc;
+    new_svc.addresses_per_priority = {
+        {Priority::LOW, Sockaddr("/low/priority/address")}};
+    EXPECT_FALSE(new_svc.isValid())
+        << "If an address for any priority is defined, then address for MEDIUM "
+           "priority should be defined.";
+  }
+
+  // All conditions met.
+  {
+    auto new_svc = svc;
+    new_svc.default_client_data_address =
+        Sockaddr("/default/client/data/address");
+    new_svc.addresses_per_priority = {
+        {Priority::LOW, Sockaddr("/low/priority/address")},
+        {Priority::MEDIUM, Sockaddr("/medium/priority/address")}};
+
+    EXPECT_TRUE(new_svc.isValid()) << "All conditions for address_per_priority "
+                                      "are met. Config should be updated.";
+  }
 }
 
 } // namespace

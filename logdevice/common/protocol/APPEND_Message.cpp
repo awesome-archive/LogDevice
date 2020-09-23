@@ -25,7 +25,6 @@
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/debug.h"
-#include "logdevice/common/plugin/OpenTracerFactory.h"
 #include "logdevice/common/plugin/PluginRegistry.h"
 #include "logdevice/common/protocol/ProtocolReader.h"
 #include "logdevice/common/protocol/ProtocolWriter.h"
@@ -34,8 +33,6 @@
 namespace facebook { namespace logdevice {
 
 void APPEND_Message::serialize(ProtocolWriter& writer) const {
-  ld_check(payload_.valid());
-
   // Only write the header without any flags corresponding to stream writer if
   // protocol does not support it.
 
@@ -71,7 +68,7 @@ void APPEND_Message::serialize(ProtocolWriter& writer) const {
   }
 
   ld_check(bool(header_.flags & APPEND_Header::CUSTOM_COUNTERS) ==
-           attrs_.counters.hasValue());
+           attrs_.counters.has_value());
   if (header_.flags & APPEND_Header::CUSTOM_COUNTERS) {
     ld_check(attrs_.counters->size() <= std::numeric_limits<uint8_t>::max());
     uint8_t counters_length = attrs_.counters->size();
@@ -82,17 +79,6 @@ void APPEND_Message::serialize(ProtocolWriter& writer) const {
       writer.write(counter.second);
     }
   }
-
-  if (header_.flags & APPEND_Header::E2E_TRACING_ON) {
-    ld_check(e2e_tracing_context_.size() < MAX_E2E_TRACING_CONTEXT_SIZE);
-    if (e2e_tracing_context_.size() < MAX_E2E_TRACING_CONTEXT_SIZE) {
-      // write tracing information
-      writer.writeLengthPrefixedVector(e2e_tracing_context_);
-    } else {
-      writer.writeLengthPrefixedVector(std::string(""));
-    }
-  }
-
   // Inserting stream request information just before checksum and payload.
   if (writer.proto() >= Compatibility::ProtocolVersion::STREAM_WRITER_SUPPORT) {
     if (header_.flags & APPEND_Header::WRITE_STREAM_REQUEST) {
@@ -110,11 +96,7 @@ void APPEND_Message::serialize(ProtocolWriter& writer) const {
       // no need to checksum anything, just add the appropriate number of bytes
       writer.write(nullptr, checksum_bits / 8);
     } else {
-      // The const_cast here is needed because getPayload() is not necessarily
-      // physically constant (it may linearize the evbuffer) but is logically
-      // constant.  APPEND message sending is not a tricky multithreaded
-      // context (this worker created the PayloadHolder) so this is fine.
-      Payload payload = const_cast<PayloadHolder&>(payload_).getPayload();
+      Payload payload = payload_.getPayload();
       char buf[8];
       Slice chkblob = checksum_bytes(Slice(payload), checksum_bits, buf);
       writer.write(chkblob.data, chkblob.size);
@@ -153,11 +135,6 @@ void APPEND_Message::onSent(Status st, const Address& to) const {
 }
 
 MessageReadResult APPEND_Message::deserialize(ProtocolReader& reader) {
-  return deserialize(reader, Worker::settings().max_payload_inline);
-}
-
-MessageReadResult APPEND_Message::deserialize(ProtocolReader& reader,
-                                              size_t max_payload_inline) {
   APPEND_Header header;
   header.flags = 0;
   reader.read(&header);
@@ -201,12 +178,6 @@ MessageReadResult APPEND_Message::deserialize(ProtocolReader& reader,
     }
   }
 
-  std::string tracing_info;
-
-  if (header.flags & APPEND_Header::E2E_TRACING_ON) {
-    reader.readLengthPrefixedVector(&tracing_info);
-  }
-
   write_stream_request_id_t req_id = WRITE_STREAM_REQUEST_ID_INVALID;
   if (reader.proto() >= Compatibility::ProtocolVersion::STREAM_WRITER_SUPPORT) {
     if (header.flags & APPEND_Header::WRITE_STREAM_REQUEST) {
@@ -219,12 +190,8 @@ MessageReadResult APPEND_Message::deserialize(ProtocolReader& reader,
   PayloadHolder ph = PayloadHolder::deserialize(reader, payload_size);
 
   return reader.result([&] {
-    return new APPEND_Message(header,
-                              lsn_before_redirect,
-                              std::move(attrs),
-                              std::move(ph),
-                              std::move(tracing_info),
-                              req_id);
+    return new APPEND_Message(
+        header, lsn_before_redirect, std::move(attrs), std::move(ph), req_id);
   });
 }
 
@@ -241,45 +208,17 @@ Message::Disposition APPEND_Message::onReceived(const Address& from) {
   if (auto log_path = Worker::getConfig()->getLogGroupPath(header_.logid)) {
     LOG_GROUP_TIME_SERIES_ADD(
         stats, append_in_bytes, log_path.value(), payload_size);
-    if (attrs_.counters.hasValue()) {
+    if (attrs_.counters.has_value()) {
       LOG_GROUP_CUSTOM_COUNTERS_ADD(
           stats, log_path.value(), attrs_.counters.value());
     }
   }
   WORKER_LOG_STAT_ADD(header_.logid, append_payload_bytes, payload_size);
 
-  std::shared_ptr<opentracing::Tracer> e2e_tracer;
-  std::unique_ptr<opentracing::Span> append_message_receive_span;
-  if (!e2e_tracing_context_.empty()) {
-    auto ot_plugin = Worker::onThisThread()
-                         ->processor_->getPluginRegistry()
-                         ->getSinglePlugin<OpenTracerFactory>(
-                             PluginType::OPEN_TRACER_FACTORY);
-    if (ot_plugin) {
-      e2e_tracer = ot_plugin->createOTTracer();
-
-      ld_check(e2e_tracer);
-      // receiving a non empty tracing context means that we should create
-      // tracing spans
-      std::stringstream sstream(e2e_tracing_context_);
-      auto extracted_context_ = e2e_tracer->Extract(sstream);
-
-      append_message_receive_span = e2e_tracer->StartSpan(
-          "APPEND_Message_receive", {ChildOf(extracted_context_->get())});
-      append_message_receive_span->SetTag("source_client_id", from.toString());
-      append_message_receive_span->SetTag(
-          "lsn_before_redirect", lsn_before_redirect_);
-    }
-  }
-
   std::shared_ptr<AppenderPrep> append_prep =
       std::make_shared<AppenderPrep>(std::move(payload_));
-  append_prep->setAppendMessage(header_,
-                                lsn_before_redirect_,
-                                from.asClientID(),
-                                std::move(attrs_),
-                                std::move(e2e_tracer),
-                                std::move(append_message_receive_span));
+  append_prep->setAppendMessage(
+      header_, lsn_before_redirect_, from.asClientID(), std::move(attrs_));
   if (header_.flags & APPEND_Header::WRITE_STREAM_REQUEST) {
     append_prep->setWriteStreamRequestId(write_stream_request_id_);
   }
@@ -338,6 +277,7 @@ APPEND_Message::getDebugInfo() const {
     FLAG(CUSTOM_KEY)
     FLAG(NO_ACTIVATION)
     FLAG(CUSTOM_COUNTERS)
+    FLAG(PAYLOAD_GROUP)
 #undef FLAG
     return folly::join('|', strings);
   };
@@ -359,7 +299,7 @@ APPEND_Message::getDebugInfo() const {
     }
     add("optional_keys", std::move(map));
   }
-  if (attrs_.counters.hasValue() && !attrs_.counters->empty()) {
+  if (attrs_.counters.has_value() && !attrs_.counters->empty()) {
     folly::dynamic map{folly::dynamic::object()};
     for (auto& kv : attrs_.counters.value()) {
       map[toString(kv.first)] = kv.second;

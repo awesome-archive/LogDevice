@@ -21,12 +21,11 @@
 
 #include "logdevice/common/AllSequencers.h"
 #include "logdevice/common/AppendRequest.h"
+#include "logdevice/common/ConnectionKind.h"
 #include "logdevice/common/EpochMetaDataUpdater.h"
-#include "logdevice/common/FileEpochStore.h"
 #include "logdevice/common/MetaDataLogWriter.h"
 #include "logdevice/common/NoopTraceLogger.h"
 #include "logdevice/common/PermissionChecker.h"
-#include "logdevice/common/PrincipalParser.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/ReaderImpl.h"
 #include "logdevice/common/ResourceBudget.h"
@@ -34,7 +33,6 @@
 #include "logdevice/common/SequencerLocator.h"
 #include "logdevice/common/StaticSequencerLocator.h"
 #include "logdevice/common/Worker.h"
-#include "logdevice/common/configuration/NodesConfigParser.h"
 #include "logdevice/common/configuration/UpdateableConfig.h"
 #include "logdevice/common/debug.h"
 #include "logdevice/common/nodeset_selection/NodeSetSelector.h"
@@ -42,12 +40,14 @@
 #include "logdevice/common/settings/Settings.h"
 #include "logdevice/common/settings/SettingsUpdater.h"
 #include "logdevice/common/settings/util.h"
+#include "logdevice/common/test/NodesConfigurationTestUtil.h"
 #include "logdevice/common/test/TestUtil.h"
 #include "logdevice/include/Err.h"
 #include "logdevice/include/Record.h"
 #include "logdevice/server/ConnectionListener.h"
 #include "logdevice/server/ServerProcessor.h"
 #include "logdevice/server/ServerSettings.h"
+#include "logdevice/server/epoch_store/FileEpochStore.h"
 #include "logdevice/server/locallogstore/LocalLogStore.h"
 #include "logdevice/server/locallogstore/test/TemporaryLogStore.h"
 #include "logdevice/server/read_path/LogStorageStateMap.h"
@@ -126,7 +126,7 @@ class UnreleasedRecordDetectorTest : public ::testing::Test {
   bool waitUntilSequencerIsActive(std::chrono::duration<Rep, Period> duration,
                                   lsn_t expect_released);
   void setHighestInsertedLSN(lsn_t lsn);
-  std::unique_ptr<folly::test::TemporaryDirectory> temp_dir_;
+  std::unique_ptr<TemporaryDirectory> temp_dir_;
   std::unique_ptr<UpdateableSettings<Settings>> usettings_;
   std::unique_ptr<UpdateableSettings<ServerSettings>> userver_settings_;
   std::unique_ptr<UpdateableSettings<GossipSettings>> ugossip_settings_;
@@ -155,7 +155,7 @@ void UnreleasedRecordDetectorTest::SetUp() {
   }
 
   // create a temp directory for the test, removed at exit
-  temp_dir_ = createTemporaryDir(TEMP_DIR_PREFIX);
+  temp_dir_ = std::make_unique<TemporaryDirectory>(TEMP_DIR_PREFIX);
   ASSERT_NE(nullptr, temp_dir_);
   const std::string temp_dir_path(temp_dir_->path().string());
 
@@ -167,6 +167,10 @@ void UnreleasedRecordDetectorTest::SetUp() {
   settings.max_inflight_storage_tasks = NUM_INFLIGHT_STORAGE_TASKS;
   settings.per_worker_storage_task_queue_size = STORAGE_TASK_QUEUE_SIZE;
   settings.unreleased_record_detector_interval = std::chrono::seconds::zero();
+  // Someone may try and fail to connect before we start the listener. Make sure
+  // it doesn't cause connection errors later.
+  settings.connect_throttle.initial_delay = std::chrono::milliseconds(0);
+
   usettings_ =
       std::make_unique<UpdateableSettings<Settings>>(std::move(settings));
   ServerSettings server_settings(create_default_settings<ServerSettings>());
@@ -200,34 +204,32 @@ void UnreleasedRecordDetectorTest::SetUp() {
       nullptr);
   ld_notify("ShardedStorageThreadPool created.");
 
+  auto socketPath = temp_dir_path + "/socket";
+
+  configuration::Node node = configuration::Node::withTestDefaults(0);
+  node.setAddress(Sockaddr(socketPath));
+  node.addStorageRole(1);
+  node.setIsMetadataNode(true);
+
+  configuration::Nodes nodes;
+  nodes[0] = std::move(node);
+
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes), ReplicationProperty{{NodeLocationScope::NODE, 1}});
+
   // create config from file
   config_ = std::make_shared<UpdateableConfig>(
-      Configuration::fromJsonFile(CONFIG_PATH));
+      Configuration::fromJsonFile(CONFIG_PATH)
+          ->withNodesConfiguration(std::move(nodes_configuration)));
+
   ASSERT_NE(nullptr, config_);
   ASSERT_NE(nullptr, config_->getServerConfig());
   ld_notify("UpdateableConfig created from file %s.", CONFIG_PATH);
 
-  // override node address with path to unix domain socket in temp directory
-  std::string socketPath(temp_dir_path);
-  socketPath.append("/socket");
-  auto* const node =
-      const_cast<configuration::Node*>(config_->getServerConfig()->getNode(0));
-  ASSERT_TRUE(configuration::parser::parseHostString(
-      socketPath, node->address, "host"));
-
-  // do the same thing for NodesConfiguration
-  auto nodes_configuration =
-      config_->getNodesConfigurationFromServerConfigSource();
-  ASSERT_NE(nullptr, nodes_configuration);
-  const auto* serv_disc = nodes_configuration->getNodeServiceDiscovery(0);
-  ASSERT_NE(nullptr, serv_disc);
-  const_cast<configuration::nodes::NodeServiceDiscovery*>(serv_disc)->address =
-      node->address;
-
   // create processor
   processor_ =
-      ServerProcessor::create(/* audit log */ nullptr,
-                              sharded_storage_thread_pool_.get(),
+      ServerProcessor::create(sharded_storage_thread_pool_.get(),
+                              /* log storage state map */ nullptr,
                               *userver_settings_,
                               *ugossip_settings_,
                               *uadmin_server_settings_,
@@ -248,20 +250,23 @@ void UnreleasedRecordDetectorTest::SetUp() {
   connection_listener_loop_ = std::make_unique<folly::EventBaseThread>(
       true,
       nullptr,
-      ConnectionListener::listenerTypeNames()
-          [ConnectionListener::ListenerType::DATA]);
+      ConnectionListener::connectionKindToThreadName(ConnectionKind::DATA));
   connection_listener_ = std::make_unique<ConnectionListener>(
       Listener::InterfaceDef(std::move(socketPath), false),
       folly::getKeepAliveToken(connection_listener_loop_->getEventBase()),
       std::make_shared<ConnectionListener::SharedState>(),
-      ConnectionListener::ListenerType::DATA,
-      budget_);
+      ConnectionKind::DATA,
+      budget_,
+      /* enable_dscp_reflection= */ true);
   connection_listener_->setProcessor(processor_.get());
   ld_notify("ConnectionListener created.");
 
   // initialize and provision the epoch store
-  auto epoch_store = std::make_unique<FileEpochStore>(
-      temp_dir_path, processor_.get(), config_->updateableNodesConfiguration());
+  auto epoch_store =
+      std::make_unique<FileEpochStore>(temp_dir_path,
+                                       processor_->getRequestExecutor(),
+                                       processor_->getOptionalMyNodeID(),
+                                       config_->updateableNodesConfiguration());
   std::shared_ptr<NodeSetSelector> selector =
       NodeSetSelectorFactory::create(NodeSetSelectorType::SELECT_ALL);
   auto log_store_factory = [this](node_index_t nid) {
@@ -275,8 +280,11 @@ void UnreleasedRecordDetectorTest::SetUp() {
   int rv = provisioner->provisionEpochMetaData(std::move(selector), true, true);
   ASSERT_EQ(0, rv);
 
-  epoch_store = std::make_unique<FileEpochStore>(
-      temp_dir_path, processor_.get(), config_->updateableNodesConfiguration());
+  epoch_store =
+      std::make_unique<FileEpochStore>(temp_dir_path,
+                                       processor_->getRequestExecutor(),
+                                       processor_->getOptionalMyNodeID(),
+                                       config_->updateableNodesConfiguration());
 
   processor_->allSequencers().setEpochStore(std::move(epoch_store));
   ld_notify("FileEpochStore created and initialized in directory %s.",
@@ -417,12 +425,13 @@ TEST_F(UnreleasedRecordDetectorTest, TransientSequencerFailure) {
     const auto append_callback = [&promise](Status st, const DataRecord& r) {
       promise.set_value(std::make_pair(st, r.attrs.lsn));
     };
-    auto append_req(std::make_unique<AppendRequest>(nullptr,
-                                                    LOG_ID,
-                                                    AppendAttributes(),
-                                                    std::string("one"),
-                                                    std::chrono::seconds(30),
-                                                    append_callback));
+    auto append_req(
+        std::make_unique<AppendRequest>(nullptr,
+                                        LOG_ID,
+                                        AppendAttributes(),
+                                        PayloadHolder::copyString("one"),
+                                        std::chrono::seconds(30),
+                                        append_callback));
     append_req->bypassWriteTokenCheck();
     std::unique_ptr<Request> req(std::move(append_req));
     EXPECT_EQ(0, processor_->blockingRequest(req));
@@ -486,7 +495,7 @@ TEST_F(UnreleasedRecordDetectorTest, TransientSequencerFailure) {
  */
 TEST_F(UnreleasedRecordDetectorTest, HighFrequencyDetector) {
   // start accepting connections
-  acceptConnections();
+  EXPECT_TRUE(acceptConnections().get());
 
   // set a very short record detector interval, thereby enabling the unreleased
   // record detector and running it at a high frequency

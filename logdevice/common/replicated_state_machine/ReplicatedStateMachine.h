@@ -6,7 +6,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 #pragma once
-
 #include <chrono>
 #include <list>
 #include <memory>
@@ -22,7 +21,6 @@
 
 #include "logdevice/common/AdminCommandTable.h"
 #include "logdevice/common/AppendRequest.h"
-#include "logdevice/common/DataRecordOwnsPayload.h"
 #include "logdevice/common/FindKeyRequest.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/Semaphore.h"
@@ -36,7 +34,9 @@
 #include "logdevice/common/protocol/ProtocolReader.h"
 #include "logdevice/common/protocol/ProtocolWriter.h"
 #include "logdevice/common/replicated_state_machine/RSMSnapshotHeader.h"
+#include "logdevice/common/replicated_state_machine/RSMSnapshotStore.h"
 #include "logdevice/common/replicated_state_machine/ReplicatedStateMachine-enum.h"
+#include "logdevice/common/replicated_state_machine/RsmVersionTypes.h"
 #include "logdevice/common/stats/Stats.h"
 #include "logdevice/common/types_internal.h"
 #include "logdevice/include/types.h"
@@ -107,7 +107,7 @@
  * TODO(T13475700): the replay mechanism depends on recovery completing.
  * We may consider relaxing this and allowing streaming updates to subscribers
  * when the state machine is past the current last released lsn instead of the
- * curren tail.
+ * current tail.
  * It is still unclear if we'd rather give a stale version or nothing at all
  * (and stall) when recovery has not completed.
  */
@@ -117,9 +117,11 @@ namespace facebook { namespace logdevice {
 template <typename T, typename D>
 class ReplicatedStateMachine {
  public:
-  explicit ReplicatedStateMachine(RSMType rsm_type,
-                                  logid_t delta_log_id,
-                                  logid_t snapshot_log_id = LOGID_INVALID);
+  explicit ReplicatedStateMachine(
+      RSMType rsm_type,
+      std::unique_ptr<RSMSnapshotStore> snapshot_store,
+      logid_t delta_log_id,
+      logid_t snapshot_log_id = LOGID_INVALID);
 
   virtual ~ReplicatedStateMachine() {}
 
@@ -148,6 +150,17 @@ class ReplicatedStateMachine {
   }
 
   /**
+   * Prevents the state machine from publishing updates. This can be used for
+   * testing situations where the RSM is blocked/stuck.
+   *
+   * Requests the state machine to publish its last known state to subscribers
+   * immediately. The state machine will only publish the state if it has one.
+   *
+   * ** Must be called on the same worker as the RSM. **
+   */
+  bool blockStateDelivery(bool blocked);
+
+  /**
    * By default, if there is evidence that some deltas were lost (because we
    * received a DATALOSS gap in the delta log for instance), this state machine
    * will stall until it sees a snapshot record that accounted for all these
@@ -172,7 +185,7 @@ class ReplicatedStateMachine {
    * not expect it. This option should be used if it is expected that there are
    * still old binaries that cannot undarstand that header. The counterpart is
    * that if the header is not written, we cannot use the CONFIRM_APPLIED option
-   * when writting a delta.
+   * when writing a delta.
    *
    * More concretely, this option should be used while we are migrating all
    * servers and clients to using EventLogStateMachine which uses this utility
@@ -250,6 +263,9 @@ class ReplicatedStateMachine {
     can_skip_bad_snapshot_ = val;
   }
 
+  virtual void getSnapshot();
+  virtual void startFetchingSnapshot();
+
   /**
    * Start reading the snapshot and delta logs.
    * Must be called on a worker thread.
@@ -261,6 +277,22 @@ class ReplicatedStateMachine {
    * destroy this state machine.
    */
   void stop();
+
+  typedef std::function<void(Status st)> trim_cb_t;
+  void trim(std::function<void(Status st)>,
+            std::chrono::milliseconds retention);
+
+  /**
+   * Trims snapshot log.
+   * Optionally trims delta log if there's no snapshot store
+   * This is not needed if none of the RSMs use snapshot
+   */
+  void legacyTrim(std::function<void(Status st)> trim_cb,
+                  std::chrono::milliseconds retention,
+                  bool trim_snapshot_only);
+
+  void trimDelta(trim_cb_t trim_cb);
+  void trimDeltaUpto(lsn_t trim_upto, trim_cb_t trim_cb);
 
   /**
    * Block until this state machine completes either because someone called
@@ -396,7 +428,9 @@ class ReplicatedStateMachine {
   // snapshot if that snapshot is for a version greater than `version_`. Calls
   // the user-provided `deserializeState()` method to deserialize the state
   // contained in that snapshot.
-  bool processSnapshot(std::unique_ptr<DataRecord>& record);
+  bool
+  processSnapshot(const Payload& payload,
+                  const RSMSnapshotStore::SnapshotAttributes& snapshot_attrs);
 
   // Called when we receive a gap in the snapshot log.
   bool onSnapshotGap(const GapRecord& gap);
@@ -413,17 +447,21 @@ class ReplicatedStateMachine {
   // Called when we received a gap from the delta log.
   bool onDeltaGap(const GapRecord& gap);
 
-  // Called once the tail lsn of the delta log was retrieved. Create a read
-  // stream to read the delta log starting from `delta_log_start_lsn_`.
+  // Called when the tail lsn of the delta log was retrieved. Can be called
+  // multiple times.
   void onGotDeltaLogTailLSN(Status st, lsn_t lsn);
 
   // Called when the delta log client read stream switches to being unhealthy
   // or healthy again
   void onDeltaLogReadStreamHealthChange(bool is_healthy);
 
-  // Called once the tail lsn of the snapshot log was retrieved. Create a read
-  // stream to read the snapshot log.
+  // Called when the tail lsn of the snapshot log was retrieved. Can be called
+  // multiple times.
   void onGotSnapshotLogTailLSN(Status st, lsn_t start, lsn_t lsn);
+
+  virtual Status getSnapshotFromMemory(lsn_t min_ver,
+                                       lsn_t& version_out,
+                                       std::string& snapshot_blob_out);
 
   // Create a payload for a snapshot. The payload includes `data` serialized as
   // well as the version of that snapshot.
@@ -479,6 +517,10 @@ class ReplicatedStateMachine {
   // How far we have processed the delta log.
   lsn_t getDeltaReadPtr() const;
 
+  RSMSnapshotStore* getSnapshotStore() {
+    return snapshot_store_.get();
+  }
+
  protected:
   // These functions may be overridden by tests.
 
@@ -501,6 +543,9 @@ class ReplicatedStateMachine {
 
   // Resume reading a read stream on which we may have been pushing back.
   virtual void resumeReadStream(read_stream_id_t id);
+
+  // Activate timer to call stop on the next event loop iteration
+  virtual void scheduleStop();
 
   // These functions must be overridden by the user.
 
@@ -591,6 +636,11 @@ class ReplicatedStateMachine {
   virtual void cancelStallGracePeriod();
   virtual void activateConfirmTimer(boost::uuids::uuid uuid);
 
+  // These functions are for fetching snapshot periodically
+  virtual void initSnapshotFetchTimer();
+  virtual void activateSnapshotFetchTimer();
+
+  // These functions are for writing snapshots periodically
   virtual void activateGracePeriodForSnapshotting();
   virtual void cancelGracePeriodForSnapshotting();
   virtual bool isGracePeriodForSnapshottingActive();
@@ -599,19 +649,26 @@ class ReplicatedStateMachine {
   virtual bool canSnapshot() const = 0;
   virtual void onSnapshotCreated(Status st, size_t snapshotSize) = 0;
 
+  // Whether this node can perform trimming of delta log
+  bool canTrim() const;
+
   const RSMType rsm_type_;
   const logid_t delta_log_id_;
   const logid_t snapshot_log_id_;
+  lsn_t last_written_version_{LSN_INVALID};
 
   // Used by tests.
   boost::uuids::uuid last_uuid_;
 
   boost::uuids::random_generator uuid_gen_;
 
+  std::unique_ptr<RSMSnapshotStore> snapshot_store_;
+
   // Options.
   bool stop_at_tail_{false};
   bool deliver_while_replaying_{false};
   bool stall_if_data_loss_{true};
+  bool state_delivery_blocked_{false};
   size_t max_pending_confirmation_{1000};
   std::chrono::milliseconds delta_append_timeout_{std::chrono::seconds{5}};
   std::chrono::milliseconds snapshot_append_timeout_{std::chrono::seconds{5}};
@@ -626,13 +683,18 @@ class ReplicatedStateMachine {
   bool write_delta_header_{true};
   bool snapshot_in_flight_{false};
 
+  // Indicates whether the state machine has stopped reading
+  bool stopped_{false};
+
  private:
   // Deserialize a record in the snapshot log. Expect a RSMSnapshotHeader
   // followed by the payload which the user provides deserialization for through
   // `deserializeState()`.
-  int deserializeSnapshot(const DataRecord& record,
-                          std::unique_ptr<T>& out,
-                          RSMSnapshotHeader& header) const;
+  int deserializeSnapshot(
+      const Payload& payload,
+      const RSMSnapshotStore::SnapshotAttributes& snapshot_attrs,
+      std::unique_ptr<T>& out,
+      RSMSnapshotHeader& header_out) const;
 
   // Called by `onSnapshotRecord()` or `onSnapshotGap()` when we have reached
   // the tail lsn `snapshot_sync_` of the snapshot log. When this
@@ -640,6 +702,16 @@ class ReplicatedStateMachine {
   // time to read the delta log.
   // Calls getDeltaLogTailLSN().
   void onBaseSnapshotRetrieved();
+
+  /**
+   * Requests the state machine to publish its last known state to subscribers
+   * immediately. The state machine will only publish the state if it has one,
+   * other wise this will print a warning indicating the reason why it didn't
+   * notify the subscriptions.
+   *
+   * ** Must be called on the same worker as the RSM. **
+   */
+  void notifySubscribersWithLatestState();
 
   // When we are tailing, we may receive a new snapshot record. Applying that
   // snapshot "fast-forwards" the state machine to the version of that snapshot,
@@ -678,6 +750,8 @@ class ReplicatedStateMachine {
   // snapshot.
   void notifySubscribers(const D* delta = nullptr);
 
+  void advertiseVersions(RsmVersionType type, lsn_t version);
+
   // Discard any entry in pending_confirmation_ that have lsn <=
   // version_ and that we could not confirm either because we fast forwarded
   // with a snapshot or we skipped the delta when we read it because we could
@@ -687,6 +761,10 @@ class ReplicatedStateMachine {
   // Used to proxy callbacks for requests enqueued in a different worker thread
   // back to this worker thread.
   WorkerCallbackHelper<ReplicatedStateMachine<T, D>> callbackHelper_;
+
+  // Currently running request to retrieve tail LSN, either for snapshot log (if
+  // SyncState is SYNC_SNAPSHOT) or for deltas log (if SYNC_DELTAS).
+  std::unique_ptr<SyncSequencerRequest> sync_sequencer_request_;
 
   // LSN of the tail of the snapshot log computed on startup. We use this to
   // define which record in the snapshot log can be considered the most recent
@@ -713,7 +791,7 @@ class ReplicatedStateMachine {
 
   // Delta log read pointer as marked by the last snapshot (this allows us to
   // skip reading deltas already applied and skip gaps).
-  lsn_t last_snapshot_last_read_ptr_{LSN_OLDEST};
+  lsn_t last_snapshot_last_read_ptr_{LSN_INVALID};
 
   // Current state of the process of syncing our local version to the last
   // version prior to this state machine starting.
@@ -737,6 +815,9 @@ class ReplicatedStateMachine {
 
   // Version of the local copy.
   lsn_t version_{LSN_OLDEST};
+
+  // Version of the latest published state to subscribers.
+  folly::Optional<lsn_t> latest_published_version_{folly::none};
 
   // Ids of the read streams for reading the snapshot and delta logs.
   read_stream_id_t snapshot_log_rsid_{0};
@@ -775,9 +856,6 @@ class ReplicatedStateMachine {
 
   // List of callbacks to call when the local state gets updated.
   std::list<update_cb_t> subscribers_;
-
-  // Used for debugging.
-  bool stopped_{false};
 
   // The following counters are used to provide an estimate to users of the
   // number of records and bytes in the delta log that have not been taken into
@@ -832,7 +910,15 @@ class ReplicatedStateMachine {
   //  - grace period passed after last snapshot
   //  - there are new deltas since last snapshot
   std::chrono::milliseconds snapshot_log_timestamp_{0};
+  // timer for writing snapshots
   Timer snapshotting_timer_;
+
+  // Timer for fetching snapshots periodically
+  std::unique_ptr<ExponentialBackoffTimer> get_snapshot_timer_;
+
+  // Timer used to schedule deletion of client read streams, so that they
+  // are not destroyed inline inside of a callback.
+  Timer read_stream_deletion_timer_;
 };
 
 template <typename T>

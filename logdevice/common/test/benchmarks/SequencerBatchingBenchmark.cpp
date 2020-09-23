@@ -18,13 +18,13 @@
 #include "logdevice/common/Appender.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/Semaphore.h"
-#include "logdevice/common/Sender.h"
 #include "logdevice/common/Sequencer.h"
 #include "logdevice/common/SequencerBatching.h"
 #include "logdevice/common/Timer.h"
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/configuration/UpdateableConfig.h"
 #include "logdevice/common/debug.h"
+#include "logdevice/common/test/SenderTestProxy.h"
 #include "logdevice/common/test/TestUtil.h"
 
 using namespace facebook::logdevice;
@@ -81,7 +81,7 @@ class SequencerBatchingBenchmark {
     Semaphore tickets;
   };
 
-  const std::string payload_;
+  PayloadHolder payload_;
   // settings used to create the processor and sequencer batching
   Settings settings_;
   std::shared_ptr<UpdateableConfig> updateable_config_;
@@ -90,7 +90,6 @@ class SequencerBatchingBenchmark {
   //  StatsHolder stats_;
   std::shared_ptr<Processor> processor_;
   void writerThread(size_t writer_id);
-  PayloadHolder genPayload();
 };
 
 class MockSequencerBatching : public SequencerBatching {
@@ -105,7 +104,7 @@ class MockSequencerBatching : public SequencerBatching {
   folly::Optional<APPENDED_Header>
   runBufferedAppend(logid_t,
                     AppendAttributes,
-                    const Payload&,
+                    PayloadHolder&&,
                     InternalAppendRequest::Callback callback,
                     APPEND_flags_t,
                     int,
@@ -194,7 +193,8 @@ class TestAppenderRequest : public Request {
 
 SequencerBatchingBenchmark::SequencerBatchingBenchmark(Params params)
     : params_(std::move(params)),
-      payload_('c', params_.append_size),
+      payload_(
+          PayloadHolder::copyString(std::string('c', params_.append_size))),
       settings_(create_default_settings<Settings>()) {
   ld_check(params_.num_appends > 0);
   ld_check(params_.nwriters > 0);
@@ -225,11 +225,6 @@ SequencerBatchingBenchmark::SequencerBatchingBenchmark(Params params)
   }
 }
 
-PayloadHolder SequencerBatchingBenchmark::genPayload() {
-  return PayloadHolder(
-      Payload(payload_.data(), payload_.size()), PayloadHolder::UNOWNED);
-}
-
 std::unique_ptr<Appender>
 SequencerBatchingBenchmark::createAppender(size_t writer_id, logid_t log_id) {
   return std::make_unique<Appender>(nullptr,
@@ -239,7 +234,7 @@ SequencerBatchingBenchmark::createAppender(size_t writer_id, logid_t log_id) {
                                     STORE_flags_t(0),
                                     log_id,
                                     AppendAttributes(),
-                                    genPayload(),
+                                    payload_,
                                     ClientID(),
                                     EPOCH_MIN,
                                     params_.append_size,

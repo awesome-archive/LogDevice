@@ -36,14 +36,13 @@ class TraceLogger {
                           std::unique_ptr<TraceSample> sample) = 0;
   virtual ~TraceLogger() {}
 
-  folly::Optional<double>
-  getSamplePercentageForTracer(const std::string& tracer) const {
-    return cluster_config_->get()->serverConfig()->getTracerSamplePercentage(
-        tracer);
+  virtual folly::Optional<double>
+  getSamplePercentageForTracer(const std::string& tracer) {
+    return folly::none;
   }
 
-  double getDefaultSamplePercentage() const {
-    return cluster_config_->get()->serverConfig()->getDefaultSamplePercentage();
+  virtual double getDefaultSamplePercentage() const {
+    return 0.1; // 0.1% 1 every 1000
   }
 
   /** Helpers useful in tracing **/
@@ -53,7 +52,7 @@ class TraceLogger {
     if (node == nullptr) {
       return std::string();
     }
-    return node->address.toStringNoBrackets();
+    return node->default_client_data_address.toStringNoBrackets();
   }
 
   std::shared_ptr<Configuration> getConfiguration() const {

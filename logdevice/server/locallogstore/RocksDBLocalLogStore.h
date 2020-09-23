@@ -81,12 +81,12 @@ class RocksDBLocalLogStore : public RocksDBLogStoreBase {
       Location advance(Direction dir,
                        folly::Optional<logid_t> stay_within) const {
         ld_check(!at_end);
-        if (stay_within.hasValue()) {
+        if (stay_within.has_value()) {
           ld_assert_eq(log_id, stay_within.value());
         }
         if (dir == Direction::FORWARD) {
           if (lsn == std::numeric_limits<lsn_t>::max()) {
-            if (stay_within.hasValue() ||
+            if (stay_within.has_value() ||
                 log_id.val_ == std::numeric_limits<logid_t::raw_type>::max()) {
               return Location::end();
             }
@@ -96,7 +96,7 @@ class RocksDBLocalLogStore : public RocksDBLogStoreBase {
           }
         } else {
           if (lsn == 0) {
-            if (stay_within.hasValue() || log_id.val_ == 0) {
+            if (stay_within.has_value() || log_id.val_ == 0) {
               return Location::end();
             }
             return Location(
@@ -163,6 +163,10 @@ class RocksDBLocalLogStore : public RocksDBLogStoreBase {
     // to a single partition, and the time range comes from partition metadata.
     RecordTimestamp min_ts_ = RecordTimestamp::min();
     RecordTimestamp max_ts_ = RecordTimestamp::max();
+
+    bool isCSIEnabled() const {
+      return csi_iterator_ != nullptr;
+    }
 
    private:
     class CopySetIndexIterator;
@@ -297,12 +301,13 @@ class RocksDBLocalLogStore : public RocksDBLogStoreBase {
    * @return On success, returns the newly created instance.  On failure,
    *         returns nullptr.
    */
-  explicit RocksDBLocalLogStore(uint32_t shard_idx,
-                                uint32_t num_shards,
-                                const std::string& path,
-                                RocksDBLogStoreConfig rocksdb_config,
-                                StatsHolder*,
-                                IOTracing*);
+  RocksDBLocalLogStore(uint32_t shard_idx,
+                       uint32_t num_shards,
+                       const std::string& path,
+                       RocksDBLogStoreConfig rocksdb_config,
+                       RocksDBCustomiser* customiser,
+                       StatsHolder*,
+                       IOTracing*);
 
   int writeMulti(const std::vector<const WriteOp*>& writes,
                  const WriteOptions& options) override {

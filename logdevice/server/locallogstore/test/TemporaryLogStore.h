@@ -106,6 +106,12 @@ class TemporaryLogStore : public LocalLogStore {
                                 LocalLogStore::SealPreemption seal_preempt,
                                 const WriteOptions& write_options) override;
 
+  int getRebuildingRanges(RebuildingRangesMetadata& rrm,
+                          RebuildingRangesVersion& version) override;
+  int writeRebuildingRanges(RebuildingRangesMetadata& rrm,
+                            RebuildingRangesVersion base_version,
+                            RebuildingRangesVersion new_version) override;
+
   Status acceptingWrites() const override;
 
   int isEmpty() const override;
@@ -129,6 +135,10 @@ class TemporaryLogStore : public LocalLogStore {
 
   int deleteAllLogSnapshotBlobs() override;
 
+  int traverseLogsMetadata(
+      LogMetadataType type,
+      LocalLogStore::TraverseLogsMetadataCallback cb) override;
+
   int findTime(logid_t log_id,
                std::chrono::milliseconds timestamp,
                lsn_t* lo,
@@ -147,7 +157,7 @@ class TemporaryLogStore : public LocalLogStore {
 
  protected:
   factory_func_t factory_;
-  std::unique_ptr<folly::test::TemporaryDirectory> temp_dir_;
+  std::unique_ptr<TemporaryDirectory> temp_dir_;
   std::unique_ptr<LocalLogStore> db_;
 };
 

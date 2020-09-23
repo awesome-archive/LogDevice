@@ -77,7 +77,7 @@ void FileBasedVersionedConfigStore::threadMain() {
 
 void FileBasedVersionedConfigStore::getConfigImpl(
     std::string key,
-    value_callback_t cb,
+    value_callback_t::SharedProxy cb,
     folly::Optional<version_t> base_version) const {
   if (shutdown_signaled_.load()) {
     cb(E::SHUTDOWN, "");
@@ -120,7 +120,7 @@ void FileBasedVersionedConfigStore::getConfigImpl(
     return;
   }
 
-  if (base_version.hasValue()) {
+  if (base_version.has_value()) {
     auto current_version_opt = (extract_fn_)(value);
     if (!current_version_opt) {
       RATELIMIT_WARNING(std::chrono::seconds(10),
@@ -145,8 +145,8 @@ void FileBasedVersionedConfigStore::updateConfigImpl(
     std::string key,
     std::string value,
     version_t new_version,
-    folly::Optional<version_t> base_version,
-    write_callback_t cb) {
+    Condition base_version,
+    write_callback_t::SharedProxy cb) {
   if (shutdown_signaled_.load()) {
     cb(E::SHUTDOWN, {}, "");
     return;
@@ -198,11 +198,7 @@ void FileBasedVersionedConfigStore::updateConfigImpl(
   }
 
   folly::Optional<version_t> current_version_opt;
-  if (current_value.empty()) {
-    // Note: empty file means that we just created the file, perform the
-    // ondemand provisioning and assume version 0 for the current data
-    current_version_opt = version_t(0);
-  } else {
+  if (!current_value.empty()) {
     current_version_opt = (extract_fn_)(current_value);
     if (!current_version_opt) {
       RATELIMIT_WARNING(
@@ -214,11 +210,13 @@ void FileBasedVersionedConfigStore::updateConfigImpl(
       return;
     }
   }
-  version_t current_version = current_version_opt.value();
-  if (base_version.hasValue() && base_version != current_version) {
+  if (auto status = isAllowedUpdate(base_version, current_version_opt);
+      status != E::OK) {
     // version conditional update failed, invoke the callback with the
     // version and value that are more recent
-    cb(E::VERSION_MISMATCH, current_version, std::move(current_value));
+    cb(std::move(status),
+       current_version_opt.value_or(version_t(0)),
+       std::move(current_value));
     return;
   }
 
@@ -237,7 +235,7 @@ void FileBasedVersionedConfigStore::updateConfigImpl(
     return;
   }
 
-  cb(E::OK, new_version, "");
+  cb(E::OK, std::move(new_version), "");
 }
 
 void FileBasedVersionedConfigStore::getConfig(
@@ -249,13 +247,18 @@ void FileBasedVersionedConfigStore::getConfig(
     return;
   }
 
-  bool success = task_queue_.writeIfNotFull(
-      [this, key = std::move(key), cb = std::move(cb), base_version]() mutable {
-        getConfigImpl(std::move(key), std::move(cb), base_version);
-      });
+  auto cb_shared = std::move(cb).asSharedProxy();
+  bool success = task_queue_.writeIfNotFull([this,
+                                             key = std::move(key),
+                                             cb_shared = cb_shared,
+                                             base_version]() mutable {
+    getConfigImpl(std::move(key), cb_shared, base_version);
+  });
   if (!success) {
-    // queue full, report transient error
-    cb(E::AGAIN, {});
+    // Queue full, report transient error.
+    // `func` was not moved out of, so it wasn't destroyed and wasn't called,
+    // so cb_plain is still alive.
+    cb_shared(E::AGAIN, {});
     return;
   }
 }
@@ -315,7 +318,7 @@ void FileBasedVersionedConfigStore::readModifyWriteConfig(
   version_t new_version = opt.value();
 
   // TODO: Add stricter enforcement of monotonic increment of version.
-  if (cur_ver.hasValue() && new_version.val() <= cur_ver.value().val()) {
+  if (cur_ver.has_value() && new_version.val() <= cur_ver.value().val()) {
     RATELIMIT_WARNING(std::chrono::seconds(10),
                       5,
                       "Config value's version is not monitonically increasing"
@@ -325,22 +328,25 @@ void FileBasedVersionedConfigStore::readModifyWriteConfig(
                       new_version.val());
   }
 
-  bool success =
-      task_queue_.writeIfNotFull([this,
-                                  key = std::move(key),
-                                  value = std::move(write_value),
-                                  base_version = std::move(cur_ver),
-                                  new_version = std::move(new_version),
-                                  cb = std::move(cb)]() mutable {
-        updateConfigImpl(std::move(key),
-                         std::move(value),
-                         std::move(new_version),
-                         std::move(base_version),
-                         std::move(cb));
-      });
+  auto cb_shared = std::move(cb).asSharedProxy();
+  bool success = task_queue_.writeIfNotFull([this,
+                                             key = std::move(key),
+                                             value = std::move(write_value),
+                                             base_version = std::move(cur_ver),
+                                             new_version =
+                                                 std::move(new_version),
+                                             cb_shared = cb_shared]() mutable {
+    updateConfigImpl(std::move(key),
+                     std::move(value),
+                     std::move(new_version),
+                     base_version.has_value()
+                         ? base_version.value()
+                         : VersionedConfigStore::Condition::createIfNotExists(),
+                     cb_shared);
+  });
   if (!success) {
     // queue full, report transient error
-    cb(E::AGAIN, {}, "");
+    cb_shared(E::AGAIN, {}, "");
     return;
   }
 }

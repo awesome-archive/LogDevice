@@ -92,7 +92,10 @@ void RebuildingSettings::defineSettings(SettingEasyInit& init) {
          }
        },
        "Rebuilding will try to keep the difference between max and min "
-       "in-flight records' timestamps less than this value.",
+       "in-flight records' timestamps less than this value. For best results, "
+       "this should be considerably larger than rocksdb-partition-duration "
+       "since records of each partition are rebuilt in a non-chronological "
+       "order.",
        SERVER,
        SettingsCategory::Rebuilding);
   init("rebuilding-global-window",
@@ -124,8 +127,7 @@ void RebuildingSettings::defineSettings(SettingEasyInit& init) {
        "1000ms",
        nullptr,
        "Max amount of time rebuilding read storage task is allowed to "
-       "take before yielding to other storage tasks. Only supported by "
-       "rebuilding V2 (partition by partition). \"max\" for unlimited.",
+       "take before yielding to other storage tasks. \"max\" for unlimited.",
        SERVER);
   init("rebuilding-max-records-in-flight",
        &max_records_in_flight,
@@ -138,8 +140,7 @@ void RebuildingSettings::defineSettings(SettingEasyInit& init) {
          }
        },
        "Maximum number of rebuilding STORE requests that a rebuilding donor "
-       "node can have in flight at the same time. Rebuilding v1: per log, "
-       "rebuilding v2: per shard.",
+       "node can have in flight per shard at the same time.",
        SERVER,
        SettingsCategory::Rebuilding);
   init(
@@ -148,25 +149,9 @@ void RebuildingSettings::defineSettings(SettingEasyInit& init) {
       "100M",
       parse_positive<size_t>(),
       "Maximum total size of rebuilding STORE requests that a rebuilding donor "
-      "node can have in flight at the same time, per shard. Only used by "
-      "rebuilding v2.",
+      "node can have in flight at the same time, per shard.",
       SERVER,
       SettingsCategory::Rebuilding);
-  init("rebuilding-max-amends-in-flight",
-       &max_amends_in_flight,
-       "100",
-       [](size_t val) {
-         if ((ssize_t)val <= 0) {
-           throw boost::program_options::error(
-               "rebuilding-max-amends-in-flight must "
-               "be positive");
-         }
-       },
-       "maximum number of requests to update (amend) a rebuilt record's "
-       "copyset that a rebuilding donor node can have in flight at the same "
-       "time, per log. Rebuilding v1 only.",
-       SERVER,
-       SettingsCategory::Rebuilding);
   init(
       "rebuilding-max-get-seq-state-in-flight",
       &max_get_seq_state_in_flight,
@@ -192,69 +177,13 @@ void RebuildingSettings::defineSettings(SettingEasyInit& init) {
        "rebuilding via SyncSequencerRequest API, with exponential backoff",
        SERVER,
        SettingsCategory::Rebuilding);
-  init("rebuilding-max-logs-in-flight",
-       &max_logs_in_flight,
-       "1",
-       [](size_t val) {
-         if ((ssize_t)val <= 0) {
-           throw boost::program_options::error("rebuilding-max-logs-"
-                                               "in-flight must be "
-                                               "positive");
-         }
-       },
-       "Maximum number of logs that a donor node can be rebuilding at the same "
-       "time. V1 only.",
-       SERVER,
-       SettingsCategory::Rebuilding);
   init("rebuilding-use-rocksdb-cache",
        &use_rocksdb_cache,
        "false",
        nullptr,
-       "Allow rebuilding reads to use RocksDB block cache. Recommended: enable "
-       "for rebuilding v1, disable for rebuilding v2.",
-       SERVER,
-       SettingsCategory::Rebuilding);
-  init("rebuilding-checkpoint-interval-mb",
-       &checkpoint_interval_mb,
-       "100",
-       [](size_t val) {
-         if ((ssize_t)val <= 0) {
-           throw boost::program_options::error(
-               "rebuilding-checkpoint-interval-mb must be positive");
-         }
-       },
-       "Write a per-log rebuilding checkpoint once per this many megabytes of "
-       "rebuilt data in the log. A rebuilding checkpoints contains an LSN "
-       "through which the log has been rebuilt by this donor and the "
-       "rebuilding version number identifying this rebuilding run. If a node "
-       "restarts in the middle of a rebuilding run, it resumes rebuilding of a "
-       "log from that log's last checkpoint. V1 only.",
-       SERVER,
-       SettingsCategory::Rebuilding);
-  init("total-log-rebuilding-size-per-shard-mb",
-       &total_log_rebuilding_size_per_shard_mb,
-       "100",
-       [](double val) {
-         if ((double)val <= 0) {
-           throw boost::program_options::error(
-               "total-log-rebuilding-size-per-shard-mb must be positive");
-         }
-       },
-       "Maximum amount of memory that can be consumed by all LogRebuilding "
-       "state machines, per shard. V1 only.",
-       SERVER,
-       SettingsCategory::Rebuilding);
-  init("max-log-rebuilding-size-mb",
-       &max_log_rebuilding_size_mb,
-       "5",
-       [](double val) {
-         if ((double)val <= 0) {
-           throw boost::program_options::error(
-               "max-log-rebuilding-size-mb must be positive");
-         }
-       },
-       "Maximum amount of memory that can be consumed by a single "
-       "LogRebuilding state machine. V1 only.",
+       "Allow rebuilding reads to use RocksDB block cache. Rebuilding reads "
+       "are not expected to benefit from using the cache, so it's disabled by "
+       "default to avoid thrashing the cache.",
        SERVER,
        SettingsCategory::Rebuilding);
   init("rebuilding-read-only",
@@ -304,23 +233,6 @@ void RebuildingSettings::defineSettings(SettingEasyInit& init) {
        "unsuccessful reply, or connection closed after we sent the store.",
        SERVER,
        SettingsCategory::Rebuilding);
-  init("rebuilding-local-window-uses-partition-boundary",
-       &local_window_uses_partition_boundary,
-       "true",
-       nullptr,
-       "If true, the local window will be moved on partition boundaries. If "
-       "false, it will instead be moved on fixed time intervals, as set by "
-       "--rebuilding-local-window. V1 only, V2 always reads partition by "
-       "partition.",
-       SERVER,
-       SettingsCategory::Rebuilding);
-  init("rebuilding-use-iterator-cache",
-       &use_iterator_cache,
-       "false",
-       nullptr,
-       "Place rebuilding iterators in the LogsDB iterator cache. V1 only.",
-       SERVER,
-       SettingsCategory::Rebuilding);
   init("rebuild-dirty-shards",
        &rebuild_dirty_shards,
        "true",
@@ -345,7 +257,7 @@ void RebuildingSettings::defineSettings(SettingEasyInit& init) {
        &shard_is_rebuilt_msg_delay,
        "5s..300s",
        validate_nonnegative<ssize_t>(),
-       "In large clusters SHARD_IS_REBULT messages can arrive in a thundering "
+       "In large clusters SHARD_IS_REBUILT messages can arrive in a thundering "
        "herd overwhelming thread 0 processing those messages. The messages "
        "will be delayed by a random time in seconds between the min and the "
        "max value specified in the range above. 0 means no delay. NOTE: "
@@ -413,20 +325,6 @@ void RebuildingSettings::defineSettings(SettingEasyInit& init) {
       "automatically, based on the cluster configuration.",
       SERVER | DEPRECATED,
       SettingsCategory::Rebuilding);
-  init("record-durability-timeout",
-       &record_durability_timeout,
-       "960s",
-       [](std::chrono::seconds val) -> void {
-         if (val.count() < 0) {
-           out_of_range(
-               "record-durability-timeout", "non-negative", val.count());
-         }
-       },
-       "Time for which LogRebuilding/RebuidlingCoordinator will wait for "
-       "pending records to be durable before restarting the rebuilding for "
-       "the log.",
-       SERVER | EXPERIMENTAL,
-       SettingsCategory::Rebuilding);
   init(
       "auto-mark-unrecoverable-timeout",
       &auto_mark_unrecoverable_timeout,
@@ -491,10 +389,8 @@ void RebuildingSettings::defineSettings(SettingEasyInit& init) {
       "store (e.g. caused by bugs, forward incompatibility, or other processes "
       "writing unexpected things to rocksdb directly)."
       "If rebuilding encounters invalid records, it skips them and logs "
-      // TODO (T24665001): With rebuilding partition by partition,
-      //                   remove the "in the same log" part.
-      "warnings. But if it encounters at least this many of them in the same "
-      "log, it freaks out, logs a critical error and stalls indefinitely. The "
+      "warnings. But if it encounters at least this many of them, it freaks "
+      "out, logs a critical error and stalls indefinitely. The "
       "rest of the server keeps trying to run normally, to the extent to which "
       "you can run normally when you can't parse most of the records in the "
       "DB.",
@@ -507,13 +403,6 @@ void RebuildingSettings::defineSettings(SettingEasyInit& init) {
        "Used in tests.",
        SERVER,
        SettingsCategory::Testing);
-  init("rebuilding-v2",
-       &enable_v2,
-       "true",
-       nullptr,
-       "Enables a new implementation of rebuilding. The old one is deprecated.",
-       SERVER,
-       SettingsCategory::Rebuilding);
   init("rebuilding-rate-limit",
        &rate_limit,
        "unlimited",
@@ -529,7 +418,7 @@ void RebuildingSettings::defineSettings(SettingEasyInit& init) {
          }
          return res;
        },
-       "Rebuilding V2 only. Limit on how fast rebuilding reads, in bytes per "
+       "Limit on how fast rebuilding reads, in bytes per "
        "unit of time, per shard. Example: 5M/1s will make rebuilding read at "
        "most one megabyte per second in each shard. Note that it counts "
        "pre-filtering bytes; if rebuilding has high read amplification "
@@ -543,7 +432,7 @@ void RebuildingSettings::defineSettings(SettingEasyInit& init) {
        SettingsCategory::Rebuilding);
   init("filter-relocate-shards",
        &filter_relocate_shards,
-       "false",
+       "true",
        nullptr,
        "Enables an optimization that mitigates a bias causing shards in "
        "RELOCATE mode to end up rebuilding 1/3rd of the data (assuming "
@@ -555,6 +444,18 @@ void RebuildingSettings::defineSettings(SettingEasyInit& init) {
        "outside the server by external tools. These tools need to add the "
        "FILTER_RELOCATE_SHARDS flag for that purpose. Experimental.",
        SERVER,
+       SettingsCategory::Rebuilding);
+  init("rebuilding-new-to-old",
+       &new_to_old,
+       "true",
+       nullptr,
+       "Rebuild records in order of approximately increasing age. More "
+       "specifically, rebuilding iterates over partitions in reverse order, "
+       "but within each partition it goes in order of increasing tuple [log "
+       "ID, LSN]. If set to false, we iterate over partitions in old-to-new "
+       "order. If global window is enabled, all nodes must have the same value "
+       "of new-to-old setting; if they don't, rebuilding stalls until they do.",
+       SERVER | REQUIRES_RESTART,
        SettingsCategory::Rebuilding);
 }
 

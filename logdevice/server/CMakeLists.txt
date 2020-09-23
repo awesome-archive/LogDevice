@@ -12,17 +12,21 @@ REMOVE_MATCHES_FROM_LISTS(files hfiles
     "/test/"
     "/locallogstore/test/"
     "/admincommands/"
-    "main.cpp"
-    "Server.cpp"
-    "Server.h"
-    "shutdown.h"
-
+    "${LOGDEVICE_SERVER_DIR}/main.cpp"
+    "${LOGDEVICE_SERVER_DIR}/Server.cpp"
+    "${LOGDEVICE_SERVER_DIR}/Server.h"
+    "${LOGDEVICE_SERVER_DIR}/shutdown.h"
+    "${LOGDEVICE_SERVER_DIR}/shutdown.cpp"
 )
+
+add_subdirectory(epoch_store/if)
 
 add_library(logdevice_server_core STATIC ${hfiles} ${files})
 
 target_link_libraries(logdevice_server_core
   common
+  api_service-cpp2
+  EpochStore-cpp2
   ldclient_static
   logdevice_admin_settings
   logdevice_admin_maintenance
@@ -56,6 +60,9 @@ else()
     COMMAND ${UNIT_TEST_OUTPUT_DIRECTORY}/server_test
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
   endif()
+
+set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
+  ${LOGDEVICE_SERVER_DIR}/flaky_tests.cmake)
 
   target_link_libraries(server_test
     common

@@ -44,6 +44,16 @@ class StartMetaDataLogRecoveryRequest : public Request {
       : Request(RequestType::START_METADATA_LOG_RECOVERY),
         meta_logid_(meta_logid) {
     ld_check(MetaDataLog::isMetaDataLog(meta_logid_));
+    ld_spew("[sequencer_activity_in_progress++] Created "
+            "StartMetaDataLogRecoveryRequest for log %lu",
+            meta_logid.val());
+    WORKER_STAT_INCR(sequencer_activity_in_progress);
+  }
+  ~StartMetaDataLogRecoveryRequest() override {
+    ld_spew("[sequencer_activity_in_progress--] Destroyed "
+            "StartMetaDataLogRecoveryRequest for log %lu",
+            meta_logid_.val());
+    WORKER_STAT_DECR(sequencer_activity_in_progress);
   }
 
   Request::Execution execute() override {
@@ -210,18 +220,17 @@ int MetaDataLogWriter::checkAppenderPayload(Appender* appender,
 }
 
 std::string MetaDataLogWriter::getDebugInfo() const {
+  // This needs to be thread safe because it's called without synchronization.
+  // Only access atomic or immutable fields.
   return folly::sformat("logid: {}, state: {}, current_epoch: {}, "
                         "last_writer_epoch: {}, recovery_only: {} "
-                        "metadata_last_released: {}, running_write: {}, "
-                        "current_worker: {}.",
+                        "metadata_last_released: {}.",
                         getDataLogID().val(),
                         int(state_.load()),
                         current_epoch_.load(),
                         last_writer_epoch_.load(),
                         recovery_only_.load() ? "true" : "false",
-                        last_released_.load(),
-                        running_write_.get(),
-                        current_worker_.val());
+                        lsn_to_string(last_released_.load()));
 }
 
 // caller of this function owns the appender
@@ -248,7 +257,7 @@ RunAppenderStatus MetaDataLogWriter::runAppender(Appender* appender) {
 
   if (appender != nullptr) {
     auto acceptable_epoch = appender->getAcceptableEpoch();
-    if (acceptable_epoch.hasValue()) {
+    if (acceptable_epoch.has_value()) {
       if (acceptable_epoch.value() != epoch_from_parent) {
         // Current epoch is unacceptable to this appender
         err = E::ABORTED;
@@ -276,7 +285,6 @@ RunAppenderStatus MetaDataLogWriter::runAppender(Appender* appender) {
       // that the abort request won't cancel a WriteMetaDataRecord that actually
       // does append.
 
-      ld_check(current_worker_ != worker_id_t(-1));
       abortRecovery();
 
       // E::INPROGRESS will cause the metadata appender buffered on worker
@@ -289,12 +297,15 @@ RunAppenderStatus MetaDataLogWriter::runAppender(Appender* appender) {
     err = prev == State::SHUTDOWN ? E::SHUTDOWN : E::NOBUFS;
 
     if (err == E::NOBUFS) {
-      RATELIMIT_INFO(std::chrono::seconds(10),
-                     2,
-                     "MetaDataLogWriter cannnot accept a new "
-                     "metadata append due to an existing write / recovery in "
-                     "progress. Failing the append with E::NOBUF. Debug: %s.",
-                     getDebugInfo().c_str());
+      // Note that getDebugInfo() is thread safe, so it's ok to call it even if
+      // we failed to acquire the state_ lock.
+      RATELIMIT_INFO(
+          std::chrono::seconds(10),
+          2,
+          "MetaDataLogWriter cannnot accept a new "
+          "metadata append due to an existing write / recovery in "
+          "progress. Failing the append with E::NOBUF. Some info: %s",
+          getDebugInfo().c_str());
     }
 
     return RunAppenderStatus::ERROR_DELETE;

@@ -67,6 +67,8 @@ class ServerProcessor;
 
 class PartitionedRocksDBStore : public RocksDBLogStoreBase {
  public:
+  class Iterator;
+
   static const char* METADATA_CF_NAME;
   static const char* UNPARTITIONED_CF_NAME;
   static const char* SNAPSHOTS_CF_NAME;
@@ -286,11 +288,19 @@ class PartitionedRocksDBStore : public RocksDBLogStoreBase {
     // exclusively locked mutex_.
     bool is_dropped{false};
 
+    // This is set at partition creation time and is picked from
+    // write-copyset-index setting.
+    bool is_csi_enabled_{false};
+
     Partition(partition_id_t id,
               RocksDBCFPtr cf,
               RecordTimestamp starting_timestamp,
-              const DirtyState* pre_dirty_state = nullptr)
-        : id_(id), cf_(std::move(cf)), starting_timestamp(starting_timestamp) {
+              const DirtyState* pre_dirty_state = nullptr,
+              const bool is_csi_enabled = false)
+        : id_(id),
+          cf_(std::move(cf)),
+          starting_timestamp(starting_timestamp),
+          is_csi_enabled_(is_csi_enabled) {
       if (pre_dirty_state != nullptr) {
         dirty_state_ = *pre_dirty_state;
       }
@@ -400,6 +410,7 @@ class PartitionedRocksDBStore : public RocksDBLogStoreBase {
                                    const std::string& path,
                                    RocksDBLogStoreConfig rocksdb_config,
                                    const Configuration* config,
+                                   RocksDBCustomiser* customiser,
                                    StatsHolder* stats,
                                    IOTracing* io_tracing)
       : PartitionedRocksDBStore(shard_idx,
@@ -407,6 +418,7 @@ class PartitionedRocksDBStore : public RocksDBLogStoreBase {
                                 path,
                                 std::move(rocksdb_config),
                                 config,
+                                customiser,
                                 stats,
                                 io_tracing,
                                 DeferInit::NO) {}
@@ -659,8 +671,11 @@ class PartitionedRocksDBStore : public RocksDBLogStoreBase {
       bool allow_blocking_io,
       std::chrono::milliseconds* timestamp_out) override;
 
-  int getRebuildingRanges(RebuildingRangesMetadata& rrm);
-  int writeRebuildingRanges(RebuildingRangesMetadata& rrm);
+  int getRebuildingRanges(RebuildingRangesMetadata& rrm,
+                          RebuildingRangesVersion& version) override;
+  int writeRebuildingRanges(RebuildingRangesMetadata& rrm,
+                            RebuildingRangesVersion base_version,
+                            RebuildingRangesVersion new_version) override;
 
   // Calls `cb` for every log that has at least one record stored. Note that
   // this method doesn't check trim points, so it's possible that some of the
@@ -908,6 +923,8 @@ class PartitionedRocksDBStore : public RocksDBLogStoreBase {
         }
       }
     }
+
+    std::string toString() const;
 
    private:
     size_t sort_order;
@@ -1166,7 +1183,6 @@ class PartitionedRocksDBStore : public RocksDBLogStoreBase {
       const std::shared_ptr<const RocksDBSettings> settings) override;
 
  private:
-  class Iterator;
   class PartitionedAllLogsIterator;
   class PartitionDirectoryIterator;
   class FindTime;
@@ -1299,6 +1315,10 @@ class PartitionedRocksDBStore : public RocksDBLogStoreBase {
   // Called by the constructor.
   // Reads persisted dirty metadata for the given partition.
   bool readPartitionDirtyState(PartitionPtr partition);
+
+  // Called by the constructor.
+  // Read persisted copyset-indexing status metadata.
+  bool readPartitionCSIStatus(PartitionPtr partition);
 
   // Called by the constructor.
   // Reads oldest partition ID from metadata and, if it's greater than
@@ -1725,6 +1745,9 @@ class PartitionedRocksDBStore : public RocksDBLogStoreBase {
   AtomicSteadyTimestamp last_directory_consistency_check_time_{
       SteadyTimestamp::min()};
 
+  std::mutex rebuilding_ranges_mutex_;
+  RebuildingRangesVersion rebuilding_ranges_version_ = {0, 0};
+
  protected:
   enum class DeferInit {
     NO,
@@ -1766,11 +1789,15 @@ class PartitionedRocksDBStore : public RocksDBLogStoreBase {
   std::atomic<partition_id_t> max_under_replicated_partition_{
       PARTITION_INVALID};
 
+  // global settings.
+  UpdateableSettings<Settings> global_settings_;
+
   explicit PartitionedRocksDBStore(uint32_t shard_idx,
                                    uint32_t num_shards,
                                    const std::string& path,
                                    RocksDBLogStoreConfig rocksdb_config,
                                    const Configuration* config,
+                                   RocksDBCustomiser* customiser,
                                    StatsHolder* stats,
                                    IOTracing* io_tracing,
                                    DeferInit defer_init);

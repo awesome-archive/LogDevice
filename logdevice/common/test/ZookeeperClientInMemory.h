@@ -9,7 +9,6 @@
 
 #include <memory>
 
-#include <google/dense_hash_map>
 #include <zookeeper/zookeeper.h>
 
 #include "logdevice/common/ZookeeperClient.h"
@@ -39,34 +38,33 @@ class ZookeeperClientInMemory : public ZookeeperClientBase {
 
   int state() override;
 
+  int exists(const char* znode_path,
+             stat_completion_t completion,
+             const void* data);
+
+  ~ZookeeperClientInMemory() override;
+
+ private:
   int setData(const char* znode_path,
               const char* znode_value,
               int znode_value_size,
               int version,
               stat_completion_t completion,
-              const void* data) override;
+              const void* data);
 
   int getData(const char* znode_path,
               data_completion_t completion,
-              const void* data) override;
-
-  int exists(const char* znode_path,
-             stat_completion_t completion,
-             const void* data);
+              const void* data);
 
   int multiOp(int count,
               const zoo_op_t* ops,
               zoo_op_result_t* results,
               void_completion_t completion,
-              const void* data) override;
+              const void* data);
 
-  ~ZookeeperClientInMemory() override;
-
- private:
   bool parentsExist(const std::lock_guard<std::mutex>& lock,
                     const char* znode_path);
 
-  int reconnect(zhandle_t* prev) override;
   std::shared_ptr<std::atomic<bool>> alive_;
   // Mutex protects `map_' and `callbacksGetData_'
   std::mutex mutex_;
@@ -100,30 +98,6 @@ class ZookeeperClientInMemory : public ZookeeperClientBase {
   int mockSync(const char* znode_path,
                string_completion_t completion,
                const void* context);
-};
-
-class ZookeeperClientInMemoryFactory : public ZookeeperClientFactory {
- public:
-  explicit ZookeeperClientInMemoryFactory(
-      ZookeeperClientInMemory::state_map_t znodes)
-      : znodes_(znodes) {}
-
-  std::string identifier() const override {
-    return "in-memory-zk";
-  }
-
-  std::string displayName() const override {
-    return "In Memory ZK";
-  }
-
-  std::unique_ptr<ZookeeperClientBase>
-  getClient(const configuration::ZookeeperConfig& config) override {
-    return std::make_unique<ZookeeperClientInMemory>(
-        config.getQuorumString(), znodes_);
-  }
-
- private:
-  ZookeeperClientInMemory::state_map_t znodes_;
 };
 
 }} // namespace facebook::logdevice

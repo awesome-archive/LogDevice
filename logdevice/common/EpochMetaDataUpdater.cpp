@@ -10,6 +10,7 @@
 #include "logdevice/common/MetaDataTracer.h"
 #include "logdevice/common/configuration/nodes/utils.h"
 #include "logdevice/common/debug.h"
+#include "logdevice/common/nodeset_selection/NodeSetSelector.h"
 #include "logdevice/common/nodeset_selection/NodeSetSelectorFactory.h"
 #include "logdevice/lib/ClientProcessor.h"
 
@@ -134,8 +135,7 @@ UpdateResult updateMetaDataIfNeeded(
     bool provision_if_empty,
     bool update_if_exists,
     bool force_update) {
-  const std::shared_ptr<LogsConfig::LogGroupNode> logcfg =
-      config.getLogGroupByIDShared(log_id);
+  const auto logcfg = config.getLogGroupByIDShared(log_id);
   if (!logcfg) {
     err = E::NOTFOUND;
     return UpdateResult::FAILED;
@@ -159,7 +159,7 @@ UpdateResult updateMetaDataIfNeeded(
     return UpdateResult::FAILED;
   }
 
-  if (!target_nodeset_size.hasValue()) {
+  if (!target_nodeset_size.has_value()) {
     if (prev_metadata_exists &&
         metadata->nodeset_params.target_nodeset_size != 0) {
       target_nodeset_size = metadata->nodeset_params.target_nodeset_size;
@@ -169,7 +169,7 @@ UpdateResult updateMetaDataIfNeeded(
     }
   }
 
-  if (!nodeset_seed.hasValue()) {
+  if (!nodeset_seed.has_value()) {
     if (prev_metadata_exists) {
       nodeset_seed = metadata->nodeset_params.seed;
     } else {
@@ -195,7 +195,7 @@ UpdateResult updateMetaDataIfNeeded(
       target_nodeset_size.value(),
       nodeset_seed.value(),
       prev_metadata_exists ? metadata.get() : nullptr,
-      nullptr);
+      NodeSetSelector::Options{});
 
   UpdateResult result =
       prev_metadata_exists ? UpdateResult::UNCHANGED : UpdateResult::CREATED;
@@ -412,7 +412,7 @@ operator()(logid_t log_id,
   // are hit (e.g. not written to metadata log).
   // Note that `info` comes from epoch store, so it contains the _next_ epoch,
   // i.e. the epoch the newly activated sequencer is going to get.
-  if (acceptable_activation_epoch_.hasValue() &&
+  if (acceptable_activation_epoch_.has_value() &&
       acceptable_activation_epoch_.value() !=
           (info ? info->h.epoch : EPOCH_MIN)) {
     RATELIMIT_INFO(std::chrono::seconds(10),

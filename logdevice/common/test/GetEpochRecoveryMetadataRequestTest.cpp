@@ -15,6 +15,7 @@
 #include "logdevice/common/test/MockBackoffTimer.h"
 #include "logdevice/common/test/MockTimer.h"
 #include "logdevice/common/test/NodeSetTestUtil.h"
+#include "logdevice/common/test/SenderTestProxy.h"
 #include "logdevice/common/test/TestUtil.h"
 
 namespace facebook { namespace logdevice {
@@ -76,15 +77,8 @@ class GetEpochRecoveryMetadataRequestTest : public ::testing::Test {
     dbg::currentLevel = dbg::Level::DEBUG;
     dbg::assertOnData = true;
 
-    Configuration::Nodes nodes;
-    NodeSetTestUtil::addNodes(&nodes, 10, 1, "rg0.dc0.cl0.ro0.rk0", 1);
-    Configuration::NodesConfig nodes_config(std::move(nodes));
-    auto logs_config = std::make_shared<configuration::LocalLogsConfig>();
-    NodeSetTestUtil::addLog(logs_config.get(), kLogID, 1, 0, 1, {});
-    config_ = std::make_shared<Configuration>(
-        ServerConfig::fromDataTest(
-            "GetEpochRecoveryMetadataRequestTest", std::move(nodes_config)),
-        std::move(logs_config));
+    nodes_config_ = std::make_shared<const NodesConfiguration>();
+    NodeSetTestUtil::addNodes(nodes_config_, 10, 1, "rg0.dc0.cl0.ro0.rk0", 1);
     int i = 0;
     while (i < nodeSetSize) {
       nodes_.push_back(ShardID(node_index_t(i), shard_index_t(0)));
@@ -126,7 +120,7 @@ class GetEpochRecoveryMetadataRequestTest : public ::testing::Test {
   std::shared_ptr<EpochMetaData> epoch_metadata_;
   GetEpochRecoveryMetadataRequestCallback cb_;
   std::vector<node_index_t> destination_;
-  std::shared_ptr<Configuration> config_;
+  std::shared_ptr<const NodesConfiguration> nodes_config_;
   Settings settings_ = create_default_settings<Settings>();
   BackoffTimer* wave_timer_{nullptr};
   std::shared_ptr<NodeSetState> nodeset_state_;
@@ -150,8 +144,7 @@ class MyCopySetSelectorDeps : public CopySetSelectorDependencies,
   NodeStatus checkNode(NodeSetState*,
                        ShardID shard,
                        StoreChainLink* destination_out,
-                       bool /*ignore_nodeset_state*/,
-                       bool /*allow_unencrypted_conections*/) const override {
+                       bool /*ignore_nodeset_state*/) const override {
     *destination_out = {shard, ClientID()};
     return NodeAvailabilityChecker::NodeStatus::AVAILABLE;
   }
@@ -305,8 +298,7 @@ class MockGetEpochRecoveryMetadataRequest
 
   std::shared_ptr<const configuration::nodes::NodesConfiguration>
   getNodesConfiguration() const {
-    return test_->config_->serverConfig()
-        ->getNodesConfigurationFromServerConfigSource();
+    return test_->nodes_config_;
   }
 
   const Settings& getSettings() const override {
@@ -524,34 +516,6 @@ TEST_F(GetEpochRecoveryMetadataRequestTest, SingleEmpty2) {
   ASSERT_TRUE(deferredCompleteTimerCreated_);
   fireDeferredCompleteTimer();
   cb_.assertCalled(E::OK, map2);
-}
-
-TEST_F(GetEpochRecoveryMetadataRequestTest, NodeWithOldProtocol_Single) {
-  init(4);
-  destinationRunningOldProto = node_index_t(3);
-  auto request = createRequest(epoch_t(1), epoch_t(1));
-  request->execute();
-  ASSERT_FALSE(deferredCompleteCalled_);
-  cb_.assertNotCalled();
-  EpochRecoveryStateMap map{{1, {E::EMPTY, EpochRecoveryMetadata()}}};
-  request->onReply(N3S0, E::OK, std::make_unique<EpochRecoveryStateMap>(map));
-  ASSERT_TRUE(deferredCompleteCalled_);
-  ASSERT_TRUE(deferredCompleteTimerCreated_);
-  fireDeferredCompleteTimer();
-  cb_.assertCalled(E::OK, map);
-}
-
-TEST_F(GetEpochRecoveryMetadataRequestTest, NodeWithOldProtocol_Range) {
-  init(4);
-  destinationRunningOldProto = node_index_t(3);
-  auto request = createRequest(epoch_t(1), epoch_t(2));
-  request->execute();
-  EpochRecoveryStateMap map{{1, {E::UNKNOWN, EpochRecoveryMetadata()}},
-                            {2, {E::UNKNOWN, EpochRecoveryMetadata()}}};
-  ASSERT_TRUE(deferredCompleteCalled_);
-  ASSERT_TRUE(deferredCompleteTimerCreated_);
-  fireDeferredCompleteTimer();
-  cb_.assertCalled(E::ABORTED, map);
 }
 
 }} // namespace facebook::logdevice

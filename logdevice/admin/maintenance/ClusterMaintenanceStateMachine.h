@@ -38,12 +38,18 @@ class ClusterMaintenanceStateMachine
                                                   MaintenanceDelta>;
 
   explicit ClusterMaintenanceStateMachine(
-      UpdateableSettings<AdminServerSettings> settings);
+      UpdateableSettings<AdminServerSettings> settings,
+      std::unique_ptr<RSMSnapshotStore> snapshot_store);
 
   /**
    * Start reading the maintenance log
    */
   void start();
+
+  /**
+   * Called when settings have changed.
+   */
+  void onSettingsUpdated();
 
   const thrift::ClusterMaintenanceState& getCurrentState() const {
     return getState();
@@ -95,6 +101,10 @@ class ClusterMaintenanceStateMachine
  private:
   // Will be set to true when we finish replaying the state machine.
   bool is_fully_loaded_{false};
+
+  // subscription for changes in UpdateableSettings<AdminServerSettings>
+  UpdateableSettings<AdminServerSettings>::SubscriptionHandle
+      updateable_settings_subscription_;
 
   std::unique_ptr<SubscriptionHandle> update_handle_;
 
@@ -163,6 +173,24 @@ class StartClusterMaintenanceStateMachineRequest : public Request {
 
  private:
   ClusterMaintenanceStateMachine* sm_;
+  WorkerType worker_type_;
+};
+
+class StopClusterMaintenanceStateMachineRequest : public Request {
+ public:
+  explicit StopClusterMaintenanceStateMachineRequest(WorkerType worker_type)
+      : Request(RequestType::STOP_CLUSTER_MAINTENANCE_STATE_MACHINE),
+        worker_type_(worker_type) {}
+
+  Execution execute() override;
+  int getThreadAffinity(int nthreads) override {
+    return ClusterMaintenanceStateMachine::getWorkerIndex(nthreads);
+  }
+  WorkerType getWorkerTypeAffinity() override {
+    return worker_type_;
+  }
+
+ private:
   WorkerType worker_type_;
 };
 

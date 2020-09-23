@@ -15,7 +15,9 @@ Implements cluster-specific operations.
 """
 
 import asyncio
-from typing import Dict, FrozenSet, Optional
+import operator
+from collections import defaultdict
+from typing import Dict, FrozenSet, Optional, Sequence, Tuple
 
 from ldops import admin_api
 from ldops.exceptions import NodeNotFoundError
@@ -24,7 +26,6 @@ from ldops.types.cluster_view import ClusterView
 from ldops.types.node import Node
 from ldops.types.socket_address import SocketAddress
 from logdevice.admin.clients import AdminAPI
-from logdevice.admin.common.types import NodeID
 from logdevice.admin.exceptions.types import NotSupported
 from logdevice.admin.nodes.types import (
     NodeConfig,
@@ -33,13 +34,14 @@ from logdevice.admin.nodes.types import (
     NodesStateResponse,
     NodeState,
 )
+from logdevice.common.types import LocationScope, NodeID
 
 
-DEFAULT_THRIFT_PORT = 6440
+DEFAULT_ADMIN_API_PORT = 6440
 
 
 async def get_cluster_by_hostname(
-    hostname: str, port: int = DEFAULT_THRIFT_PORT
+    hostname: str, port: int = DEFAULT_ADMIN_API_PORT
 ) -> Cluster:
     """
     Convenience method which automatically resolves given hostname and returns
@@ -162,6 +164,7 @@ async def get_cluster_view(client: AdminAPI) -> ClusterView:
     elif isinstance(maintenances_resp, Exception):
         raise maintenances_resp
     else:
+        # pyre-fixme[16]: `BaseException` has no attribute `maintenances`.
         maintenances = maintenances_resp.maintenances
 
     if isinstance(nodes_config_resp, Exception):
@@ -171,7 +174,57 @@ async def get_cluster_view(client: AdminAPI) -> ClusterView:
         raise nodes_state_resp
 
     return ClusterView(
+        # pyre-fixme[16]: `BaseException` has no attribute `nodes`.
         nodes_config=nodes_config_resp.nodes,
+        # pyre-fixme[16]: `BaseException` has no attribute `states`.
         nodes_state=nodes_state_resp.states,
         maintenances=maintenances,
+    )
+
+
+async def group_nodes_by_scope(
+    client: AdminAPI,
+    node_configs: Optional[Sequence[NodeConfig]] = None,
+    scope: Optional[LocationScope] = None,
+) -> Tuple[Tuple[NodeID, ...], ...]:
+    if node_configs is None:
+        response = await admin_api.get_nodes_config(client)
+        node_configs = response.nodes
+    if scope is None:
+        rep_info = await admin_api.get_replication_info(client)
+        scope = rep_info.tolerable_failure_domains.domain
+    ret = defaultdict(set)
+
+    for node_config in node_configs:
+        # location_per_scope doesn't have NODE as a key, so we insert a
+        # dummy value for the location, which is different for each node.
+        # This is okay because we omit the name of the location from the
+        # return value.
+        if scope != LocationScope.NODE:
+            location = tuple(
+                node_config.location_per_scope.get(scope_kind, "")
+                for scope_kind in sorted(
+                    LocationScope, key=lambda x: x.value, reverse=True
+                )
+                if scope_kind.value >= scope.value
+            )
+        else:
+            location = node_config.node_index
+
+        ret[location].add(
+            NodeID(
+                node_index=node_config.node_index,
+                address=node_config.data_address,
+                name=node_config.name,
+            )
+        )
+
+    return tuple(
+        sorted(
+            (
+                tuple(sorted(v, key=operator.attrgetter("node_index")))
+                for k, v in ret.items()
+            ),
+            key=lambda x: x[0].node_index,
+        )
     )

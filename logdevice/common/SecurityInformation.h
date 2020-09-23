@@ -33,10 +33,10 @@ class Principal {
   // Used to assign default permissions to a resource
   static constexpr const char* DEFAULT = "default";
 
-  // Assigned to Socket connections that did not provide any authentication data
+  // Assigned to Connections that did not provide any authentication data
   static constexpr const char* UNAUTHENTICATED = "unauthenticated";
 
-  // Assigned to Socket connections that provide any authentication data
+  // Assigned to Connections that provide any authentication data
   static constexpr const char* AUTHENTICATED = "authenticated";
 
   // Assigned to internal cluster nodes
@@ -74,7 +74,7 @@ class Principal {
  * Used mainly when parsing the configuration file and creating new
  * PrincipalParsers.
  * Note: When updating the configuration file while the cluster is running,
- *       changes to authenticaiton_type and permission_checking_type will
+ *       changes to authentication_type and permission_checking_type will
  *       not take effect until the cluster is restarted.
  *
  * NONE                 This indicates that there is no authentication for the
@@ -120,7 +120,7 @@ enum class AuthenticationType {
  * Logdevice. Used mainly when parsing the configuration file and creating new
  * PermissionCheckers.
  * Note: When updating the configuration file while the cluster is running,
- *       changes to authenticaiton_type and permission_checking_type will
+ *       changes to authentication_type and permission_checking_type will
  *       not take effect until the cluster is restarted.
  *
  * NONE                 This indicates that there is no authorization for the

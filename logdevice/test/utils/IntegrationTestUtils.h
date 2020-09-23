@@ -28,12 +28,16 @@
 #include "logdevice/common/configuration/logs/LogsConfigTree.h"
 #include "logdevice/common/debug.h"
 #include "logdevice/common/event_log/EventLogRecord.h"
+#include "logdevice/common/replicated_state_machine/RsmVersionTypes.h"
+#include "logdevice/common/test/NodesConfigurationTestUtil.h"
 #include "logdevice/common/test/TestUtil.h"
 #include "logdevice/include/ClientSettings.h"
 #include "logdevice/include/LogsConfigTypes.h"
 #include "logdevice/include/types.h"
-#include "logdevice/ops/admin_command_client/AdminCommandClient.h"
+#include "logdevice/test/utils/AdminServer.h"
 #include "logdevice/test/utils/MetaDataProvisioner.h"
+#include "logdevice/test/utils/NodesConfigurationFileUpdater.h"
+#include "logdevice/test/utils/ParamMaps.h"
 #include "logdevice/test/utils/port_selection.h"
 
 namespace facebook { namespace logdevice {
@@ -69,6 +73,9 @@ namespace facebook { namespace logdevice {
  * LOGDEVICE_TEST_BINARY controls which binary to run as the server.  If not
  * set, _bin/logdevice/server/logdeviced is used.
  *
+ * LOGDEVICE_TEST_ADMIN_SERVER_BINARY controls which binary to run as the admin
+ * server.  If not set, _bin/logdevice/ops/admin_server/ld-admin-server is used.
+
  * LOGDEVICE_TEST_USE_TCP        use TCP ports instead of UNIX domain sockets
  *
  * LOGDEVICE_LOG_LEVEL           set the default log level used by tests
@@ -86,7 +93,10 @@ class Client;
 class EpochStore;
 class FileConfigSource;
 class ShardedLocalLogStore;
-class NodesConfigurationPublisher;
+
+namespace configuration { namespace nodes {
+class NodesConfigurationStore;
+}} // namespace configuration::nodes
 
 namespace test {
 struct ServerInfo;
@@ -100,33 +110,6 @@ namespace IntegrationTestUtils {
 class Cluster;
 class Node;
 
-// scope in which command line parameters that applies to different
-// types of nodes. Must be defined continuously.
-enum class ParamScope : uint8_t { ALL = 0, SEQUENCER = 1, STORAGE_NODE = 2 };
-
-using ParamValue = folly::Optional<std::string>;
-using ParamMap = std::unordered_map<std::string, ParamValue>;
-using ParamMaps = std::map<ParamScope, ParamMap>;
-
-class ParamSpec {
- public:
-  std::string key_;
-  folly::Optional<std::string> value_;
-  ParamScope scope_;
-
-  /* implicit */ ParamSpec(std::string key, ParamScope scope = ParamScope::ALL)
-      : key_(key), scope_(scope) {
-    ld_check(!key_.empty());
-  }
-
-  ParamSpec(std::string key,
-            std::string value,
-            ParamScope scope = ParamScope::ALL)
-      : ParamSpec(key, scope) {
-    value_ = value;
-  }
-};
-
 // used to specify the type of rockdb local logstore for storage
 // nodes in the cluster
 enum class RocksDBType : uint8_t { SINGLE, PARTITIONED };
@@ -138,10 +121,12 @@ enum class NodesConfigurationSourceOfTruth { NCM, SERVER_CONFIG };
  */
 class ClusterFactory {
  public:
+  ClusterFactory();
+
   /**
    * Creates a Cluster object, configured with logs 1 and 2.
    *
-   * Unless setNodes() is called (in which case nnodes must equal nodes.size()),
+   * Unless setNodes() is called (in which case nnodes is ignored),
    * Cluster will contain the specified number of nodes. If nnodes = 1, the one
    * node will act as both a sequencer and storage node.  Otherwise, there will
    * be one sequencer node and the rest will be storage nodes.
@@ -269,7 +254,7 @@ class ClusterFactory {
 
   /**
    * Sets that number of logs that needs to be created if LogsConfigManager is
-   * enabled. It's created by client API calls after after bootstraping the
+   * enabled. It's created by client API calls after after bootstrapping the
    * cluster. It's ignored when `defer_start_` is true.
    */
   ClusterFactory& setNumLogsConfigManagerLogs(int n) {
@@ -280,8 +265,8 @@ class ClusterFactory {
   /**
    * If called, create() will use specified node configs.
    */
-  ClusterFactory& setNodes(Configuration::Nodes nodes) {
-    node_configs_ = std::move(nodes);
+  ClusterFactory& setNodes(std::shared_ptr<const NodesConfiguration> nodes) {
+    nodes_config_ = std::move(nodes);
     return *this;
   }
 
@@ -311,24 +296,16 @@ class ClusterFactory {
    */
   ClusterFactory& setRocksDBType(RocksDBType db_type) {
     rocksdb_type_ = db_type;
+    setParam("--rocksdb-partitioned",
+             db_type == RocksDBType::PARTITIONED ? "true" : "false");
     return *this;
   }
 
   /**
-   * Sets the node that is designated to run
-   * maintenance manager
+   * Sets whether the standalone admin server will be running or not.
    */
-  ClusterFactory& runMaintenanceManagerOn(node_index_t n) {
-    maintenance_manager_node_ = n;
-
-    // Maintenance manager usually responds to events (like maintenance log
-    // deltas, event log deltas, nodes config updates) quickly, but sometimes,
-    // due to some race conditions, it seems to miss an event and goes to sleep
-    // for maintenance-manager-reevaluation-timeout. Decrease it so that tests
-    // don't time out.
-    // TODO (#54454518): Maybe make MaintenanceManager not do that.
-    setParam("--maintenance-manager-reevaluation-timeout", "5s");
-
+  ClusterFactory& useStandaloneAdminServer(bool enable) {
+    use_standalone_admin_server_ = enable;
     return *this;
   }
 
@@ -338,19 +315,6 @@ class ClusterFactory {
    */
   ClusterFactory& doPreProvisionEpochMetaData() {
     provision_epoch_metadata_ = true;
-    return *this;
-  }
-
-  /**
-   * If called, nodes configuration store won't be provisioned.
-   */
-  ClusterFactory& doNotPreProvisionNodesConfigurationStore() {
-    provision_nodes_configuration_store_ = false;
-    return *this;
-  }
-
-  ClusterFactory& doNotSyncServerConfigToNodesConfiguration() {
-    sync_server_config_to_nodes_configuration_ = false;
     return *this;
   }
 
@@ -369,30 +333,6 @@ class ClusterFactory {
    */
   ClusterFactory& doNotLetSequencersProvisionEpochMetaData() {
     let_sequencers_provision_metadata_ = false;
-    return *this;
-  }
-
-  /**
-   * By default, the cluster factory generates a single config file that is
-   * shared among all nodes. When this option is set, the factory will generate
-   * one config file per node in their own directory. They will initially be
-   * identical. but this allows testing with inconsistent configurations.
-   * In paritcular this option is required to simulate netwrok paritioning (see
-   * partition method below)
-   * Note: expand/shrink/replace and maybe some other functionalities are not
-   * compatible with this setting yet.
-   *
-   * TODO T52924503: currently oneConfigPerNode() is not compatible with
-   * NodesConfiguration with NCM source-of-truth. We will add test utilities to
-   * simulate config divergence in NCM.
-   */
-  ClusterFactory& oneConfigPerNode() {
-    one_config_per_node_ = true;
-
-    setNodesConfigurationSourceOfTruth(
-        NodesConfigurationSourceOfTruth::SERVER_CONFIG);
-    setParam("--enable-config-synchronization", "false");
-
     return *this;
   }
 
@@ -480,14 +420,41 @@ class ClusterFactory {
    */
   ClusterFactory& setParam(std::string key,
                            ParamScope scope = ParamScope::ALL) {
-    return setParam(ParamSpec{key, scope});
+    return setParam(ParamSpec{key, "true", scope});
   }
 
   /**
    * Same as setParam(key, value, scope) or setParam(key, scope) as appropriate.
    */
   ClusterFactory& setParam(ParamSpec spec) {
-    cmd_param_[spec.scope_][spec.key_] = spec.value_;
+    // If the scope is ParamScope::ALL, we can safely add this to the server
+    // config instead of command line args.
+    // TODO: Codemod all the usages of ParamScope::ALL to use setServerSettings
+    // directly.
+    if (spec.scope_ == ParamScope::ALL) {
+      // Trim the "--" prefix from the command line arg name.
+      auto& key = spec.key_;
+      ld_check(key.substr(0, 2) == "--");
+      setServerSetting(spec.key_.substr(2), spec.value_);
+    } else {
+      cmd_param_[spec.scope_][spec.key_] = spec.value_;
+    }
+    return *this;
+  }
+
+  /**
+   * Sets a config setting for logdeviced processes.
+   */
+  ClusterFactory& setServerSetting(std::string key, std::string value) {
+    server_settings_[std::move(key)] = std::move(value);
+    return *this;
+  }
+
+  /**
+   * Sets a config setting for clients
+   */
+  ClusterFactory& setClientSetting(std::string key, std::string value) {
+    client_settings_[std::move(key)] = std::move(value);
     return *this;
   }
 
@@ -506,7 +473,8 @@ class ClusterFactory {
    */
   ClusterFactory&
   useHashBasedSequencerAssignment(uint32_t gossip_interval_ms = 100,
-                                  std::string suspect_duration = "0ms") {
+                                  std::string suspect_duration = "0ms",
+                                  bool use_health_based_hashing = false) {
     setParam("--gossip-enabled", ParamScope::ALL);
     setParam("--gossip-interval",
              std::to_string(gossip_interval_ms) + "ms",
@@ -515,6 +483,43 @@ class ClusterFactory {
     // lazy sequencer bringup
     setParam("--sequencers", "lazy", ParamScope::SEQUENCER);
     hash_based_sequencer_assignment_ = true;
+    if (!use_health_based_hashing) {
+      setParam("--enable-health-based-sequencer-placement",
+               "false",
+               ParamScope::ALL);
+    }
+    return *this;
+  }
+
+  // Modify default HM parameters to avoid false positive detection of stalls or
+  // unhealthy states. In many tests gossip interval is modified to be more
+  // frequent causing delays in HM activation that is then detected and an
+  // unhealthy status of tha node is propagated. Modifying the maximum tolerated
+  // stalled percentages is due to the number of workers on each node being
+  // reduced to a very small number (5).
+  // Health based sequencer hashing is disabled by calling
+  // useHashBasedSequencerAssignment, but in HM related tests its behaviour is
+  // often needed, so this method handles toggling this setting too.
+  ClusterFactory& setHealthMonitorParameters(
+      uint32_t health_monitor_max_delay_ms = 240000,
+      uint32_t watchdog_poll_interval = 50000,
+      double worker_stall_percentage = 1.1,
+      double queue_stall_percentage = 1.1,
+      bool enable_health_based_sequencer_placement = true) {
+    setParam("--health-monitor-max-delay",
+             std::to_string(health_monitor_max_delay_ms) + "ms",
+             ParamScope::ALL);
+    setParam("--watchdog-poll-interval",
+             std::to_string(watchdog_poll_interval) + "ms");
+    setParam("--health-monitor-max-stalled-worker-percentage",
+             std::to_string(worker_stall_percentage),
+             ParamScope::ALL);
+    setParam("--health-monitor-max-overloaded-worker-percentage",
+             std::to_string(queue_stall_percentage),
+             ParamScope::ALL);
+    setParam("--enable-health-based-sequencer-placement",
+             std::to_string(enable_health_based_sequencer_placement),
+             ParamScope::ALL);
     return *this;
   }
 
@@ -557,6 +562,15 @@ class ClusterFactory {
   }
 
   /**
+   * Sets the path to the admin server binary (relative to the build root) to
+   * use if a custom one is needed.
+   */
+  ClusterFactory& setAdminServerBinary(std::string path) {
+    admin_server_binary_ = path;
+    return *this;
+  }
+
+  /**
    * By default, the cluster will use a traffic shaping configuration which is
    * designed for coverage of the traffic shaping logic in tests, but limits
    * throughput.  This method allows traffic shaping to be turned off in cases
@@ -577,15 +591,6 @@ class ClusterFactory {
    */
   ClusterFactory& setLogLevel(dbg::Level log_level) {
     default_log_level_ = log_level;
-    return *this;
-  }
-
-  /**
-   * Write logs config to a file separately and include this file from the main
-   * config file
-   */
-  ClusterFactory& writeLogsConfigFileSeparately() {
-    write_logs_config_file_separately_ = true;
     return *this;
   }
 
@@ -613,14 +618,15 @@ class ClusterFactory {
 
  private:
   folly::Optional<logsconfig::LogAttributes> log_attributes_;
-  folly::Optional<Configuration::Nodes> node_configs_;
+  std::shared_ptr<const NodesConfiguration> nodes_config_;
   folly::Optional<Configuration::MetaDataLogsConfig> meta_config_;
   bool enable_logsconfig_manager_ = false;
-  bool one_config_per_node_{false};
 
   configuration::InternalLogs internal_logs_;
 
   ParamMaps cmd_param_;
+  ServerConfig::SettingsConfig server_settings_;
+  ServerConfig::SettingsConfig client_settings_;
 
   // If set to true, allocate tcp ports to be used by the tests for the nodes'
   // protocol and command ports instead of unix domain sockets.
@@ -638,9 +644,6 @@ class ClusterFactory {
   // Provision the inital epoch metadata in epoch store and storage nodes
   // that store metadata
   bool provision_epoch_metadata_ = false;
-
-  // Provision the inital nodes configuration store
-  bool provision_nodes_configuration_store_ = true;
 
   // Controls whether the cluster should also update the NodesConfiguration
   // whenver the ServerConfig change. This is there only during the migration
@@ -689,8 +692,8 @@ class ClusterFactory {
   // if unset, use a random choice between the two sources
   folly::Optional<NodesConfigurationSourceOfTruth> nodes_configuration_sot_;
 
-  // The node designated to run a instance of MaintenanceManager
-  node_index_t maintenance_manager_node_ = -1;
+  // Whether to start the standalone admin server or not.
+  bool use_standalone_admin_server_ = false;
 
   // Type of rocksdb local log store
   RocksDBType rocksdb_type_ = RocksDBType::PARTITIONED;
@@ -701,6 +704,9 @@ class ClusterFactory {
   // Server binary if setServerBinary() was called
   folly::Optional<std::string> server_binary_;
 
+  // Server binary if setAdminServerBinary() was called
+  folly::Optional<std::string> admin_server_binary_;
+
   std::string cluster_name_ = "integration_test";
 
   std::string log_group_name_ = "/ns/test_logs";
@@ -709,21 +715,30 @@ class ClusterFactory {
   dbg::Level default_log_level_ =
       getLogLevelFromEnv().value_or(dbg::Level::INFO);
 
-  // See writeLogsConfigFileSeparately()
-  bool write_logs_config_file_separately_{false};
-
   // Helper method, one attempt in create(), repeated up to outer_tries_ times
   std::unique_ptr<Cluster> createOneTry(const Configuration& config);
 
   static logsconfig::LogAttributes createLogAttributesStub(int nstorage_nodes);
 
-  // Figures out the full path to the server binary, considering in order of
-  // precedence:
-  //
-  // - the environment variable LOGDEVICED_TEST_BINARY,
-  // - setServerBinary() override
-  // - a default path
+  /**
+   * Figures out the full path to the server binary, considering in order of
+   * precedence:
+   *
+   * - the environment variable LOGDEVICE_TEST_BINARY,
+   * - setServerBinary() override
+   * - a default path
+   */
   std::string actualServerBinary() const;
+
+  /**
+   * Figures out the full path to the server binary, considering in order of
+   * precedence:
+   *
+   * - the environment variable LOGDEVICE_ADMIN_SERVER_BINARY,
+   * - setAdminServerBinary() override
+   * - a default path
+   */
+  std::string actualAdminServerBinary() const;
 
   // Set the attributes of an internal log.
   void setInternalLogAttributes(const std::string& name,
@@ -736,52 +751,80 @@ class ClusterFactory {
    */
   std::unique_ptr<client::LogGroup>
   createLogsConfigManagerLogs(std::unique_ptr<Cluster>& cluster);
+
+  void populateDefaultServerSettings();
+
+  std::shared_ptr<const NodesConfiguration>
+  provisionNodesConfiguration(int nnodes) const;
 };
 
-struct SockaddrPair {
-  Sockaddr protocol_addr_;
-  Sockaddr command_addr_;
-  Sockaddr gossip_addr_;
-  Sockaddr admin_addr_;
-  // If one of protocol_addr_ or command_addr_ contains a TCP port, we own a
-  // detail::PortOwner object for it that keeps a socket bound to it.
-  detail::PortOwnerPtrTuple tcp_ports_owned_;
+// All ports logdeviced can listen on.
+struct ServerAddresses {
+  static constexpr size_t COUNT = 11;
 
-  static SockaddrPair fromTcpPortPair(detail::PortOwnerPtrTuple tuple) {
-    SockaddrPair addrs;
-    addrs.protocol_addr_ =
-        Sockaddr(get_localhost_address_str(), std::get<0>(tuple)->port);
-    addrs.command_addr_ =
-        Sockaddr(get_localhost_address_str(), std::get<1>(tuple)->port);
-    addrs.admin_addr_ =
-        Sockaddr(get_localhost_address_str(), std::get<2>(tuple)->port);
-    addrs.tcp_ports_owned_ = std::move(tuple);
-    return addrs;
+  Sockaddr protocol;
+  Sockaddr gossip;
+  Sockaddr admin;
+  Sockaddr server_to_server;
+  Sockaddr protocol_ssl;
+  Sockaddr server_thrift_api;
+  Sockaddr client_thrift_api;
+  Sockaddr data_low_priority;
+  Sockaddr data_medium_priority;
+
+  // If we're holding open sockets on the above ports, this list contains the
+  // fd-s of these sockets. This list is cleared (and sockets closed) just
+  // before starting the server process.
+  std::vector<detail::PortOwner> owners;
+
+  void toNodeConfig(configuration::nodes::NodeServiceDiscovery& node,
+                    bool ssl) {
+    using Priority =
+        configuration::nodes::NodeServiceDiscovery::ClientNetworkPriority;
+    node.default_client_data_address = protocol;
+    node.gossip_address = gossip;
+    if (ssl) {
+      node.ssl_address.assign(protocol_ssl);
+    }
+    node.admin_address.assign(admin);
+    node.server_to_server_address.assign(server_to_server);
+    node.server_thrift_api_address.assign(server_thrift_api);
+    node.client_thrift_api_address.assign(client_thrift_api);
+    node.addresses_per_priority = {{Priority::LOW, data_low_priority},
+                                   {Priority::MEDIUM, data_medium_priority}};
   }
 
-  static void buildGossipTcpSocket(SockaddrPair& addr, int port) {
-    addr.gossip_addr_ = Sockaddr(get_localhost_address_str(), port);
+  static ServerAddresses withTCPPorts(std::vector<detail::PortOwner> ports) {
+    std::string addr = get_localhost_address_str();
+    ServerAddresses r;
+
+    r.protocol = Sockaddr(addr, ports[0].port);
+    r.gossip = Sockaddr(addr, ports[2].port);
+    r.admin = Sockaddr(addr, ports[3].port);
+    r.protocol_ssl = Sockaddr(addr, ports[4].port);
+    r.server_to_server = Sockaddr(addr, ports[6].port);
+    r.server_thrift_api = Sockaddr(addr, ports[7].port);
+    r.client_thrift_api = Sockaddr(addr, ports[8].port);
+    r.data_low_priority = Sockaddr(addr, ports[9].port);
+    r.data_medium_priority = Sockaddr(addr, ports[10].port);
+
+    r.owners = std::move(ports);
+
+    return r;
   }
 
-  static SockaddrPair buildGossipSocket(const std::string& path) {
-    SockaddrPair addrs;
-    addrs.gossip_addr_ = Sockaddr(path + "/" + "socket_gossip");
-    return addrs;
-  }
-
-  static SockaddrPair buildUnixSocketPair(const std::string& path, bool ssl) {
-    SockaddrPair addrs;
-    std::string ssl_prefix = (ssl ? "ssl_" : "");
-    addrs.protocol_addr_ =
-        Sockaddr(folly::format("{}/{}socket_main", path, ssl_prefix).str());
-    // Gossip currently never uses SSL
-    addrs.gossip_addr_ =
-        Sockaddr(folly::format("{}/socket_gossip", path).str());
-    addrs.command_addr_ =
-        Sockaddr(folly::format("{}/{}socket_command", path, ssl_prefix).str());
-    addrs.admin_addr_ =
-        Sockaddr(folly::format("{}/{}socket_admin", path, ssl_prefix).str());
-    return addrs;
+  static ServerAddresses withUnixSockets(const std::string& path) {
+    ServerAddresses r;
+    r.protocol = Sockaddr(path + "/socket_main");
+    r.gossip = Sockaddr(path + "/socket_gossip");
+    r.admin = Sockaddr(path + "/socket_admin");
+    r.server_to_server = Sockaddr(path + "/socket_server_to_server");
+    r.protocol_ssl = Sockaddr(path + "/ssl_socket_main");
+    r.server_thrift_api = Sockaddr(path + "/server_thrift_api");
+    r.client_thrift_api = Sockaddr(path + "/client_thrift_api");
+    r.data_low_priority = Sockaddr(path + "/socket_data_low_pri");
+    r.data_medium_priority = Sockaddr(path + "/socket_data_medium_pri");
+    return r;
   }
 };
 
@@ -814,20 +857,22 @@ class Cluster {
    * Expand the cluster by adding nodes with the given indices.
    * @return 0 on success, -1 on error.
    */
-  int expand(std::vector<node_index_t> new_indices,
-             bool start = true,
-             bool bump_config_version = true);
+  int expand(std::vector<node_index_t> new_indices, bool start = true);
 
   /**
    * Expand the cluster by adding `nnodes` with consecutive indices after the
    * highest existing one.
    * @return 0 on success, -1 on error.
    */
-  int expand(int nnodes, bool start = true, bool bump_config_version = true);
+  int expand(int nnodes, bool start = true);
 
   /**
    * Shrink the cluster by removing the given nodes.
    * @return 0 on success, -1 on error.
+   *
+   * Note that this doesn't do rebuilding. If shrink out nodes that have
+   * some records (including metadata/internal logs), you'll likely see data
+   * loss or underreplication.
    */
   int shrink(std::vector<node_index_t> indices);
 
@@ -837,7 +882,7 @@ class Cluster {
    */
   int shrink(int nnodes);
 
-  std::shared_ptr<UpdateableConfig> getConfig() {
+  std::shared_ptr<UpdateableConfig> getConfig() const {
     return config_;
   }
 
@@ -850,31 +895,35 @@ class Cluster {
   }
 
   /**
-   * Like ClientFactory::create(), but:
-   *  - tweaks some client settings to be more appropriate for tests,
-   *  - the created client taps into the UpdateableConfig instance owned by
-   *    this Cluster object. This speeds up client creation.
-   * Creating a client can take a few seconds, so reuse them when possible.
+   * This creates a client by calling ClientFactory::create() that does not
+   * share the loaded config_.
+   *
+   * If use_file_based_ncs is set to true, the client will use
+   * FileBasedNodesConfigurationStore to fetch and update the
+   * NodesConfiguration instead of the server based one. Use this *only* if you
+   * want to create a client without estabilishing any connection to the nodes
+   * to fetch the Nodes Config (e.g. when all the nodes are dead).
    */
   std::shared_ptr<Client>
   createClient(std::chrono::milliseconds timeout = getDefaultTestTimeout(),
                std::unique_ptr<ClientSettings> settings =
                    std::unique_ptr<ClientSettings>(),
-               std::string credentials = "");
-
-  /**
-   * This creates a client by calling ClientFactory::create() that does not
-   * share the loaded config_. This function should be removed and instead we
-   * should update createClient to do the same. t18313631 tracks this and
-   * explains the reasons behind this.
-   */
-  std::shared_ptr<Client> createIndependentClient(
-      std::chrono::milliseconds timeout = getDefaultTestTimeout(),
-      std::unique_ptr<ClientSettings> settings =
-          std::unique_ptr<ClientSettings>()) const;
+               std::string credentials = "",
+               bool use_file_based_ncs = false);
 
   const Nodes& getNodes() const {
     return nodes_;
+  }
+
+  // Creates a thrift client for the standalone admin server if enabled. Returns
+  // nullptr if not.
+  std::unique_ptr<thrift::AdminAPIAsyncClient> createAdminClient() const;
+
+  /**
+   * Returns the admin server instance if started.
+   */
+  AdminServer* FOLLY_NULLABLE getAdminServer() {
+    return admin_server_.get();
   }
 
   Node& getNode(node_index_t index) {
@@ -884,9 +933,13 @@ class Cluster {
   }
 
   Node& getSequencerNode() {
+    ld_check(!hash_based_sequencer_assignment_);
     // For now, the first node is always the sequencer
     return getNode(0);
   }
+
+  // Returns the list of non-stopped storage nodes.
+  std::vector<node_index_t> getRunningStorageNodes() const;
 
   // When using hash-based sequencer assignment, the above is not sufficient.
   // Hash-based sequencer assignment is necessary to have failover.
@@ -965,13 +1018,12 @@ class Cluster {
                                          bool allow_existing_metadata = true);
 
   /**
-   * Converts the server config into a nodes configuration and writes it to
-   * disk via a FileBasedNodesConfigurationStore.
-   * @param server_config                  the server config to convert
+   * Updates the NC on disk via FileBasedNodesConfigurationStore.
+   * @param nodes_config                  the NC to write
    * @return          0 for success, -1 for failure
    */
-  int updateNodesConfigurationFromServerConfig(
-      const ServerConfig* server_config);
+  int updateNodesConfiguration(
+      const configuration::nodes::NodesConfiguration& nodes_config);
 
   /**
    * Replaces the node at the specified index.  Kills the current process if
@@ -996,6 +1048,72 @@ class Cluster {
       int sequencer_weight,
       folly::Optional<bool> enable_sequencing = folly::none);
 
+  // A guide to the few wait*() methods below:
+  //  - When using static sequencer placement (default),
+  //    waitUntilAllSequencersQuiescent() guarantees that subsequent appends
+  //    won't fail without a good reason and that sequencers won't reactivate
+  //    without a good reason.
+  //  - When using hash-based sequencer placement
+  //    (useHashBasedSequencerAssignment()),
+  //    waitUntilAllStartedAndPropagatedInGossip() guarantees that subsequent
+  //    appends won't fail to activate sequencer without a good reason.
+  //    If you want to wait for the newly activated sequencer to finish
+  //    recovery, metadata log write, unnecessary reactivation, etc, then you
+  //    can also call waitUntilAllSequencersQuiescent() after the append that
+  //    activated the sequencer.
+  //  - waitForConfigUpdate() is for after you updated the config file
+  //    (e.g. using writeConfig()).
+  //  - Most of the other wait methods are either obsolete or only useful for
+  //    particular test cases that want something very specific.
+  //    Many call sites are using them inappropriately (e.g. waitForRecovery()
+  //    instead of waitUntilAllSequencersQuiescent(), or waitUntilAllAvailable()
+  //    instead of waitUntilAllStartedAndPropagatedInGossip()); feel free to fix
+  //    those when they make tests flaky; I didn't dare mass-replace them.
+
+  /**
+   * Wait for all nodes to complete all sequencer activation-related activity:
+   * activation, recoveries, metadata log writes, metadata log recoveries,
+   * reactivations caused by metadata log writes, nodeset updates caused by
+   * config changes, etc. If you're not making any changes to the cluster
+   * (starting/stopping nodes, updating config/settings, etc), after this call
+   * sequencers are not going to reactivate, get stuck in recovery (even if
+   * there's no f-majority of available nodes), or do other unexpected things.
+   * You'll get consecutive LSNs for appends.
+   *
+   * Note that this only applies to sequencers that have already at least
+   * started activation as of the time of this call. If static sequencer
+   * placement is used (i.e. useHashBasedSequencerAssignment() wasn't called),
+   * that's all sequencers; otherwise, that's typically only sequencers for the
+   * logs that received at least one append. Also note that, even though appends
+   * done after this call should all go to the same epoch and get consecutive
+   * LSNs, this may be a higher epoch than for appends done before the call.
+   */
+  int waitUntilAllSequencersQuiescent(
+      std::chrono::steady_clock::time_point deadline =
+          std::chrono::steady_clock::time_point::max());
+
+  /**
+   * Wait until the given nodes see each other and themselves as alive and
+   * started in gossip, and see everyone else as dead.
+   * For a freshly started cluster, until this wait is done, appends may fail
+   * with E::ISOLATED if sequencer node happens to see itself as alive but
+   * others as dead.
+   *
+   * @param nodes  The set of nodes that should be alive. If folly::none, all
+   *               running nodes (i.e. with Node::stopped_ == false).
+   */
+  int waitUntilAllStartedAndPropagatedInGossip(
+      folly::Optional<std::set<node_index_t>> nodes = folly::none,
+      std::chrono::steady_clock::time_point deadline =
+          std::chrono::steady_clock::time_point::max());
+
+  /**
+   * Waits until all live nodes and clients have processed the
+   * NodesConfiguration with at least the version passed.
+   */
+  void waitForServersAndClientsToProcessNodesConfiguration(
+      membership::MembershipVersion::Type version);
+
   /**
    * Waits until all live nodes have a view of the config same as getConfig().
    * This doesn't guarantees much about server behavior because the
@@ -1010,6 +1128,13 @@ class Cluster {
   /**
    * Wait for all sequencer nodes in the cluster to finish log recovery.
    * Caller needs to ensure recovery should happen on sequencer nodes.
+   *
+   * Warning: currently the implementation is not fully correct and, when using
+   * hash-based sequencer placement, may incorrectly get stuck in rare cases
+   * if sequencers preempt each other in a somewhat unusual sequence. To avoid
+   * flakiness, prefer either waitUntilAllSequencersQuiescent()
+   * or waiting for recovery of a specific log on a specific node.
+   *
    * @return 0 if recovery is completed, -1 if the call timed out.
    */
   int waitForRecovery(std::chrono::steady_clock::time_point deadline =
@@ -1018,6 +1143,9 @@ class Cluster {
   // Waits until all nodes are available through gossip (ALIVE)
   int waitUntilAllAvailable(std::chrono::steady_clock::time_point deadline =
                                 std::chrono::steady_clock::time_point::max());
+  // Waits until all nodes are healthy through gossip (HEALTHY)
+  int waitUntilAllHealthy(std::chrono::steady_clock::time_point deadline =
+                              std::chrono::steady_clock::time_point::max());
 
   /**
    * Wait for all sequencer nodes in the cluster to write metadata log records
@@ -1043,14 +1171,29 @@ class Cluster {
                           std::chrono::steady_clock::time_point::max());
 
   /**
-   * Waits until nodes specified in the parameter `nodes` are alive and fully
-   * started (i.e. not in starting state). If `nodes` is folly::none,
-   * all nodes in the cluster will be checked.
+   * Wait for all nodes in the cluster except the ones specified in the skip
+   * list to see the specified node in a certain health status (depending on
+   * what is submitted as the `health_status` arg
    */
-  int waitUntilStartupComplete(
+
+  int waitUntilGossipStatus(
+      uint8_t health_status, /* set to 3 for waiting for unhealthy */
+      uint64_t targetNode,
+      std::set<uint64_t> nodesToSkip = {},
+      std::chrono::steady_clock::time_point deadline =
+          std::chrono::steady_clock::time_point::max());
+
+  /**
+   * Waits until nodes specified in the parameter `nodes` are alive and fully
+   * started (i.e. not in starting state) according to gossip. If `nodes` is
+   * folly::none, all nodes in the cluster will be checked.
+   */
+  int waitUntilNoOneIsInStartupState(
       folly::Optional<std::set<uint64_t>> nodes = folly::none,
       std::chrono::steady_clock::time_point deadline =
           std::chrono::steady_clock::time_point::max());
+
+  int waitUntilAllClientsPickedConfig(const std::string& serialized_config);
 
   /**
    * Same as ClusterFactory::setParam(). Only affects future logdeviced
@@ -1074,6 +1217,10 @@ class Cluster {
     ld_check(!key.empty());
     cmd_param_[scope].erase(key);
   }
+
+  // Returns true if gossip is enabled in the ALL scope.
+  // This assumes that the default for the --gossip-enabled flag is true.
+  bool isGossipEnabled() const;
 
   /**
    * Check that all the data in the cluster is correctly replicated.
@@ -1136,6 +1283,21 @@ class Cluster {
   void partition(std::vector<std::set<int>> partitions);
 
   /**
+   * Requires maintenance manager to be enabled.
+   * This will create an internal maintenance to drain a shard. The created
+   * maintenance will be applied via writing directly to the internal
+   * maintenance log. This might change in the future so the caller should not
+   * rely on this implementation detail.
+   *
+   * @return true if the operation succeeded. On
+   *              `false` the value of `err` is set accordingly.
+   */
+  bool applyInternalMaintenance(Client& client,
+                                node_index_t maintenance_leader,
+                                node_index_t node_id,
+                                uint32_t shard_idx,
+                                const std::string& reason);
+  /**
    * Gracefully shut down the given nodes. Faster than calling shutdown() on
    * them one by one.
    * @return 0 if all processes returned zero exit status, -1 otherwise.
@@ -1188,28 +1350,51 @@ class Cluster {
   // require @param node must exist in the cluster
   bool hasStorageRole(node_index_t node) const;
 
+  // Send admin command `set` to all nodes.
+  void updateSetting(const std::string& name, const std::string& value);
+  void unsetSetting(const std::string& name);
+
+  // Build a NodesConfigurationStore to modify the NodesConfiguration directly.
+  std::unique_ptr<configuration::nodes::NodesConfigurationStore>
+  buildNodesConfigurationStore() const;
+
+  // Reads the nodes configuration from the cluster's NodesConfigurationStore.
+  std::shared_ptr<const NodesConfiguration>
+  readNodesConfigurationFromStore() const;
+
+  // Create a self registering node with a given name. Does not start the
+  // process.
+  std::unique_ptr<Node>
+  createSelfRegisteringNode(const std::string& name) const;
+
  private:
   // Private constructor.  Factory (friend class) is only caller.
   Cluster(std::string root_path,
-          std::unique_ptr<folly::test::TemporaryDirectory> root_pin,
+          std::unique_ptr<TemporaryDirectory> root_pin,
           std::string config_path,
           std::string epoch_store_path,
           std::string ncs_path,
           std::string server_binary,
+          std::string admin_server_binary,
           std::string cluster_name,
           bool enable_logsconfig_manager,
-          bool one_config_per_node,
           dbg::Level default_log_level,
-          bool write_logs_config_file_separately,
-          bool sync_server_config_to_nodes_configuration,
           NodesConfigurationSourceOfTruth nodes_configuration_sot);
 
   // Directory where to store the data for a node (logs, db, sockets).
   static std::string getNodeDataPath(const std::string& root,
                                      node_index_t index,
                                      int replacement_counter) {
-    return root + "/N" + std::to_string(index) + ':' +
-        std::to_string(replacement_counter);
+    return getNodeDataPath(root,
+                           "N" + std::to_string(index) + ':' +
+                               std::to_string(replacement_counter));
+  }
+
+  // Directory where to store the data for a node (logs, db, sockets) given the
+  // directory name of the node.
+  static std::string getNodeDataPath(const std::string& root,
+                                     const std::string& name) {
+    return root + "/" + name;
   }
 
   std::string getNodeDataPath(const std::string& root,
@@ -1217,19 +1402,32 @@ class Cluster {
     return getNodeDataPath(root, index, getNodeReplacementCounter(index));
   }
 
+  // Forms Sockaddr-s for the node. If use_tcp is true, picks and reserves
+  // the ports. Otherwise forms paths for unix fomain sockets.
+  static int pickAddressesForServers(
+      const std::vector<node_index_t>& indices,
+      bool use_tcp,
+      const std::string& root_path,
+      const std::map<node_index_t, node_gen_t>& node_replacement_counters,
+      std::vector<ServerAddresses>& out);
+
   // Creates a Node instance for the specified config entry and starts the
   // process.  Does not wait for process to start; call
   // node->waitUntilStarted() for that.
   std::unique_ptr<Node> createNode(node_index_t index,
-                                   SockaddrPair addrs,
-                                   SockaddrPair ssl_addrs) const;
+                                   ServerAddresses addrs) const;
   // Helper for createNode().  Figures out the initial command line args for the
   // specified node
-  ParamMap commandArgsForNode(node_index_t index, const Node& node) const;
+  ParamMap commandArgsForNode(const Node& node) const;
 
-  // Helper for createClient() and createIndependentClient() to populate client
+  // Creates an admin server instance for this cluster. This does not wait for
+  // the process to start.
+  std::unique_ptr<AdminServer> createAdminServer();
+
+  // Helper for createClient() to populate client
   // settings.
-  void populateClientSettings(std::unique_ptr<ClientSettings>& settings) const;
+  void populateClientSettings(std::unique_ptr<ClientSettings>& settings,
+                              bool use_file_based_ncs) const;
 
   // We keep track whether the cluster was created using tcp ports or unix
   // domain sockets so that we can use the same method for new nodes created by
@@ -1241,24 +1439,26 @@ class Cluster {
 
   std::string root_path_;
   // If root_path_ is a temporary directory, this owns it
-  std::unique_ptr<folly::test::TemporaryDirectory> root_pin_;
+  std::unique_ptr<TemporaryDirectory> root_pin_;
   std::string config_path_;
   std::string epoch_store_path_;
   // path for the file-based nodes configuration store
   std::string ncs_path_;
   std::string server_binary_;
+  std::string admin_server_binary_;
   std::string cluster_name_;
   bool enable_logsconfig_manager_ = false;
   const NodesConfigurationSourceOfTruth nodes_configuration_sot_;
 
-  bool one_config_per_node_ = false;
   std::shared_ptr<UpdateableConfig> config_;
-  std::unique_ptr<NodesConfigurationPublisher> nodes_configuration_publisher_;
   FileConfigSource* config_source_;
   std::unique_ptr<ClientSettings> client_settings_;
+  std::unique_ptr<NodesConfigurationFileUpdater> nodes_configuration_updater_;
+
   // ordered map for convenience
   Nodes nodes_;
-
+  // The admin server object if standalone admin server is enabled.
+  std::unique_ptr<AdminServer> admin_server_;
   // keep track of node replacement events. for nodes with storage role, the
   // counter should be in sync with the `generation' in its config. For nodes
   // without storage role, counter is only used for tracking/directory keeping
@@ -1273,15 +1473,10 @@ class Cluster {
   // type of rocksdb local log store
   RocksDBType rocksdb_type_ = RocksDBType::PARTITIONED;
 
-  // The node designated to run a instance of MaintenanceManager
-  node_index_t maintenance_manager_node_ = -1;
-
   // See ClusterFactory::hash_based_sequencer_assignment_
   bool hash_based_sequencer_assignment_{false};
 
   dbg::Level default_log_level_ = dbg::Level::INFO;
-
-  bool write_logs_config_file_separately_{false};
 
   // Controls whether the cluster should also update the NodesConfiguration
   // whenver the ServerConfig change. This is there only during the migration
@@ -1293,7 +1488,8 @@ class Cluster {
   // keep handles around until the cluster is destroyed.
   std::vector<UpdateableServerConfig::HookHandle> server_config_hook_handles_;
 
-  std::shared_ptr<AdminCommandClient> admin_command_client_;
+  // A vector of all the clients that are created for this cluster.
+  std::vector<std::weak_ptr<Client>> created_clients_;
 
   friend class ClusterFactory;
 };
@@ -1307,24 +1503,25 @@ class Node {
   std::string data_path_;
   std::string config_path_;
   std::string server_binary_;
+  std::string name_;
   node_index_t node_index_;
-  SockaddrPair addrs_; // Pair of Sockaddr to use for the protocol socket
-  // and command socket.
-  SockaddrPair ssl_addrs_; // Pair of Sockaddr to use for the protocol socket
-  // and command socket in SSL.
+  ServerAddresses addrs_;
   int num_db_shards_ = 4; // how many shards storage nodes will use
   // Random ID generated by constructor.  Passed on the command line to the
   // server.  waitUntilStarted() looks for this to verify that we are talking
   // to the right process.
   std::string server_id_;
-  // Stopped until start() is called, as well as between suspend() and resume()
+  // Stopped until start() is called, as well as between suspend() and resume(),
+  // or shutdown() and start().
   bool stopped_ = true;
+  bool gossip_enabled_ = true;
   // type of rocksdb local log store
   RocksDBType rocksdb_type_ = RocksDBType::PARTITIONED;
   // override cluster params for this particular node
   ParamMap cmd_args_;
 
-  std::shared_ptr<AdminCommandClient> admin_command_client_;
+  bool is_storage_node_ = true;
+  bool is_sequencer_node_ = true;
 
   Node();
   ~Node() {
@@ -1354,12 +1551,12 @@ class Node {
     return data_path_ + "/db";
   }
 
-  std::string getLogPath() const {
-    return data_path_ + "/log";
+  std::string getShardPath(shard_index_t idx) const {
+    return getDatabasePath() + "/shard" + std::to_string(idx);
   }
 
-  Sockaddr getCommandSockAddr() const {
-    return addrs_.command_addr_;
+  std::string getLogPath() const {
+    return data_path_ + "/log";
   }
 
   void signal(int sig) {
@@ -1410,7 +1607,7 @@ class Node {
   int shutdown();
 
   // Creates a thrift client for admin server running on this node.
-  std::unique_ptr<thrift::AdminAPIAsyncClient> createAdminClient();
+  std::unique_ptr<thrift::AdminAPIAsyncClient> createAdminClient() const;
 
   /**
    * Waits until the admin API is able to answer requests that need the event
@@ -1421,11 +1618,6 @@ class Node {
    * --disable-rebuilding=false
    */
   int waitUntilNodeStateReady();
-  /**
-   * Waits until the ClusterMaintenanceStateMachine is fully loaded on that
-   * machine.
-   */
-  int waitUntilMaintenanceRSMReady();
 
   /**
    * Waits for the server to start accepting connections.
@@ -1444,6 +1636,9 @@ class Node {
 
   void waitUntilKnownDead(node_index_t other_node_index);
 
+  int waitUntilHealthy(std::chrono::steady_clock::time_point deadline =
+                           std::chrono::steady_clock::time_point::max());
+
   /**
    * Waits for the server using a gossip-based failure detector to mark another
    * node as alive (if `alive` is set to `true`) or dead.
@@ -1457,12 +1652,31 @@ class Node {
           std::chrono::steady_clock::time_point::max());
 
   /**
+   * Waits for the server using a gossip-based failure detector to mark another
+   * node as having a certain health status.
+   *
+   * @return 0 if succeeded, -1 if timed out while waiting
+   */
+  int waitUntilKnownGossipStatus(
+      node_index_t other_node_index,
+      uint8_t health_status,
+      std::chrono::steady_clock::time_point deadline =
+          std::chrono::steady_clock::time_point::max());
+
+  /**
    * Waits for the node to activate a sequencer for this log and finish
    * recovery.
    */
   int waitForRecovery(logid_t log,
                       std::chrono::steady_clock::time_point deadline =
                           std::chrono::steady_clock::time_point::max());
+
+  /**
+   * See Cluster::waitUntilAllSequencersQuiescent().
+   */
+  int waitUntilAllSequencersQuiescent(
+      std::chrono::steady_clock::time_point deadline =
+          std::chrono::steady_clock::time_point::max());
 
   /**
    * Waits for the node to advance its LCE of @param log to be at least
@@ -1523,10 +1737,8 @@ class Node {
 
   /**
    * Sends admin command `command' to command port and returns the result.
-   * Connect through SSL if requested.
    */
   std::string sendCommand(const std::string& command,
-                          bool ssl = false,
                           std::chrono::milliseconds command_timeout =
                               std::chrono::milliseconds(30000)) const;
 
@@ -1537,7 +1749,7 @@ class Node {
    * json nor error message, crashes.
    */
   std::vector<std::map<std::string, std::string>>
-  sendJsonCommand(const std::string& command, bool ssl = false) const;
+  sendJsonCommand(const std::string& command) const;
 
   /**
    * Returns the admin API address for this node
@@ -1545,21 +1757,11 @@ class Node {
   folly::SocketAddress getAdminAddress() const;
 
   /**
-   * Sends the provided admin command via the address of the interface with the
-   * given name, and returns the result.
-   */
-  std::string sendIfaceCommand(const std::string& command,
-                               const std::string ifname) const;
-
-  /**
-   * Finds and returns the address of the given interface on the node.
-   */
-  std::string getIfaceAddr(const std::string ifname) const;
-
-  /**
    * Connects to the admin ports and returns the running server information
    */
-  folly::Optional<test::ServerInfo> getServerInfo() const;
+  folly::Optional<test::ServerInfo>
+  getServerInfo(std::chrono::milliseconds command_timeout =
+                    std::chrono::milliseconds(30000)) const;
 
   /**
    * Waits for the logdeviced process to exit.
@@ -1608,12 +1810,12 @@ class Node {
   std::map<std::string, std::string> sequencerInfo(logid_t log_id) const;
 
   /**
-   * Issues a GOSSIP BLACKLIST command, and EXPECT_EQs that it succeeds.
+   * Issues a GOSSIP BLACKLIST command, and ld_check-s that it succeeds.
    */
   void gossipBlacklist(node_index_t node_id) const;
 
   /**
-   * Issues a GOSSIP WHITELIST command, and EXPECT_EQs that it succeeds.
+   * Issues a GOSSIP WHITELIST command, and ld_check-s that it succeeds.
    */
   void gossipWhitelist(node_index_t node_id) const;
 
@@ -1630,12 +1832,12 @@ class Node {
                         folly::Optional<double> chance = folly::none,
                         folly::Optional<uint32_t> latency_ms = folly::none);
   /**
-   * Issues a NEWCONNECTIONS command, and EXPECT_EQs that it succeeds.
+   * Issues a NEWCONNECTIONS command, and ld_check-s that it succeeds.
    */
   void newConnections(bool accept) const;
 
   /**
-   * Issues a STARTRECOVERY command, and EXPECT_EQs that it succeeds.
+   * Issues a STARTRECOVERY command, and ld_check-s that it succeeds.
    */
   void startRecovery(logid_t logid) const;
 
@@ -1674,6 +1876,15 @@ class Node {
   std::map<std::string, std::string> gossipInfo() const;
 
   /**
+   * Issues an INFO GOSSIP command to the node's command port to collect info
+   * about the health status of other nodes. Results are stored in the map, with
+   * keys corresponding to nodes, and values being "UNDEFINED", "HEALTHY",
+   * "OVERLOADED" or "UNHEALTHY". Cluster has to be started with the
+   * --gossip-enable option.
+   */
+  std::map<std::string, std::string> gossipStatusInfo() const;
+
+  /**
    * Issues an INFO GOSSIP command to collect information about whether the node
    * is in starting state and display it.
    */
@@ -1688,6 +1899,12 @@ class Node {
    * "ALIVE"   : If node is ALIVE
    */
   std::map<std::string, std::string> gossipState() const;
+
+  std::map<node_index_t, std::string>
+  getRsmVersions(logid_t rsm_log, RsmVersionType rsm_type) const;
+
+  std::pair<std::string, std::string>
+  getTrimmableVersion(logid_t rsm_log) const;
 
   /*
    * Sends "info gossip" to command port via nc.
@@ -1742,9 +1959,6 @@ class Node {
   }
 
   std::vector<std::string> commandLine() const;
-
-  // Folly event-base to be used for Admin API operations
-  folly::EventBase event_base_;
 };
 
 /**

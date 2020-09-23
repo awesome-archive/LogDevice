@@ -114,28 +114,17 @@ static const std::set<std::string> logs_config_recognized_keys = {
     SEQUENCER_BATCHING_COMPRESSION,
     SEQUENCER_BATCHING_PASSTHRU_THRESHOLD,
     SHADOW,
-    TAIL_OPTIMIZED};
+    TAIL_OPTIMIZED,
+};
 
-static const std::set<std::string> logs_config_non_defaultable_keys = {
-    "id",
-    "name"};
+static const std::set<std::string> logs_config_non_defaultable_keys = {"id",
+                                                                       "name"};
 
-static bool parseSubLogs(LocalLogsConfig::DirectoryNode* parent_ns,
-                         const LogsConfigNamespace& namespace_prefix,
-                         const std::string& ns_name,
-                         const folly::dynamic& namespaceMap,
-                         const SecurityConfig& securityConfig,
-                         std::shared_ptr<LocalLogsConfig>& output,
-                         LoadFileCallback loadFileCallback,
-                         const ConfigParserOptions& options) {
-  std::string scope = namespace_prefix.empty()
-      ? "cluster"
-      : "namespace \"" + namespace_prefix.toString() + "\"";
-
-  // start with empty set of attributes
-  LogAttributes ns_attrs;
-
-  const folly::dynamic* localDefaults = namespaceMap.get_ptr("defaults");
+bool parseDefaults(const folly::dynamic& map,
+                   const std::string& scope,
+                   const SecurityConfig& securityConfig,
+                   folly::Optional<LogAttributes>& output) {
+  const folly::dynamic* localDefaults = map.get_ptr("defaults");
   if (localDefaults) {
     if (!localDefaults->isObject()) {
       ld_error("\"defaults\" entry for %s not a JSON object", scope.c_str());
@@ -159,70 +148,35 @@ static bool parseSubLogs(LocalLogsConfig::DirectoryNode* parent_ns,
       if (!attrs) {
         return false;
       }
-      ns_attrs = attrs.value();
+      output = attrs;
     }
   }
 
-  // log list could either be specified inline or included from an external
-  // file.
-  auto inline_iter = namespaceMap.find("logs");
-  auto include_iter = namespaceMap.find("include_log_config");
+  return true;
+}
 
-  if (include_iter != namespaceMap.items().end() &&
-      inline_iter != namespaceMap.items().end()) {
-    ld_error("both \"logs\" and \"include_log_config\" "
-             "entries specified for cluster");
-    err = E::INVALID_CONFIG;
+static bool parseSubLogs(LocalLogsConfig::DirectoryNode* parent_ns,
+                         const LogsConfigNamespace& namespace_prefix,
+                         const std::string& ns_name,
+                         const folly::dynamic& namespaceMap,
+                         const SecurityConfig& securityConfig,
+                         std::shared_ptr<LocalLogsConfig>& output,
+                         const ConfigParserOptions& options) {
+  std::string scope = namespace_prefix.empty()
+      ? "cluster"
+      : "namespace \"" + namespace_prefix.toString() + "\"";
+
+  // start with empty set of attributes
+  LogAttributes ns_attrs;
+
+  folly::Optional<LogAttributes> attrs;
+  if (!parseDefaults(namespaceMap, scope, securityConfig, attrs)) {
     return false;
+  } else if (attrs.has_value()) {
+    ns_attrs = attrs.value();
   }
 
-  folly::dynamic included_json = folly::dynamic::object;
-  if (include_iter != namespaceMap.items().end()) {
-    if (!namespace_prefix.empty()) {
-      ld_error("include_log_config only supported for the whole logs config, "
-               "not allowed under %s",
-               scope.c_str());
-      err = E::INVALID_CONFIG;
-      return false;
-    }
-
-    if (!loadFileCallback) {
-      // found valid include_log_config entry, but no callback passed -
-      // indicates that we shouldn't follow up with the actual include.
-      // Resetting the LogsConfig pointer to signal that we aren't able to
-      // resolve log configuration locally.
-      output.reset();
-      return true;
-    }
-    std::string json_file;
-    Status rv =
-        loadFileCallback(include_iter->second.asString().c_str(), &json_file);
-    if (rv == E::NOTREADY) {
-      // Callback indicated that the included config isn't ready yet.
-      // Silently abort parsing.
-      err = E::NOTREADY;
-      return false;
-    }
-    if (rv != E::OK) {
-      ld_error("unable to load includable file \"%s\": %s",
-               include_iter->second.asString().c_str(),
-               error_name(rv));
-      err = E::INVALID_CONFIG;
-      return false;
-    }
-    included_json = parseJson(json_file);
-    if (included_json == nullptr) {
-      // assuming parseJson() set the error code and message already.
-      return false;
-    }
-    auto sub_iter = included_json.find("logs");
-    if (sub_iter != included_json.items().end()) {
-      inline_iter = sub_iter;
-    }
-  }
-
-  // This will be triggered if there is no entry in the included config file
-  // above.
+  auto inline_iter = namespaceMap.find("logs");
   if (inline_iter == namespaceMap.items().end()) {
     ld_debug("missing \"logs\" entry for %s", scope.c_str());
     err = E::LOGS_SECTION_MISSING;
@@ -279,7 +233,6 @@ static bool parseSubLogs(LocalLogsConfig::DirectoryNode* parent_ns,
 bool parseLogs(const folly::dynamic& clusterMap,
                std::shared_ptr<LocalLogsConfig>& output,
                const SecurityConfig& securityConfig,
-               LoadFileCallback loadFileCallback,
                const std::string& ns_delimiter,
                const ConfigParserOptions& options) {
   ld_check(output->logsBegin() == output->logsEnd());
@@ -291,7 +244,6 @@ bool parseLogs(const folly::dynamic& clusterMap,
           clusterMap,
           securityConfig,
           output,
-          loadFileCallback,
           options)) {
     return false;
   }
@@ -507,7 +459,7 @@ static bool parseOneLogRange(LocalLogsConfig::DirectoryNode* parent_ns,
     return false;
   }
 
-  std::shared_ptr<LocalLogsConfig::LogGroupNode> log_group_node =
+  const auto log_group_node =
       output.insert(parent_ns, logid_interval, name, attrs.value());
   if (!log_group_node) {
     return false;
@@ -541,7 +493,6 @@ static bool parseOneLogEntry(LocalLogsConfig::DirectoryNode* parent_dir,
                         logMap,
                         securityConfig,
                         output,
-                        LoadFileCallback(),
                         options);
   }
 }

@@ -20,18 +20,17 @@
 #include "logdevice/common/ClientEventTracer.h"
 #include "logdevice/common/DataRecordFromTailRecord.h"
 #include "logdevice/common/DataSizeRequest.h"
-#include "logdevice/common/E2ETracer.h"
 #include "logdevice/common/EpochMetaDataCache.h"
 #include "logdevice/common/EpochMetaDataMap.h"
 #include "logdevice/common/FindKeyRequest.h"
 #include "logdevice/common/GetHeadAttributesRequest.h"
-#include "logdevice/common/IsLogEmptyRequest.h"
 #include "logdevice/common/LogsConfigApiRequest.h"
 #include "logdevice/common/NoopTraceLogger.h"
-#include "logdevice/common/PrincipalParser.h"
+#include "logdevice/common/PayloadGroupCodec.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/ReaderImpl.h"
 #include "logdevice/common/Semaphore.h"
+#include "logdevice/common/SnapshotStoreTypes.h"
 #include "logdevice/common/StatsCollectionThread.h"
 #include "logdevice/common/SyncSequencerRequest.h"
 #include "logdevice/common/TailRecord.h"
@@ -49,6 +48,7 @@
 #include "logdevice/common/debug.h"
 #include "logdevice/common/plugin/TraceLoggerFactory.h"
 #include "logdevice/common/plugin/ZookeeperClientFactory.h"
+#include "logdevice/common/replicated_state_machine/RsmSnapshotStoreFactory.h"
 #include "logdevice/common/settings/Settings.h"
 #include "logdevice/common/settings/UpdateableSettings.h"
 #include "logdevice/common/stats/Stats.h"
@@ -64,33 +64,8 @@
 #include "logdevice/lib/shadow/Shadow.h"
 
 using facebook::logdevice::logsconfig::FBuffersLogsConfigCodec;
-using std::chrono::duration;
-using std::chrono::steady_clock;
 
 namespace facebook { namespace logdevice {
-
-using NodesConfigurationManager =
-    configuration::nodes::NodesConfigurationManager;
-using NCSType = configuration::nodes::NodesConfigurationStoreFactory::NCSType;
-
-// Implementing the member function of Client inside ClientImpl.cpp sounds
-// confusing, but this is not an error. This is for the purpose of moving
-// the indirection of calling ClientImpl::create in Client::create.
-// Instead, users who call create will always call the Client::create.
-std::shared_ptr<Client> Client::create(std::string cluster_name,
-                                       std::string config_url,
-                                       std::string credentials,
-                                       std::chrono::milliseconds timeout,
-                                       std::unique_ptr<ClientSettings> settings,
-                                       std::string csid) noexcept {
-  return ClientFactory()
-      .setClusterName(std::move(cluster_name))
-      .setCredentials(std::move(credentials))
-      .setTimeout(timeout)
-      .setClientSettings(std::move(settings))
-      .setCSID(std::move(csid))
-      .create(std::move(config_url));
-}
 
 bool ClientImpl::validateServerConfig(ServerConfig& cfg) const {
   ld_check(config_);
@@ -148,11 +123,8 @@ ClientImpl::ClientImpl(std::string cluster_name,
   if (settings->stats_collection_interval.count() > 0 ||
       settings->client_test_force_stats) {
     auto params =
-        StatsParams()
-            .setIsServer(false)
-            .addAdditionalEntitySuffix(".client")
-            .setNodeStatsRetentionTimeOnClients(
-                settings->sequencer_boycotting.node_stats_send_period);
+        StatsParams().setIsServer(false).setNodeStatsRetentionTimeOnClients(
+            settings->sequencer_boycotting.node_stats_send_period);
     // Only create StatsHolder when we're going to collect stats, primarily to
     // avoid instantianting thread-local Stats unnecessarily
     stats_ = std::make_unique<StatsHolder>(std::move(params));
@@ -198,12 +170,13 @@ ClientImpl::ClientImpl(std::string cluster_name,
         /*server_roles*/ folly::none,
         std::move(zk_client_factory));
     if (ncm == nullptr) {
-      ld_critical(
-          "Unable to create NodesConfigurationManager during Client creation!");
+      ld_critical("Unable to create NodesConfigurationManager during Client "
+                  "creation for %s!",
+                  cluster_name_.c_str());
       throw ConstructorFailed();
     }
 
-    auto initial_nc = processor_->config_->getNodesConfigurationFromNCMSource();
+    auto initial_nc = processor_->config_->getNodesConfiguration();
     if (!initial_nc) {
       // Currently this should only happen in tests as our boostrapping
       // workflow should always ensure the Processor has a valid
@@ -216,17 +189,24 @@ ClientImpl::ClientImpl(std::string cluster_name,
       initial_nc = std::make_shared<const NodesConfiguration>();
     }
     if (!ncm->init(std::move(initial_nc))) {
-      ld_critical(
-          "Processing initial NodesConfiguration did not finish in time.");
+      ld_critical("Processing initial NodesConfiguration did not finish in "
+                  "time for %s.",
+                  cluster_name_.c_str());
       throw ConstructorFailed();
     }
   }
 
+  auto snapshot_store = RsmSnapshotStoreFactory::create(
+      processor_.get(),
+      settings_->getSettings()->rsm_snapshot_store_type,
+      std::to_string(configuration::InternalLogs::CONFIG_LOG_DELTAS.val_),
+      false /* is_server */);
   if (!LogsConfigManager::createAndAttach(
-          *processor_, false /* is_writable */)) {
+          *processor_, std::move(snapshot_store), false /* is_writable */)) {
     err = E::INVALID_CONFIG;
     ld_critical("Internal LogsConfig Manager could not be started in Client. "
-                "LogsConfig will not be available!");
+                "LogsConfig will not be available for %s!",
+                cluster_name_.c_str());
     throw ConstructorFailed();
   }
 
@@ -252,7 +232,8 @@ ClientImpl::ClientImpl(std::string cluster_name,
         config_->getServerConfig()->getInternalLogsConfig());
   }
 
-  if (!config_->getLogsConfig() || !config_->getLogsConfig()->isFullyLoaded()) {
+  auto logs_config = config_->getLogsConfig();
+  if (!logs_config || !logs_config->isFullyLoaded()) {
     Semaphore sem;
 
     auto start_time = std::chrono::steady_clock::now();
@@ -278,15 +259,17 @@ ClientImpl::ClientImpl(std::string cluster_name,
     if (rv != 0) {
       STAT_INCR(stats_.get(), client.logsconfig_start_timeout);
       ld_critical("Timeout waiting on LogsConfig to become fully loaded "
-                  "after %.3f seconds",
-                  timeout_for_logconfig.count() / 1e3);
+                  "after %.3f seconds for %s",
+                  timeout_for_logconfig.count() / 1e3,
+                  cluster_name_.c_str());
       err = E::TIMEDOUT;
       throw ConstructorFailed();
     }
   } else {
     ld_info("Internal LogsConfig Manager is DISABLED.");
     if (!config_->getLogsConfig()) {
-      ld_critical("Could not load the LogsConfig from the config file!");
+      ld_critical("Could not load the LogsConfig from the config file on %s!",
+                  cluster_name_.c_str());
       err = E::INVALID_CONFIG;
       throw ConstructorFailed();
     }
@@ -327,8 +310,55 @@ int ClientImpl::append(logid_t logid,
                        AppendAttributes attrs,
                        worker_id_t target_worker,
                        std::unique_ptr<std::string> per_request_token) {
+  // Check payload size before copying it into PayloadHolder.
+  if (!AppendRequest::checkPayloadSize(payload.size(),
+                                       getMaxPayloadSize(),
+                                       /* allow_extra */ false)) {
+    return -1;
+  }
+
   auto req = prepareRequest(logid,
-                            payload,
+                            PayloadHolder::copyPayload(payload),
+                            cb,
+                            std::move(attrs),
+                            target_worker,
+                            std::move(per_request_token));
+  if (!req) {
+    return -1;
+  }
+  req->setClientPayload(payload);
+  return postAppend(std::move(req));
+}
+
+int ClientImpl::append(logid_t logid,
+                       std::string payload,
+                       append_callback_t cb,
+                       AppendAttributes attrs,
+                       worker_id_t target_worker,
+                       std::unique_ptr<std::string> per_request_token) {
+  // We need payload to be owned by a folly::IOBuf rather than an std::string.
+  // If payload is small, let's just make a copy. If payload is large, we'll
+  // use a custom deleter function to avoid copying.
+  PayloadHolder payload_holder;
+  if (payload.size() < 256) {
+    payload_holder = PayloadHolder(
+        PayloadHolder::COPY_BUFFER, payload.data(), payload.size());
+  } else {
+    std::string* string_on_heap = new std::string(std::move(payload));
+    folly::IOBuf::FreeFunction deleter = +[](void* /* buf */, void* userData) {
+      delete reinterpret_cast<std::string*>(userData);
+    };
+    payload_holder = PayloadHolder(
+        folly::IOBuf(folly::IOBuf::TAKE_OWNERSHIP,
+                     string_on_heap->data(),
+                     string_on_heap->size(),
+                     deleter,
+                     /* userData */ reinterpret_cast<void*>(string_on_heap)),
+        /* ignore_size_limit */ true);
+  }
+
+  auto req = prepareRequest(logid,
+                            std::move(payload_holder),
                             cb,
                             std::move(attrs),
                             target_worker,
@@ -340,14 +370,14 @@ int ClientImpl::append(logid_t logid,
 }
 
 int ClientImpl::append(logid_t logid,
-                       std::string payload,
+                       PayloadGroup&& payload_group,
                        append_callback_t cb,
                        AppendAttributes attrs,
                        worker_id_t target_worker,
                        std::unique_ptr<std::string> per_request_token) {
   auto req = prepareRequest(logid,
-                            std::move(payload),
-                            cb,
+                            std::move(payload_group),
+                            std::move(cb),
                             std::move(attrs),
                             target_worker,
                             std::move(per_request_token));
@@ -361,7 +391,7 @@ std::pair<Status, NodeID> ClientImpl::appendBuffered(
     logid_t logid,
     const BufferedWriter::AppendCallback::ContextSet&,
     AppendAttributes attrs,
-    const Payload& payload,
+    PayloadHolder&& payload,
     BufferedWriterAppendSink::AppendRequestCallback buffered_writer_cb,
     worker_id_t target_worker,
     int checksum_bits) {
@@ -401,7 +431,7 @@ std::pair<Status, NodeID> ClientImpl::appendBuffered(
       bridge_.get(),
       logid,
       std::move(attrs),
-      payload,
+      std::move(payload),
       settings_->getSettings()->append_timeout.value_or(timeout_),
       std::move(wrapped_cb));
 
@@ -537,9 +567,16 @@ int ClientImpl::append(logid_t logid,
                        const Payload& payload,
                        append_callback_t cb,
                        AppendAttributes attrs) noexcept {
+  return append(logid, payload, cb, std::move(attrs), worker_id_t{-1}, nullptr);
+}
+
+int ClientImpl::append(logid_t logid,
+                       PayloadGroup&& payload_group,
+                       append_callback_t cb,
+                       AppendAttributes attrs) noexcept {
   return append(logid,
-                payload,
-                std::move(cb),
+                std::move(payload_group),
+                cb,
                 std::move(attrs),
                 worker_id_t{-1},
                 nullptr);
@@ -560,6 +597,16 @@ lsn_t ClientImpl::appendSync(logid_t logid,
       this, logid, std::move(payload), std::move(attrs), ts);
 }
 
+lsn_t ClientImpl::appendSync(logid_t logid,
+                             PayloadGroup&& payload_group,
+                             AppendAttributes attrs,
+                             std::chrono::milliseconds* ts) noexcept {
+  // TODO this consumes payload_group in case of failure. should return it to
+  // the caller?
+  return append_sync_helper(
+      this, logid, std::move(payload_group), std::move(attrs), ts);
+}
+
 std::unique_ptr<Reader> ClientImpl::createReader(size_t max_logs,
                                                  ssize_t buffer_size) noexcept {
   return std::make_unique<ReaderImpl>(max_logs,
@@ -575,19 +622,6 @@ ClientImpl::createAsyncReader(ssize_t buffer_size) noexcept {
   return std::make_unique<AsyncReaderImpl>(shared_from_this(), buffer_size);
 }
 
-static std::string get_full_name(const std::string& name,
-                                 const Configuration& config,
-                                 const ClientSettingsImpl& settings) {
-  // If the name starts with a delimiter, we don't use the default namespace
-  std::string delim = config.logsConfig()->getNamespaceDelimiter();
-  if (name.size() > 0 && name.compare(0, delim.size(), delim) == 0) {
-    return name;
-  } else {
-    return config.logsConfig()->getNamespacePrefixedLogRangeName(
-        settings.getSettings()->default_log_namespace, name);
-  }
-}
-
 logid_range_t ClientImpl::getLogRangeByName(const std::string& name) noexcept {
   if (ThreadID::isWorker()) {
     ld_error("Synchronous methods for fetching log configuration should not "
@@ -597,15 +631,13 @@ logid_range_t ClientImpl::getLogRangeByName(const std::string& name) noexcept {
     return logid_range_t(logid_t(0), logid_t(0));
   }
 
-  std::string full_name = get_full_name(name, *config_->get(), *settings_);
-  return config_->get()->logsConfig()->getLogRangeByName(full_name);
+  return config_->get()->logsConfig()->getLogRangeByName(name);
 }
 
 void ClientImpl::getLogRangeByName(
     const std::string& name,
     get_log_range_by_name_callback_t cb) noexcept {
-  std::string full_name = get_full_name(name, *config_->get(), *settings_);
-  config_->get()->logsConfig()->getLogRangeByNameAsync(full_name, cb);
+  config_->get()->logsConfig()->getLogRangeByNameAsync(name, cb);
 }
 
 std::string ClientImpl::getLogNamespaceDelimiter() noexcept {
@@ -622,20 +654,17 @@ ClientImpl::getLogRangesByNamespace(const std::string& ns) noexcept {
     return {};
   }
 
-  auto full_ns = get_full_name(ns, *config_->get(), *settings_);
-  return config_->get()->logsConfig()->getLogRangesByNamespace(full_ns);
+  return config_->get()->logsConfig()->getLogRangesByNamespace(ns);
 }
 
 void ClientImpl::getLogRangesByNamespace(
     const std::string& ns,
     get_log_ranges_by_namespace_callback_t cb) noexcept {
-  auto full_ns = get_full_name(ns, *config_->get(), *settings_);
-  config_->get()->logsConfig()->getLogRangesByNamespaceAsync(full_ns, cb);
+  config_->get()->logsConfig()->getLogRangesByNamespaceAsync(ns, cb);
 }
 
 std::unique_ptr<client::LogGroup>
 ClientImpl::getLogGroupSync(const std::string& name) noexcept {
-  auto full_ns = get_full_name(name, *config_->get(), *settings_);
   if (ThreadID::isWorker()) {
     ld_error("Synchronous methods for fetching log configuration should not "
              "be called from worker threads on the client.");
@@ -652,7 +681,7 @@ ClientImpl::getLogGroupSync(const std::string& name) noexcept {
     sem.post();
   };
 
-  getLogGroup(full_ns, cb);
+  getLogGroup(name, cb);
 
   sem.wait();
   if (status != E::OK) {
@@ -686,14 +715,13 @@ void ClientImpl::getLocalLogGroup(const std::string& path,
 
 void ClientImpl::getLogGroup(const std::string& path,
                              get_log_group_callback_t cb) noexcept {
-  auto full_ns = get_full_name(path, *config_->get(), *settings_);
   if (hasFullyLoadedLocalLogsConfig()) {
-    getLocalLogGroup(full_ns, std::move(cb));
+    getLocalLogGroup(path, std::move(cb));
     return;
   }
   std::string delimiter =
       config_->get()->serverConfig()->getNamespaceDelimiter();
-  auto callback = [cb, full_ns, delimiter](
+  auto callback = [cb, path, delimiter](
                       Status st, uint64_t config_version, std::string payload) {
     if (st == E::OK) {
       ld_check(payload.size() > 0);
@@ -709,7 +737,7 @@ void ClientImpl::getLogGroup(const std::string& path,
       }
       std::unique_ptr<client::LogGroupImpl> lg =
           std::make_unique<client::LogGroupImpl>(
-              std::move(recovered_lg), full_ns, config_version);
+              std::move(recovered_lg), path, config_version);
       cb(st, std::move(lg));
     } else {
       cb(st, nullptr);
@@ -718,7 +746,7 @@ void ClientImpl::getLogGroup(const std::string& path,
 
   std::unique_ptr<Request> req = std::make_unique<LogsConfigApiRequest>(
       LOGS_CONFIG_API_Header::Type::GET_LOG_GROUP_BY_NAME,
-      full_ns,
+      path,
       settings_->getSettings()->logsconfig_timeout.value_or(timeout_),
       LogsConfigApiRequest::MAX_ERRORS,
       logsconfig_api_random_seed_,
@@ -826,14 +854,13 @@ int ClientImpl::makeDirectory(const std::string& path,
                               bool mk_intermediate_dirs,
                               const client::LogAttributes& attrs,
                               make_directory_callback_t cb) noexcept {
-  auto full_ns = get_full_name(path, *config_->get(), *settings_);
   std::string delimiter =
       config_->get()->serverConfig()->getNamespaceDelimiter();
   // create the payload
   logsconfig::DeltaHeader header; // Resolution is Auto by default
   logsconfig::MkDirectoryDelta delta{header, path, mk_intermediate_dirs, attrs};
 
-  auto callback = [cb, full_ns, delimiter](
+  auto callback = [cb, path, delimiter](
                       Status st, uint64_t config_version, std::string payload) {
     if (st == E::OK) {
       // deserialize the payload
@@ -847,7 +874,7 @@ int ClientImpl::makeDirectory(const std::string& path,
       }
       std::unique_ptr<client::DirectoryImpl> dir =
           std::make_unique<client::DirectoryImpl>(
-              *recovered_dir, nullptr, full_ns, delimiter, config_version);
+              *recovered_dir, nullptr, path, delimiter, config_version);
       cb(st, std::move(dir), "");
     } else {
       // payload has the failure reason
@@ -911,7 +938,6 @@ ClientImpl::makeDirectorySync(const std::string& path,
 int ClientImpl::removeDirectory(const std::string& path,
                                 bool recursive,
                                 logsconfig_status_callback_t cb) noexcept {
-  auto full_ns = get_full_name(path, *config_->get(), *settings_);
   std::string delimiter = config_->get()->logsConfig()->getNamespaceDelimiter();
   // create the payload
   logsconfig::DeltaHeader header; // Resolution is Auto by default
@@ -995,7 +1021,6 @@ bool ClientImpl::removeLogGroupSync(const std::string& path,
 
 int ClientImpl::removeLogGroup(const std::string& path,
                                logsconfig_status_callback_t cb) noexcept {
-  auto full_ns = get_full_name(path, *config_->get(), *settings_);
   std::string delimiter = config_->get()->logsConfig()->getNamespaceDelimiter();
   // create the payload
   logsconfig::DeltaHeader header; // Resolution is Auto by default
@@ -1027,12 +1052,9 @@ int ClientImpl::removeLogGroup(const std::string& path,
 int ClientImpl::rename(const std::string& from_path,
                        const std::string& to_path,
                        logsconfig_status_callback_t cb) noexcept {
-  auto source_full_ns = get_full_name(from_path, *config_->get(), *settings_);
-  auto dest_full_ns = get_full_name(to_path, *config_->get(), *settings_);
-  std::string delimiter = config_->get()->logsConfig()->getNamespaceDelimiter();
   // create the payload
   logsconfig::DeltaHeader header; // Resolution is Auto by default
-  logsconfig::RenameDelta delta{header, source_full_ns, dest_full_ns};
+  logsconfig::RenameDelta delta{header, from_path, to_path};
 
   auto callback = [cb](
                       Status st, uint64_t version, std::string failure_reason) {
@@ -1095,7 +1117,6 @@ int ClientImpl::makeLogGroup(const std::string& path,
                              const client::LogAttributes& attrs,
                              bool mk_intermediate_dirs,
                              make_log_group_callback_t cb) noexcept {
-  auto full_ns = get_full_name(path, *config_->get(), *settings_);
   std::string delimiter =
       config_->get()->serverConfig()->getNamespaceDelimiter();
   // create the payload
@@ -1103,7 +1124,7 @@ int ClientImpl::makeLogGroup(const std::string& path,
   logsconfig::MkLogGroupDelta delta{
       header, path, range, mk_intermediate_dirs, attrs};
 
-  auto callback = [cb, full_ns, delimiter](
+  auto callback = [cb, path, delimiter](
                       Status st, uint64_t config_version, std::string payload) {
     if (st == E::OK) {
       // deserialize the payload
@@ -1119,7 +1140,7 @@ int ClientImpl::makeLogGroup(const std::string& path,
       }
       std::unique_ptr<client::LogGroupImpl> lg =
           std::make_unique<client::LogGroupImpl>(
-              std::move(recovered_log_group), full_ns, config_version);
+              std::move(recovered_log_group), path, config_version);
       cb(st, std::move(lg), "");
     } else {
       // payload contains the failure reason.
@@ -1184,13 +1205,12 @@ ClientImpl::makeLogGroupSync(const std::string& path,
 int ClientImpl::setAttributes(const std::string& path,
                               const client::LogAttributes& attrs,
                               logsconfig_status_callback_t cb) noexcept {
-  auto full_ns = get_full_name(path, *config_->get(), *settings_);
   std::string delimiter = config_->get()->logsConfig()->getNamespaceDelimiter();
   // create the payload
   logsconfig::DeltaHeader header; // Resolution is Auto by default
   logsconfig::SetAttributesDelta delta{header, path, attrs};
 
-  auto callback = [cb, full_ns, delimiter](
+  auto callback = [cb, path, delimiter](
                       Status st, uint64_t version, std::string failure_reason) {
     cb(st, version, failure_reason);
   };
@@ -1249,13 +1269,12 @@ bool ClientImpl::setAttributesSync(const std::string& path,
 int ClientImpl::setLogGroupRange(const std::string& path,
                                  const logid_range_t& range,
                                  logsconfig_status_callback_t cb) noexcept {
-  auto full_ns = get_full_name(path, *config_->get(), *settings_);
   std::string delimiter = config_->get()->logsConfig()->getNamespaceDelimiter();
   // create the payload
   logsconfig::DeltaHeader header; // Resolution is Auto by default
   logsconfig::SetLogRangeDelta delta{header, path, range};
 
-  auto callback = [cb, full_ns, delimiter](
+  auto callback = [cb, path, delimiter](
                       Status st, uint64_t version, std::string failure_reason) {
     cb(st, version, std::move(failure_reason));
   };
@@ -1333,13 +1352,12 @@ int ClientImpl::getLocalDirectory(const std::string& path,
 
 int ClientImpl::getDirectory(const std::string& path,
                              get_directory_callback_t cb) noexcept {
-  auto full_ns = get_full_name(path, *config_->get(), *settings_);
   if (hasFullyLoadedLocalLogsConfig()) {
-    return getLocalDirectory(full_ns, std::move(cb));
+    return getLocalDirectory(path, std::move(cb));
   }
   std::string delimiter =
       config_->get()->serverConfig()->getNamespaceDelimiter();
-  auto callback = [cb, full_ns, delimiter](
+  auto callback = [cb, path, delimiter](
                       Status st, uint64_t config_version, std::string payload) {
     if (st == E::OK) {
       // deserialize the payload
@@ -1352,7 +1370,7 @@ int ClientImpl::getDirectory(const std::string& path,
       }
       std::unique_ptr<client::DirectoryImpl> dir =
           std::make_unique<client::DirectoryImpl>(
-              *recovered_dir, nullptr, full_ns, delimiter, config_version);
+              *recovered_dir, nullptr, path, delimiter, config_version);
       cb(st, std::move(dir));
     } else {
       cb(st, nullptr);
@@ -1361,7 +1379,7 @@ int ClientImpl::getDirectory(const std::string& path,
 
   std::unique_ptr<Request> req = std::make_unique<LogsConfigApiRequest>(
       LOGS_CONFIG_API_Header::Type::GET_DIRECTORY,
-      full_ns,
+      path,
       settings_->getSettings()->logsconfig_timeout.value_or(timeout_),
       LogsConfigApiRequest::MAX_ERRORS,
       logsconfig_api_random_seed_,
@@ -1405,7 +1423,9 @@ bool ClientImpl::syncLogsConfigVersion(uint64_t version) noexcept {
   int rv = sem.timedwait(
       settings_->getSettings()->logsconfig_timeout.value_or(timeout_));
   if (rv != 0) {
-    ld_critical("Timeout waiting on LogsConfig to reach version %lu", version);
+    ld_critical("Timeout waiting on LogsConfig to reach version %lu on %s",
+                version,
+                cluster_name_.c_str());
     return false;
   }
   return true;
@@ -1695,10 +1715,6 @@ struct IsLogEmptyGate {
 }; // namespace
 
 int ClientImpl::isLogEmptySync(logid_t logid, bool* empty) noexcept {
-  if (settings_->getSettings()->enable_is_log_empty_v2) {
-    return isLogEmptyV2Sync(logid, empty);
-  }
-
   IsLogEmptyGate gate; // request-reply synchronization
   int rv;
 
@@ -1720,53 +1736,6 @@ int ClientImpl::isLogEmptySync(logid_t logid, bool* empty) noexcept {
 }
 
 int ClientImpl::isLogEmpty(logid_t logid, is_empty_callback_t cb) noexcept {
-  if (settings_->getSettings()->enable_is_log_empty_v2) {
-    return isLogEmptyV2(logid, cb);
-  }
-
-  auto cb_wrapper = [cb, logid, start = SteadyClock::now()](
-                        const IsLogEmptyRequest& req, Status st, bool empty) {
-    // log response
-    Worker* w = Worker::onThisThread();
-    if (w) {
-      auto& tracer = w->processor_->api_hits_tracer_;
-      if (tracer) {
-        tracer->traceIsLogEmpty(
-            msec_since(start), logid, req.getFailedShards(st), st, empty);
-      }
-    }
-    cb(st, empty);
-  };
-  std::unique_ptr<Request> req = std::make_unique<IsLogEmptyRequest>(
-      logid,
-      settings_->getSettings()->meta_api_timeout.value_or(timeout_),
-      cb_wrapper,
-      settings_->getSettings()->client_is_log_empty_grace_period);
-  return processor_->postRequest(req);
-}
-
-int ClientImpl::isLogEmptyV2Sync(logid_t logid, bool* empty) noexcept {
-  IsLogEmptyGate gate; // request-reply synchronization
-  int rv;
-
-  ld_check(empty);
-
-  rv = isLogEmptyV2(logid, std::ref(gate));
-
-  if (rv == 0) {
-    gate.wait();
-    if (gate.status == E::OK) {
-      *empty = gate.empty;
-    } else {
-      logdevice::err = gate.status;
-      rv = -1;
-    }
-  }
-
-  return rv;
-}
-
-int ClientImpl::isLogEmptyV2(logid_t logid, is_empty_callback_t cb) noexcept {
   auto cb_wrapper =
       [logid, cb, start = SteadyClock::now()](
           Status st,
@@ -1776,7 +1745,7 @@ int ClientImpl::isLogEmptyV2(logid_t logid, is_empty_callback_t cb) noexcept {
           std::shared_ptr<const EpochMetaDataMap> /*metadata_map*/,
           std::shared_ptr<TailRecord> /*tail_record*/,
           folly::Optional<bool> is_log_empty) {
-        if (!is_log_empty.hasValue()) {
+        if (!is_log_empty.has_value()) {
           ld_check_ne(st, E::OK);
           is_log_empty = false;
         }
@@ -2277,10 +2246,9 @@ size_t ClientImpl::getMaxPayloadSize() noexcept {
   return settings_->getSettings()->max_payload_size;
 }
 
-template <typename T>
 std::unique_ptr<AppendRequest>
 ClientImpl::prepareRequest(logid_t logid,
-                           T payload,
+                           PayloadHolder&& payload,
                            append_callback_t cb,
                            AppendAttributes attrs,
                            worker_id_t target_worker,
@@ -2289,6 +2257,58 @@ ClientImpl::prepareRequest(logid_t logid,
     return nullptr;
   }
 
+  return createRequest(logid,
+                       std::move(payload),
+                       std::move(cb),
+                       std::move(attrs),
+                       target_worker,
+                       std::move(per_request_token));
+}
+
+std::unique_ptr<AppendRequest>
+ClientImpl::prepareRequest(logid_t logid,
+                           PayloadGroup&& payload_group,
+                           append_callback_t cb,
+                           AppendAttributes attrs,
+                           worker_id_t target_worker,
+                           std::unique_ptr<std::string> per_request_token) {
+  folly::IOBufQueue queue;
+  PayloadGroupCodec::encode(payload_group, queue);
+  auto iobuf = queue.moveAsValue();
+  if (!checkAppend(logid, iobuf.computeChainDataLength())) {
+    return nullptr;
+  }
+
+  // TODO remove coalesce once PayloadHolder supports chained IOBufs
+  iobuf.coalesceWithHeadroomTailroom(0, 0);
+  auto req = createRequest(
+      logid,
+      PayloadHolder{std::move(iobuf)},
+      [cb = std::move(cb), payload_group = std::move(payload_group)](
+          Status st, const DataRecord& r) mutable {
+        // pass PayloadGroup ownership back to the caller
+        DataRecord record{r.logid,
+                          std::move(payload_group),
+                          r.attrs.lsn,
+                          r.attrs.timestamp,
+                          r.attrs.batch_offset,
+                          r.attrs.offsets};
+        cb(st, record);
+      },
+      std::move(attrs),
+      target_worker,
+      std::move(per_request_token));
+  req->setPayloadGroupFlag();
+  return req;
+}
+
+std::unique_ptr<AppendRequest>
+ClientImpl::createRequest(logid_t logid,
+                          PayloadHolder&& payload,
+                          append_callback_t cb,
+                          AppendAttributes attrs,
+                          worker_id_t target_worker,
+                          std::unique_ptr<std::string> per_request_token) {
   auto req = std::make_unique<AppendRequest>(
       bridge_.get(),
       logid,
@@ -2307,20 +2327,6 @@ ClientImpl::prepareRequest(logid_t logid,
   }
   return req;
 }
-
-// Some compilers (e.g., gcc-7.4.0, the default compiler on Ubuntu 18) may
-// inline calls to prepareRequest<Payload>() in ClientImpl::append() below. If
-// that happens, the compiler will not generate code for
-// prepareRequest<Payload>() instantiation. However, lib/shadow/ShadowClient.cpp
-// requires that instantiation. This leads to link errors when linking examples/
-// and some tests. Adding an explicit instantiation here to fix.
-template std::unique_ptr<AppendRequest> ClientImpl::prepareRequest<Payload>(
-    logid_t logid,
-    Payload payload,
-    append_callback_t cb,
-    AppendAttributes attrs,
-    worker_id_t target_worker,
-    std::unique_ptr<std::string> per_request_token);
 
 void ClientImpl::initLogsConfigRandomSeed() {
   logsconfig_api_random_seed_ = folly::Random::rand64();
@@ -2358,16 +2364,6 @@ void ClientImpl::updateStatsSettings() {
 void ClientImpl::setAppendErrorInjector(
     folly::Optional<AppendErrorInjector> injector) {
   append_error_injector_ = injector;
-}
-
-bool ClientImpl::shouldE2ETrace() {
-  // decide based on configuration/sampling rate if e2e tracing is on
-  double sampling_rate = config_->get()
-                             ->serverConfig()
-                             ->getTracerSamplePercentage(E2E_APPEND_TRACER)
-                             .value_or(DEFAULT_E2E_TRACING_RATE);
-  // flip the coin
-  return folly::Random::randDouble(0, 100) < sampling_rate;
 }
 
 void ClientImpl::registerCustomStats(StatsHolder* custom_stats) {

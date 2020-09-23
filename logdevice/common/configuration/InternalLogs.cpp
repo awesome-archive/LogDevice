@@ -78,6 +78,13 @@ InternalLogs::InternalLogs(const InternalLogs& other) {
 InternalLogs& InternalLogs::operator=(const InternalLogs& other) {
   reset();
 
+  std::string failure_reason;
+  if (!setDefaultAttributes(other.root_->attrs(), failure_reason)) {
+    ld_error("Unable to copy default internal log attributes: %s",
+             failure_reason.c_str());
+    ld_check(false);
+  }
+
   for (auto it = other.logsBegin(); it != other.logsEnd(); ++it) {
     auto n =
         insert(it->second.log_group->name(), it->second.log_group->attrs());
@@ -87,7 +94,7 @@ InternalLogs& InternalLogs::operator=(const InternalLogs& other) {
   return *this;
 }
 
-std::shared_ptr<logsconfig::LogGroupNode>
+logsconfig::LogGroupNodePtr
 InternalLogs::insert(const std::string& name, logsconfig::LogAttributes attrs) {
   const logid_t logid = lookupByName(name);
   if (logid == LOGID_INVALID) {
@@ -131,7 +138,7 @@ bool InternalLogs::isValid() const {
 
     // backlog duration must be not be set.
     if (p.log_group->attrs().backlogDuration() &&
-        p.log_group->attrs().backlogDuration().value().hasValue()) {
+        p.log_group->attrs().backlogDuration().value().has_value()) {
       ld_error("\"backlog\" attribute must not be set for internal log "
                "\"%s\" (%lu)",
                l.first.c_str(),
@@ -174,6 +181,41 @@ folly::dynamic InternalLogs::toDynamic() const {
   }
 
   return logs;
+}
+
+bool InternalLogs::operator!=(const InternalLogs& other) const {
+  return !(*this == other);
+}
+
+bool InternalLogs::operator==(const InternalLogs& other) const {
+  // If sizes don't match, they are not equal
+  if (size() != other.size()) {
+    return false;
+  }
+
+  for (const auto& kv : nameLookup()) {
+    auto log_id = kv.second;
+    // Check if the log exists in both configs and that their attrs match
+    auto this_config_attr =
+        logExists(log_id) ? getLogGroupByID(log_id)->log_group : nullptr;
+    auto other_config_attr = other.logExists(log_id)
+        ? other.getLogGroupByID(log_id)->log_group
+        : nullptr;
+    // Log not configured in both configs.
+    if (this_config_attr == nullptr && other_config_attr == nullptr) {
+      continue;
+    }
+    // Log is present in one config but not the other
+    if (this_config_attr == nullptr || other_config_attr == nullptr) {
+      return false;
+    }
+    // Log id present in both configs but the attributes don't match
+    if (!(*this_config_attr == *other_config_attr)) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 }}} // namespace facebook::logdevice::configuration

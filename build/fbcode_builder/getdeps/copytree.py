@@ -1,9 +1,7 @@
-# Copyright (c) 2019-present, Facebook, Inc.
-# All rights reserved.
+# Copyright (c) Facebook, Inc. and its affiliates.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree. An additional grant
-# of patent rights can be found in the PATENTS file in the same directory.
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
 
 from __future__ import absolute_import, division, print_function, unicode_literals
 
@@ -11,18 +9,42 @@ import os
 import shutil
 import subprocess
 
+from .platform import is_windows
 
-def is_eden(dirpath):
-    """Returns True if the specified directory is the root directory of,
-    or is a sub-directory of an Eden mount."""
-    return os.path.islink(os.path.join(dirpath, ".eden", "root"))
+
+PREFETCHED_DIRS = set()
+
+
+def containing_repo_type(path):
+    while True:
+        if os.path.exists(os.path.join(path, ".git")):
+            return ("git", path)
+        if os.path.exists(os.path.join(path, ".hg")):
+            return ("hg", path)
+
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None, None
+        path = parent
 
 
 def find_eden_root(dirpath):
-    """If the specified directory is the root directory of, or is a
-    sub-directory of an Eden mount, returns the canonical absolute path
-    to the root of that Eden mount."""
-    return os.readlink(os.path.join(dirpath, ".eden", "root"))
+    """If the specified directory is inside an EdenFS checkout, returns
+    the canonical absolute path to the root of that checkout.
+
+    Returns None if the specified directory is not in an EdenFS checkout.
+    """
+    if is_windows():
+        repo_type, repo_root = containing_repo_type(dirpath)
+        if repo_root is not None:
+            if os.path.exists(os.path.join(repo_root, ".eden", "config")):
+                return os.path.realpath(repo_root)
+        return None
+
+    try:
+        return os.readlink(os.path.join(dirpath, ".eden", "root"))
+    except OSError:
+        return None
 
 
 def prefetch_dir_if_eden(dirpath):
@@ -31,14 +53,18 @@ def prefetch_dir_if_eden(dirpath):
     performed by copytree makes this more expensive than is desirable
     so we help accelerate things by performing a prefetch on the
     source directory """
-    if not is_eden(dirpath):
+    global PREFETCHED_DIRS
+    if dirpath in PREFETCHED_DIRS:
         return
     root = find_eden_root(dirpath)
+    if root is None:
+        return
     rel = os.path.relpath(dirpath, root)
     print("Prefetching %s..." % rel)
-    # TODO: this should be edenfsctl but until I swing through a new
-    # package deploy, I only have `eden` on my mac to test this
-    subprocess.call(["eden", "prefetch", "--repo", root, "--silent", "%s/**" % rel])
+    subprocess.call(
+        ["edenfsctl", "prefetch", "--repo", root, "--silent", "%s/**" % rel]
+    )
+    PREFETCHED_DIRS.add(dirpath)
 
 
 def copytree(src_dir, dest_dir, ignore=None):

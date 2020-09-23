@@ -15,7 +15,6 @@
 
 namespace facebook { namespace logdevice {
 
-using NodeTemplate = NodesConfigurationTestUtil::NodeTemplate;
 class MetadataNodesetSelectorTest : public ::testing::Test {
  public:
   explicit MetadataNodesetSelectorTest() {}
@@ -31,22 +30,22 @@ class MetadataNodesetSelectorTest : public ::testing::Test {
 
 void MetadataNodesetSelectorTest::init() {
   int i, j = 0;
-  std::vector<NodeTemplate> nodes;
+  configuration::Nodes nodes;
   std::unordered_set<ShardID> metadata_shards;
   for (auto loc : {"rg1.dc1.msb1.rw1.rk1",
                    "rg1.dc1.msb1.rw1.rk2",
                    "rg1.dc1.msb1.rw1.rk3"}) {
     i = 0;
     while (i < 2) {
-      NodeTemplate node;
-      node.id = j++;
-      node.location = loc;
-      node.num_shards = 1;
+      auto idx = j++;
+      configuration::Node node = configuration::Node::withTestDefaults(idx);
+      node.setLocation(loc);
+      node.addStorageRole(1);
       if (i == 1) {
-        metadata_shards.insert(ShardID(node.id, 0));
+        metadata_shards.insert(ShardID(idx, 0));
       }
       node.metadata_node = i == 1 ? true : false;
-      nodes.push_back(node);
+      nodes[idx] = std::move(node);
       i++;
     }
   }
@@ -61,12 +60,11 @@ void MetadataNodesetSelectorTest::addNewRack(std::string rack_location,
                                              std::vector<node_index_t> nodes) {
   std::unordered_map<ShardID, membership::StorageState> map;
   for (auto nid : nodes) {
-    NodeTemplate node;
-    node.id = nid;
-    node.location = rack_location;
-    node.num_shards = 1;
+    configuration::Node node = configuration::Node::withTestDefaults(nid);
+    node.setLocation(rack_location);
+    node.addStorageRole(1);
     auto update =
-        NodesConfigurationTestUtil::addNewNodeUpdate(*nodes_config_, node);
+        NodesConfigurationTestUtil::addNewNodeUpdate(*nodes_config_, node, nid);
     nodes_config_ = nodes_config_->applyUpdate(update);
     map[ShardID(nid, 0)] = membership::StorageState::READ_WRITE;
   }
@@ -158,8 +156,8 @@ TEST_F(MetadataNodesetSelectorTest, ExcludeNode) {
 
   // Say we want to exclude one of them
   auto excluded_node = *old_metadata_nodeset.begin();
-  auto result = MetadataNodeSetSelector::getNodeSet(
-      nodes_config_, {excluded_node});
+  auto result =
+      MetadataNodeSetSelector::getNodeSet(nodes_config_, {excluded_node});
   EXPECT_FALSE(result.hasError());
   EXPECT_TRUE(result.hasValue());
   EXPECT_EQ(old_metadata_nodeset.size(), result.value().size());
@@ -169,8 +167,8 @@ TEST_F(MetadataNodesetSelectorTest, ExcludeNode) {
 }
 
 TEST_F(MetadataNodesetSelectorTest, MultiScopeReplicationProperty) {
-  replication_property_ = ReplicationProperty(
-      {{NodeLocationScope::NODE, 3}, {NodeLocationScope::CLUSTER, 2}});
+  replication_property_ =
+      ReplicationProperty({{NodeLocationScope::CLUSTER, 3}});
   init();
   auto old_metadata_nodeset =
       nodes_config_->getStorageMembership()->getMetaDataNodeSet();
@@ -197,6 +195,30 @@ TEST_F(MetadataNodesetSelectorTest, MultiScopeReplicationProperty) {
   EXPECT_FALSE(result.hasError());
   EXPECT_TRUE(result.hasValue());
   EXPECT_EQ(result.value().size(), 5);
+}
+
+TEST_F(MetadataNodesetSelectorTest, NodeScopeNodeset) {
+  replication_property_ = ReplicationProperty({{NodeLocationScope::NODE, 3}});
+  // Build a cluster with three nodes in the same domain
+  configuration::Nodes nodes;
+  for (int i = 0; i < 3; i++) {
+    nodes.emplace(i,
+                  configuration::Node::withTestDefaults(i)
+                      .setLocation("rg1.dc1.msb3.rw1.rk1")
+                      .addStorageRole(1));
+  }
+  auto update = NodesConfigurationTestUtil::initialAddShardsUpdate(
+      nodes, replication_property_);
+  nodes_config_ =
+      NodesConfigurationTestUtil::provisionNodes(std::move(update), {});
+  ld_check(nodes_config_);
+
+  // We should be able to build a nodeset that spawns the whole cluster
+  auto result = MetadataNodeSetSelector::getNodeSet(
+      nodes_config_, std::unordered_set<node_index_t>());
+
+  ASSERT_TRUE(result.hasValue());
+  EXPECT_EQ((std::set<node_index_t>{0, 1, 2}), result.value());
 }
 
 }} // namespace facebook::logdevice

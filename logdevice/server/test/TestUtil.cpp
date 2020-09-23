@@ -8,7 +8,6 @@
 
 #include "logdevice/server/test/TestUtil.h"
 
-#include "logdevice/admin/AdminServer.h"
 #include "logdevice/admin/maintenance/ClusterMaintenanceStateMachine.h"
 #include "logdevice/admin/settings/AdminServerSettings.h"
 #include "logdevice/common/NoopTraceLogger.h"
@@ -19,12 +18,13 @@
 #include "logdevice/common/test/TestUtil.h"
 #include "logdevice/server/Listener.h"
 #include "logdevice/server/LogStoreMonitor.h"
-#include "logdevice/server/RebuildingCoordinator.h"
-#include "logdevice/server/RebuildingSupervisor.h"
 #include "logdevice/server/ServerProcessor.h"
 #include "logdevice/server/locallogstore/ShardedRocksDBLocalLogStore.h"
+#include "logdevice/server/rebuilding/RebuildingCoordinator.h"
+#include "logdevice/server/rebuilding/RebuildingSupervisor.h"
 #include "logdevice/server/shutdown.h"
 #include "logdevice/server/storage_tasks/ShardedStorageThreadPool.h"
+#include "logdevice/server/thrift/LogDeviceThriftServer.h"
 
 namespace facebook { namespace logdevice {
 
@@ -74,47 +74,65 @@ TestServerProcessorBuilder::setMyNodeID(NodeID my_node_id) {
   return *this;
 }
 
+TestServerProcessorBuilder& TestServerProcessorBuilder::setDeferStart() {
+  defer_start_ = true;
+  return *this;
+}
+
 std::shared_ptr<ServerProcessor> TestServerProcessorBuilder::build() && {
   if (!config_) {
     setUpdateableConfig(UpdateableConfig::createEmpty());
   }
-  if (!server_settings_.hasValue()) {
+  if (!server_settings_.has_value()) {
     setServerSettings(create_default_settings<ServerSettings>());
   }
-  if (!admin_settings_.hasValue()) {
+  if (!admin_settings_.has_value()) {
     setAdminServerSettings(create_default_settings<AdminServerSettings>());
   }
-  if (!gossip_settings_.hasValue()) {
+  if (!gossip_settings_.has_value()) {
     GossipSettings gossip_settings(create_default_settings<GossipSettings>());
     gossip_settings.enabled = false;
     setGossipSettings(std::move(gossip_settings));
   }
-  return ServerProcessor::create(nullptr,
-                                 sharded_storage_thread_pool_,
-                                 std::move(server_settings_).value(),
-                                 std::move(gossip_settings_).value(),
-                                 std::move(admin_settings_).value(),
-                                 config_,
-                                 std::make_shared<NoopTraceLogger>(config_),
-                                 std::move(settings_),
-                                 stats_,
-                                 make_test_plugin_registry(),
-                                 "",
-                                 "",
-                                 "logdevice",
-                                 std::move(my_node_id_));
+  auto p = ServerProcessor::createWithoutStarting(
+      sharded_storage_thread_pool_,
+      /* log storage state map */ nullptr,
+      std::move(server_settings_).value(),
+      std::move(gossip_settings_).value(),
+      std::move(admin_settings_).value(),
+      config_,
+      std::make_shared<NoopTraceLogger>(config_),
+      std::move(settings_),
+      stats_,
+      make_test_plugin_registry(),
+      "",
+      "",
+      "logdevice",
+      std::move(my_node_id_));
+
+  if (!defer_start_) {
+    p->startRunning();
+  }
+
+  return p;
 }
 
 void shutdown_test_server(std::shared_ptr<ServerProcessor>& processor) {
-  std::unique_ptr<AdminServer> admin_handle;
+  using ClientNetworkPriority =
+      configuration::nodes::NodeServiceDiscovery::ClientNetworkPriority;
+
+  std::unique_ptr<LogDeviceThriftServer> admin_handle;
+  std::unique_ptr<LogDeviceThriftServer> s2s_thrift_api_server;
+  std::unique_ptr<LogDeviceThriftServer> c2s_thrift_api_server;
   std::unique_ptr<Listener> connection_listener;
-  std::unique_ptr<Listener> command_listener;
   std::unique_ptr<Listener> gossip_listener;
   std::unique_ptr<Listener> ssl_connection_listener;
+  std::unique_ptr<Listener> server_to_server_listener;
+  std::map<ClientNetworkPriority, std::unique_ptr<Listener>>
+      listeners_per_priority;
   std::unique_ptr<folly::EventBaseThread> connection_listener_loop;
-  std::unique_ptr<folly::EventBaseThread> command_listener_loop;
   std::unique_ptr<folly::EventBaseThread> gossip_listener_loop;
-  std::unique_ptr<folly::EventBaseThread> ssl_connection_listener_loop;
+  std::unique_ptr<folly::EventBaseThread> server_to_server_listener_loop;
   std::unique_ptr<LogStoreMonitor> logstore_monitor;
   std::unique_ptr<ShardedStorageThreadPool> storage_thread_pool;
   std::unique_ptr<ShardedRocksDBLocalLogStore> sharded_store;
@@ -126,15 +144,18 @@ void shutdown_test_server(std::shared_ptr<ServerProcessor>& processor) {
   std::unique_ptr<maintenance::ClusterMaintenanceStateMachine>
       cluster_maintenance_state_machine;
 
+  uint64_t shutdown_duration_ms = 0;
   shutdown_server(admin_handle,
+                  s2s_thrift_api_server,
+                  c2s_thrift_api_server,
                   connection_listener,
-                  command_listener,
+                  listeners_per_priority,
                   gossip_listener,
                   ssl_connection_listener,
+                  server_to_server_listener,
                   connection_listener_loop,
-                  command_listener_loop,
                   gossip_listener_loop,
-                  ssl_connection_listener_loop,
+                  server_to_server_listener_loop,
                   logstore_monitor,
                   processor,
                   storage_thread_pool,
@@ -145,6 +166,7 @@ void shutdown_test_server(std::shared_ptr<ServerProcessor>& processor) {
                   rebuilding_supervisor,
                   unreleased_record_detector,
                   cluster_maintenance_state_machine,
-                  false);
+                  false,
+                  shutdown_duration_ms);
 }
 }} // namespace facebook::logdevice

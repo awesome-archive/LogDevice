@@ -18,9 +18,9 @@
 #include <folly/Executor.h>
 
 #include "logdevice/common/EventLoopTaskQueue.h"
+#include "logdevice/common/PThread.h"
 #include "logdevice/common/Semaphore.h"
 #include "logdevice/common/ThreadID.h"
-#include "logdevice/common/TimeoutMap.h"
 #include "logdevice/common/libevent/LibEventCompatibility.h"
 
 namespace facebook { namespace logdevice {
@@ -53,7 +53,8 @@ class EventLoop : public folly::Executor {
       bool enable_priority_queues = true,
       const std::array<uint32_t, EventLoopTaskQueue::kNumberOfPriorities>&
           requests_per_iteration = {13, 3, 1},
-      EvBase::EvBaseType base_type = EvBase::LEGACY_EVENTBASE);
+      EvBase::EvBaseType base_type = EvBase::FOLLY_EVENTBASE,
+      bool start_running = true);
 
   // destructor has to be virtual because it is invoked by EventLoop::run()
   // as "delete this"
@@ -72,6 +73,14 @@ class EventLoop : public folly::Executor {
     return *base_;
   }
 
+  uint8_t getNumPriorities() const override {
+    return EventLoopTaskQueue::kNumberOfPriorities;
+  }
+
+  // Tells the event loop thread to start processing requests.
+  // Must be called if `start_running = false` was passed to constructor.
+  void startRunning();
+
   /// Enqueue a function to executed by this executor. This and all
   /// variants must be threadsafe.
   void add(folly::Function<void()>) override;
@@ -88,7 +97,7 @@ class EventLoop : public folly::Executor {
    *
    * @return the pthread handle. This function should never fail.
    */
-  std::thread& getThread() {
+  PThread& getThread() {
     return thread_;
   }
 
@@ -106,28 +115,6 @@ class EventLoop : public folly::Executor {
    */
   static EventLoop* onThisThread() {
     return EventLoop::thisThreadLoop_;
-  }
-
-  // A map that translates std::chrono::milliseconds values into
-  // struct timevals suitable for use with evtimer_add() for append request
-  // timers. The first kMaxFastTimeouts *distinct* timeout values are
-  // mapped into fake struct timeval created by
-  // event_base_init_common_timeout() and actually containing timer queue
-  // ids for this thread's event_base.
-  TimeoutMap& commonTimeouts() {
-    return common_timeouts_;
-  }
-
-  // Convenience function so callers of commonTimeouts().get() don't need
-  // to declare a local timeval. Must only be used from the Worker's thread.
-  template <typename Duration>
-  const timeval* getCommonTimeout(Duration d) {
-    ld_check(EventLoop::onThisThread() == this);
-    auto timeout = std::chrono::duration_cast<std::chrono::microseconds>(d);
-    return commonTimeouts().get(timeout);
-  }
-  const timeval* getZeroTimeout() {
-    return commonTimeouts().get(std::chrono::milliseconds(0));
   }
 
   static const int PRIORITY_LOW = 2;    // lowest priority
@@ -149,12 +136,12 @@ class EventLoop : public folly::Executor {
   std::atomic<size_t> event_handlers_completed_{0};
 
  protected:
-  bool keepAliveAcquire() override {
+  bool keepAliveAcquire() noexcept override {
     num_references_.fetch_add(1, std::memory_order_relaxed);
     return true;
   }
 
-  void keepAliveRelease() override {
+  void keepAliveRelease() noexcept override {
     auto prev = num_references_.fetch_sub(1, std::memory_order_acq_rel);
     ld_assert(prev > 0);
   }
@@ -163,13 +150,19 @@ class EventLoop : public folly::Executor {
   ThreadID::Type thread_type_;
   std::string thread_name_;
 
-  std::thread thread_; // thread on which this loop runs
+  PThread thread_; // thread on which this loop runs
 
   // pid of thread_
   int tid_{-1};
 
   // Main task queue; (shutting down this TaskQueue stops the event loop)
   std::unique_ptr<EventLoopTaskQueue> task_queue_;
+
+  // The thread will block on this semaphore before it starts processing
+  // requests.
+  Semaphore start_running_;
+  // True if we posted to start_running_.
+  bool started_running_ = false;
 
   Status
   init(EvBase::EvBaseType base_type,
@@ -186,17 +179,10 @@ class EventLoop : public folly::Executor {
   // eventloop.
   std::atomic<size_t> num_references_{0};
 
-  // TimeoutMap to cache common timeouts.
-  TimeoutMap common_timeouts_{kMaxFastTimeouts};
-
   // True indicates eventloop honors the priority with used in
   // EventLoop::addWithPriority. If false EventLoop will override the priority
   // of the task and make all work added as single priority.
   bool priority_queues_enabled_;
-
-  // Size limit for commonTimeouts_ (NB: libevent has a default upper bound
-  // of MAX_COMMON_TIMEOUTS = 256)
-  static constexpr int kMaxFastTimeouts = 200;
 };
 
 }} // namespace facebook::logdevice

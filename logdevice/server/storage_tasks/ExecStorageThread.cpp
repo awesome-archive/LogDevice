@@ -29,7 +29,7 @@ void ExecStorageThread::run() {
   // both slow and metadata threads are using the lower io priority
   if ((thread_type_ == StorageTask::ThreadType::SLOW ||
        thread_type_ == StorageTask::ThreadType::DEFAULT) &&
-      settings->slow_ioprio.hasValue()) {
+      settings->slow_ioprio.has_value()) {
     set_io_priority_of_this_thread(settings->slow_ioprio.value());
   }
 
@@ -83,10 +83,12 @@ void ExecStorageThread::run() {
     slow_task_tracer.traceStorageTask(
         [&] {
           StorageTaskDebugInfo info = task->getDebugInfo();
-          info.execution_start_time =
-              toSystemTimestamp(execution_start_time).toMilliseconds();
-          info.execution_end_time =
-              toSystemTimestamp(execution_end_time).toMilliseconds();
+          info.execution_start_time = SteadyTimestamp(execution_start_time)
+                                          .approximateSystemTimestamp()
+                                          .toMilliseconds();
+          info.execution_end_time = SteadyTimestamp(execution_end_time)
+                                        .approximateSystemTimestamp()
+                                        .toMilliseconds();
           return info;
         },
         /* execution_time_ms */ usec / 1000);

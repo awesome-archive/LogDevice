@@ -2,9 +2,6 @@ aliases:
   - &filter-ignore-gh-pages
     branches:
       ignore: gh-pages
-  - &filter-only-master
-    branches:
-      only: master
 
 version: 2
 jobs:
@@ -15,17 +12,24 @@ jobs:
     steps:
       - checkout
       - run: apt-get update
-      - run: apt-get install -y ca-certificates doxygen $(cat logdevice/build_tools/ubuntu.deps)
+      - run: apt-get install -y ca-certificates git
+      - run: apt-get install -y doxygen $(cat logdevice/build_tools/ubuntu.deps)
       - run: git reset --hard HEAD
       - run: git submodule sync
       - run: git submodule update --init --recursive
       - run:
           name: Build LogDevice
           command: |
-            mkdir -p _build
+            export CC=clang-9
+            export CXX=clang++-9
+            mkdir -p _build/staging/usr/local
+            python3 -m pip install virtualenv
+            python3 -m virtualenv _build/staging/usr/local
+            source _build/staging/usr/local/bin/activate
+            python3 -m pip install --upgrade setuptools wheel cython
             cd _build
-            cmake -DPORTABLE=ON ../logdevice/
-            make -j 8
+            cmake -Dthriftpy3=ON ../logdevice/
+            make -j 5
       - run:
           name: Generate Documentation
           working_directory: _build
@@ -62,7 +66,7 @@ jobs:
     steps:
       - checkout
       - run: apt-get update
-      - run: apt-get install -y ca-certificates doxygen xsltproc $(cat logdevice/build_tools/ubuntu.deps)
+      - run: apt-get install -y ca-certificates doxygen git xsltproc $(cat logdevice/build_tools/ubuntu.deps)
       - run: git reset --hard HEAD
       - attach_workspace:
           at: .
@@ -91,26 +95,48 @@ jobs:
     steps:
       - checkout
       - run: apt-get update
-      - run: apt-get install -y ca-certificates docker.io
+      - run: apt-get install -y ca-certificates git docker.io
       - run: git reset --hard HEAD
-      - attach_workspace:
-          at: .
+      - run: git submodule sync
+      - run: git submodule update --init --recursive
       - setup_remote_docker:
           docker_layer_caching: true
       - run:
-          name: Assemble Docker Image
+          name: Assemble Docker Image (Ubuntu)
           command: |
-            docker build -t facebookincubator/logdevice:latest -f docker/Dockerfile.ci .
+            docker build -t facebookincubator/logdevice:latest --build-arg PARALLEL=2 -f docker/Dockerfile.ubuntu .
       - run:
           name: Push Image to DockerHub
           command: |
             if [ -n "$DOCKER_PWD" ]; then
+              if [ "$CIRCLE_BRANCH" == "master" ]; then
+                DOCKER_TAG=latest;
+              elif [ -n "$CIRCLE_TAG" ]; then
+                DOCKER_TAG=$CIRCLE_TAG;
+              else
+                DOCKER_TAG=$CIRCLE_BRANCH;
+              fi
               echo $DOCKER_PWD | docker login -u $DOCKER_LOGIN --password-stdin
-              docker push facebookincubator/logdevice:latest
+              docker push facebookincubator/logdevice:$DOCKER_TAG
             fi
 workflows:
   version: 2
-  build_and_deploy:
+  nightly:
+    triggers:
+      - schedule:
+          # 6AM UTC build
+          cron: "6 0 * * *"
+          filters:
+            branches:
+              only: master
+    jobs:
+      - dockerimage:
+          filters:
+            branches:
+              only: master
+            tags:
+              only: /.*/
+  build_and_test:
     jobs:
       - build:
           filters: *filter-ignore-gh-pages
@@ -118,11 +144,17 @@ workflows:
           filters: *filter-ignore-gh-pages
           requires:
             - build
-      - dockerimage:
-          filters: *filter-only-master
-          requires:
-            - build
       - deploy-website:
-          filters: *filter-only-master
+          filters:
+            branches:
+              only: master
           requires:
             - build
+      - dockerimage:
+          requires:
+            - build
+          filters:
+            branches:
+              ignore: master
+            tags:
+              only: /.*/

@@ -154,9 +154,6 @@ struct STORE_Header {
   // epoch of the record.
   static const STORE_flags_t EPOCH_BEGIN = 1 << 16; //=65536
 
-  // used to know weather we should expect e2e tracing information or not
-  static const STORE_flags_t E2E_TRACING_ON = 1u << 17; //=131072
-
   // used to know if contains OffsetMap or not
   static const STORE_flags_t OFFSET_MAP = 1u << 18; //=262144
 
@@ -168,6 +165,9 @@ struct STORE_Header {
   // must match that of LocalLogStoreRecordFormat::FLAG_WRITE_STREAM and
   // RECORD_Header::WRITE_STREAM
   static const STORE_flags_t WRITE_STREAM = 1u << 22; //=4194304
+
+  // Record contains serialized PayloadGroup
+  static const STORE_flags_t PAYLOAD_GROUP = 1u << 23; //=8388608
 
   // Please update STORE_Message::flagsToString() when adding flags.
 } __attribute__((__packed__));
@@ -194,10 +194,10 @@ struct STORE_Extra {
   uint32_t rebuilding_wave = 0;
 
   // If this STORE message is for rebuilding, the rebuilding_id which uniquely
-  // identifies a run of the LogRebuilding state machine where this store
+  // identifies a run of the ChunkRebuilding state machine where this store
   // originated from, is sent along. This version will be passed back in the
   // STORED reply.
-  log_rebuilding_id_t rebuilding_id = LOG_REBUILDING_ID_INVALID;
+  chunk_rebuilding_id_t rebuilding_id = CHUNK_REBUILDING_ID_INVALID;
 
   // If this STORE message include BYTE_OFFSET (BYTE_OFFSET flag is
   // set), the amount of bytes were written in epoch (to which this message
@@ -256,9 +256,8 @@ class STORE_Message : public Message {
                 STORE_flags_t additional_flags,
                 STORE_Extra extra,
                 std::map<KeyType, std::string> optional_keys,
-                std::shared_ptr<PayloadHolder> payload,
-                bool appender_context = false,
-                std::string e2e_tracing_context = "");
+                const PayloadHolder& payload,
+                bool appender_context = false);
 
   // Movable but not copyable
   STORE_Message(STORE_Message&&) = default;
@@ -307,9 +306,6 @@ class STORE_Message : public Message {
     std::abort();
   }
   static Message::deserializer_t deserialize;
-  // Overload of deserialize that does not need to run on a Worker thread.
-  static MessageReadResult deserialize(ProtocolReader&,
-                                       size_t max_payload_inline);
 
   /**
    * @return a human-readable representation of copyset_
@@ -371,7 +367,7 @@ class STORE_Message : public Message {
   }
 
   const PayloadHolder* getPayloadHolder() const {
-    return payload_.get();
+    return &payload_;
   }
 
   /**
@@ -394,8 +390,7 @@ class STORE_Message : public Message {
    * deserialize() uses this constructor when it reads a STORE message from
    * the input buffer of a bufferevent.
    */
-  STORE_Message(const STORE_Header& header,
-                std::shared_ptr<PayloadHolder>&& payload);
+  STORE_Message(const STORE_Header& header, const PayloadHolder& payload);
 
   // Convenience wrapper for STORED_Message::createAndSend
   void sendReply(Status status,
@@ -419,10 +414,7 @@ class STORE_Message : public Message {
   // exists before allowing the message to be serialized onto the wire
   bool appender_context_{false};
 
-  // Nullptr means empty payload.  The payload is also not serialized when the
-  // AMEND flag is set, so on the receiving side it will always be empty for
-  // amends.
-  std::shared_ptr<PayloadHolder> payload_;
+  PayloadHolder payload_;
 
   // identities of all nodes on which this record is stored
   folly::small_vector<StoreChainLink, 6> copyset_;
@@ -451,10 +443,6 @@ class STORE_Message : public Message {
   // if true, indicate that the STORE is preempted by only by a soft seal
   bool soft_preempted_only_{false};
 
-  // tracing context containing information about the parent context of future
-  // spans references
-  std::string e2e_tracing_context_;
-
   friend class StoreStateMachine;
   friend void STORE_onSent(const STORE_Message& msg,
                            Status st,
@@ -464,7 +452,6 @@ class STORE_Message : public Message {
   friend class AppenderTest;
   friend class TestAppender;
   friend class MessageSerializationTest;
-  friend class E2ETracingSerializationTest;
 };
 
 }} // namespace facebook::logdevice

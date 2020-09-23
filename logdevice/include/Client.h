@@ -200,21 +200,9 @@ typedef std::function<void(Status status, std::unique_ptr<LogHeadAttributes>)>
 class Client {
  public:
   /**
-   * This interface is deprecated. Please use ClientFactory to create clients
+   * Note that Client doesn't have a public constructor. The only way to
+   * construct a `Client` instance is using a `ClientFactory`
    */
-  [[deprecated("Replaced by ClientFactory")]] static std::shared_ptr<Client>
-  create(std::string cluster_name,
-         std::string config_url,
-         std::string credentials,
-         std::chrono::milliseconds timeout,
-         std::unique_ptr<ClientSettings> settings,
-         std::string csid = "") noexcept;
-
-  /**
-  No default constructor will issue a compilation error, since ClientImpl
-  need to initialize the Client object at first.
-  */
-  Client() = default;
 
   /**
    * ClientFactory::create() actually returns pointers to objects of class
@@ -305,6 +293,28 @@ class Client {
    * Appends a new record to the log. Blocks until operation completes.
    * The delivery of a signal does not interrupt the wait.
    *
+   * @param logid         unique id of the log to which to append a new record
+   *
+   * @param payload_group record payloads. Other threads of the caller must not
+   *                      modify IOBufs of the group until the call returns.
+   *
+   * @param attrs         additional append attributes. See AppendAttributes
+   *
+   * @param timestamp     Timestamp set and stored with the record by the
+   *                      LogDevice cluster.
+   *
+   * See appendSync(logid_t, std::string) for a description of return values.
+   */
+  virtual lsn_t
+  appendSync(logid_t logid,
+             PayloadGroup&& payload_group,
+             AppendAttributes attrs = AppendAttributes(),
+             std::chrono::milliseconds* timestamp = nullptr) noexcept = 0;
+
+  /**
+   * Appends a new record to the log. Blocks until operation completes.
+   * The delivery of a signal does not interrupt the wait.
+   *
    * @param logid     unique id of the log to which to append a new record
    *
    * @param payload   record payload, see Record.h. The function does not
@@ -317,8 +327,7 @@ class Client {
    * @param timestamp Timestamp set and stored with the record by the
    *                  LogDevice cluster.
    *
-   * See appendSync(logid_t, const Payload&) for a description of return
-   * values.
+   * See appendSync(logid_t, std::string) for a description of return values.
    */
   virtual lsn_t
   appendSync(logid_t logid,
@@ -349,7 +358,7 @@ class Client {
    *
    * @param logid     unique id of the log to which to append a new record
    *
-   * @param payload   record payload.
+   * @param payload   record payload
    *
    * @param cb        the callback to call
    *
@@ -369,19 +378,19 @@ class Client {
                      AppendAttributes attrs = AppendAttributes()) noexcept = 0;
 
   /**
-   * Appends a new record to the log without blocking. This version doesn't
-   * transfer the ownership of the payload to LogDevice and assumes that the
-   * caller will be responsible for destroying it.
-   *
-   *  IMPORTANT: for performance reasons this function does not make
-   *  an internal copy of payload.  It just passes payload.data
-   *  pointer and payload.size value to the LogDevice client thread
-   *  pool. The caller MUST make sure that the payload is not free'd
-   *  or modified, or its memory is otherwise reused until the
-   *  callback cb() is called with the same payload as its argument. A
-   *  common pattern for sending a payload that's on the stack is to
-   *  memcpy() it into a malloc'ed buffer, then call free() on
-   *  payload.data pointer passed to cb().
+   * Appends a new record to the log without blocking. Payloads must not by
+   * modified until callback is called.
+   * Behavior is the same as in append(logid_t, std::string, ...).
+   */
+  virtual int append(logid_t logid,
+                     PayloadGroup&& payload_group,
+                     append_callback_t cb,
+                     AppendAttributes attrs = AppendAttributes()) noexcept = 0;
+
+  /**
+   * Appends a new record to the log without blocking. Makes a copy of the
+   * provided payload, so it's ok to deallocate `payload` after the append()
+   * call returns, without waiting for callback.
    */
   virtual int append(logid_t logid,
                      const Payload& payload,
@@ -667,54 +676,8 @@ class Client {
           FindKeyAccuracy accuracy = FindKeyAccuracy::STRICT) noexcept = 0;
 
   /**
-   * NOTE: This API call translates to isLogEmptyV2Sync call, if client setting
-   * --enable-is-log-empty-v2 is set to true. If you intend to use this, please
-   * refer to the comment section of isLogEmptyV2Sync for possbile error codes
-   * as they are slightly different from V1.
-   *
    * Checks wether a particular log is empty. This method is blocking until the
    * state can be determined or an error occurred.
-   *
-   * @param logid is the ID of the log to check
-   * @param empty will be set by this method to either true or false depending
-   *        on the responses received by storage nodes.
-   * @return 0 if the request was successful, -1 otherwise and sets
-   *         logdevice::err to:
-   *     INVALID_PARAM  if the log ID is invalid,
-   *     PARTIAL        if we can't answer with certainty. The log is probably
-   *                    either empty or almost empty, and any records are
-   *                    probably not very recent.
-   *     ACCESS         if permission to access the log was denied
-   *     FAILED         if the state of the log could not be determined.
-   *     NOBUFS         if too many requests are pending to be delivered to
-   *                    Workers
-   *     SHUTDOWN       Processor is shutting down
-   *     INTERNAL       if attempt to write into the request pipe of a
-   *                    Worker failed
-   *     TIMEDOUT       None of the above happened before the client timeout
-   *                    ran out.
-   */
-  virtual int isLogEmptySync(logid_t logid, bool* empty) noexcept = 0;
-
-  /**
-   * NOTE: This API call translates to isLogEmptyV2 call, if client setting
-   * --enable-is-log-empty-v2 is set to true. If you intend to use this, please
-   * refer to the comment section of isLogEmptyV2Sync for possbile error codes
-   * as they are slightly different from V1.
-   *
-   * A non-blocking version of isLogEmptySync().
-   *
-   * @param logid is the ID of the log to check
-   * @param cb will be called once the state of the log is determined or an
-   *        error occurred. The possible status values are the same as for
-   *        isLogEmptySync().
-   * @return 0 if the request was successfuly scheduled, -1 otherwise.
-   */
-  virtual int isLogEmpty(logid_t logid, is_empty_callback_t cb) noexcept = 0;
-
-  /**
-   * Like isLogEmptySync, but instead of asking all the nodes, we ask the
-   * sequencer to compare the trim point to the tail record of the log.
    *
    * @param logid is the ID of the log to check
    * @param empty will be set by this method to either true or false depending
@@ -738,18 +701,18 @@ class Client {
    *     TIMEDOUT       None of the above happened before the client timeout
    *                    ran out.
    */
-  virtual int isLogEmptyV2Sync(logid_t logid, bool* empty) noexcept = 0;
+  virtual int isLogEmptySync(logid_t logid, bool* empty) noexcept = 0;
 
   /**
-   * A non-blocking version of isLogEmptyV2Sync().
+   * A non-blocking version of isLogEmptySync().
    *
    * @param logid is the ID of the log to check
    * @param cb will be called once the state of the log is determined or an
    *        error occurred. The possible status values are the same as for
-   *        isLogEmptyV2Sync().
+   *        isLogEmptySync().
    * @return 0 if the request was successfuly scheduled, -1 otherwise.
    */
-  virtual int isLogEmptyV2(logid_t logid, is_empty_callback_t cb) noexcept = 0;
+  virtual int isLogEmpty(logid_t logid, is_empty_callback_t cb) noexcept = 0;
 
   /**
    * Finds the size of stored data for the given log in the given time range,
@@ -1451,6 +1414,13 @@ class Client {
                             std::string type,
                             std::string data = "",
                             std::string context = "") noexcept = 0;
+
+ protected:
+  /**
+  No default constructor will issue a compilation error, since ClientImpl
+  need to initialize the Client object at first.
+  */
+  Client() = default;
 
  private:
   Client(const Client&) = delete;            // non-copyable

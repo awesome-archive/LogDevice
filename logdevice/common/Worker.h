@@ -17,9 +17,12 @@
 #include <utility>
 #include <vector>
 
+#include <folly/Function.h>
 #include <folly/IntrusiveList.h>
 #include <folly/Random.h>
 #include <folly/concurrency/UnboundedQueue.h>
+#include <folly/container/F14Map.h>
+#include <folly/futures/Future.h>
 #include <folly/io/async/Request.h>
 
 #include "logdevice/common/ClientID.h"
@@ -28,9 +31,9 @@
 #include "logdevice/common/RecordID.h"
 #include "logdevice/common/RunContext.h"
 #include "logdevice/common/ThreadID.h"
-#include "logdevice/common/TimeoutMap.h"
 #include "logdevice/common/Timer.h"
 #include "logdevice/common/WorkerType.h"
+#include "logdevice/common/client_read_stream/AllClientReadStreams.h"
 #include "logdevice/common/settings/Settings.h"
 #include "logdevice/common/settings/UpdateableSettings.h"
 #include "logdevice/common/types_internal.h"
@@ -101,14 +104,13 @@ namespace facebook { namespace logdevice {
 
 /**
  * @file A Worker executes LogDevice requests, keeps track of active Request
- *       objects, and manages a collection of Sockets. All LogDevice requests
- *       are executed on Executor threads. Worker objects directly receive and
- *       execute requests from client threads, the listener thread, and the
+ *       objects, and manages a collection of Connections. All LogDevice
+ * requests are executed on Executor threads. Worker objects directly receive
+ * and execute requests from client threads, the listener thread, and the
  *       command port thread. These other threads use Processor object to
  *       pass the requests to a Worker.
  */
 
-class AllClientReadStreams;
 class AppenderBuffer;
 class BufferedWriterShard;
 class ClusterState;
@@ -116,7 +118,6 @@ class Configuration;
 class EpochRecovery;
 class EventLogStateMachine;
 class GetSeqStateRequestMap;
-class LogRebuildingInterface;
 class LogStorageState;
 class LogsConfig;
 class LogsConfigManager;
@@ -140,6 +141,7 @@ class UpdateableConfig;
 class WorkerImpl;
 class WorkerTimeoutStats;
 class OverloadDetector;
+class ThriftRouter;
 
 namespace maintenance {
 class ClusterMaintenanceStateMachine;
@@ -160,10 +162,9 @@ struct GetClusterStateRequestMap;
 struct GetEpochRecoveryMetadataRequestMap;
 struct GetHeadAttributesRequestMap;
 struct GetLogInfoRequestMaps;
+struct GetRsmSnapshotRequestMap;
 struct GetTrimPointRequestMap;
-struct IsLogEmptyRequestMap;
 struct LogIDUniqueQueue;
-struct LogRebuildingMap;
 struct LogRecoveryRequestMap;
 struct LogsConfigApiRequestMap;
 struct LogsConfigManagerReplyMap;
@@ -171,6 +172,9 @@ struct LogsConfigManagerRequestMap;
 struct MUTATED_Header;
 struct TrimRequestMap;
 struct WriteMetaDataRecordMap;
+struct SettingOverrideTTLRequestMap {
+  std::unordered_map<std::string, std::unique_ptr<Request>> map;
+};
 
 namespace configuration {
 class ZookeeperConfig;
@@ -189,7 +193,7 @@ class Worker : public WorkContext {
    *
    * @param processor         processor that created this Worker, required.
    * @param idx               see .idx_
-   * @param config            cluster configuration that Sockets and other
+   * @param config            cluster configuration that Connections and other
    *                          objects running on this Worker thread will use
    *
    * @throws ConstructorFailed on error, sets err to
@@ -264,21 +268,10 @@ class Worker : public WorkContext {
   std::shared_ptr<ServerConfig> getServerConfig() const;
 
   /**
-   * @return  NodesConfiguraton object cached on this worker, depending on
-   *          processor settings, the source can be server config or NCM.
+   * @return  NodesConfiguraton object cached on this worker.
    */
   std::shared_ptr<const configuration::nodes::NodesConfiguration>
   getNodesConfiguration() const;
-
-  /**
-   * get the NodesConfiguration updated by NodesConfigurationManager.
-   * Note: only used during NCM migration period, will be removed later
-   */
-  std::shared_ptr<const configuration::nodes::NodesConfiguration>
-  getNodesConfigurationFromNCMSource() const;
-
-  std::shared_ptr<const configuration::nodes::NodesConfiguration>
-  getNodesConfigurationFromServerConfigSource() const;
 
   /**
    * @return logs configuration object cached on this Worker and
@@ -362,7 +355,7 @@ class Worker : public WorkContext {
 
   const std::shared_ptr<TraceLogger> getTraceLogger() const;
 
-  // Socket close callbacks for each storage node used by PeriodicReleases.
+  // Connection close callbacks for each storage node used by PeriodicReleases.
   // These are used to invalidate last released lsn to a storage node
   // when the connection b/w sequencer and storage node breaks.
   std::vector<std::unique_ptr<SocketCallback>>
@@ -377,9 +370,9 @@ class Worker : public WorkContext {
   // pool this worker lives.
   const WorkerType worker_type_{WorkerType::GENERAL};
 
-  // MessageDispatch instance which the Socket layer uses to dispatch message
-  // events.  Subclasses of Worker can override createMessageDispatch() to
-  // make this a MessageDispatch subclass.  Intentionally here to outlive
+  // MessageDispatch instance which the Connection layer uses to dispatch
+  // message events.  Subclasses of Worker can override createMessageDispatch()
+  // to make this a MessageDispatch subclass.  Intentionally here to outlive
   // `impl_' (Sender, importantly).
   std::unique_ptr<MessageDispatch> message_dispatch_;
 
@@ -394,7 +387,7 @@ class Worker : public WorkContext {
   // Needs to outlive impl_->runningAppends_ because buffered writer append
   // callbacks access this map.
   using ActiveBufferedWritersMap =
-      std::unordered_map<buffered_writer_id_t,
+      folly::F14ValueMap<buffered_writer_id_t,
                          BufferedWriterShard*,
                          buffered_writer_id_t::Hash>;
   ActiveBufferedWritersMap active_buffered_writers_;
@@ -404,11 +397,13 @@ class Worker : public WorkContext {
   std::unique_ptr<WorkerImpl> impl_;
 
   // An interface for sending Messages on this Worker. This object owns all
-  // Sockets on this Worker.
+  // Connections on this Worker.
   Sender& sender() const;
 
-  // a map of all currently running LogRebuildings.
-  LogRebuildingMap& runningLogRebuildings() const;
+  /**
+   * Creates an instance of Thrift client for sending RPC to given node.
+   */
+  ThriftRouter* getThriftRouter() const;
 
   // a map of all currently running FindKeyRequests
   FindKeyRequestMap& runningFindKey() const;
@@ -422,8 +417,7 @@ class Worker : public WorkContext {
   // a map of all currently running GetTrimPointRequest
   GetTrimPointRequestMap& runningGetTrimPoint() const;
 
-  // a map of all currently running IsLogEmptyRequests
-  IsLogEmptyRequestMap& runningIsLogEmpty() const;
+  GetRsmSnapshotRequestMap& runningGetRsmSnapshotRequests() const;
 
   // a map of all currently running dataSizeRequests
   DataSizeRequestMap& runningDataSize() const;
@@ -442,6 +436,9 @@ class Worker : public WorkContext {
 
   // Internal LogsConfigManager reply map
   LogsConfigManagerReplyMap& runningLogsConfigManagerReplies() const;
+
+  // a map of all currently running SettingOverrideTTLRequest
+  SettingOverrideTTLRequestMap& activeSettingOverrides() const;
 
   // a map of GetEpochRecoveryMetadataRequest that are running on this
   // worker
@@ -614,12 +611,6 @@ class Worker : public WorkContext {
    * given amount of time after first invocation of finishWorkAndCloseSockets.
    */
   void forceAbortPendingWork();
-
-  /**
-   * This method closes all the sockets during shutdown if the sockets don't
-   * drain in given time.
-   */
-  void forceCloseSockets();
 
   virtual void subclassFinishWork() {}
   virtual void subclassWorkFinished() {}
@@ -795,12 +786,30 @@ class Worker : public WorkContext {
   int forcePost(std::unique_ptr<Request>& req);
 
   virtual void setupWorker();
+  // Callback functions that register worker id and duration of slow/delayed
+  // action.
+  using SlowRequestCallback =
+      std::function<void(int idx, std::chrono::milliseconds duration)>;
+
+  void setLongExecutionCallback(SlowRequestCallback cb);
+  void setLongQueuedCallback(SlowRequestCallback cb);
+
+  virtual void initSSLFetcher();
 
   // Execution probability distribution of different tasks. Hi Priority tasks
   // are called such because they have a higher chance of getting executed.
   static constexpr int kHiPriTaskExecDistribution = 70;
   static constexpr int kMidPriTaskExecDistribution = 0;
   static constexpr int kLoPriTaskExecDistribution = 30;
+
+  /**
+   * Forces shutdown of Sender owned by this Worker. Can be called from
+   * arbtirary thread because it enqueues downstream shudown call to be executed
+   * on this worker.
+   *
+   * @return Future which fullfills when sender shut down.
+   */
+  FOLLY_NODISCARD folly::SemiFuture<folly::Unit> shutdownSender();
 
  private:
   // Periodically called to report load to Processor for load-aware work
@@ -815,6 +824,10 @@ class Worker : public WorkContext {
   // Helper used by onStartedRunning() and onStoppedRunning()
   void setCurrentlyRunningContext(RunContext new_context,
                                   RunContext prev_context);
+  // Helper used to generate error injection if the conditions are correct. Used
+  // to test HealthMonitor functionalities.
+  void generateErrorInjection(double error_chance,
+                              std::chrono::milliseconds sleep_duration);
 
   // Subclasses can override to create a MessageDispatch subclass during
   // initialisation
@@ -842,7 +855,7 @@ class Worker : public WorkContext {
   // Storage for getTimeoutCommon().
   mutable struct timeval get_common_tv_buf_;
 
-  // Methods of Sockets and other objects managed by this Worker check
+  // Connection member functions and other objects managed by this Worker check
   // this to see if they are executing in a Worker destructor where
   // some members of Worker may have already been destroyed.
   bool shutting_down_;
@@ -866,12 +879,13 @@ class Worker : public WorkContext {
   // down work forcefully.
   size_t force_abort_pending_requests_counter_{0};
 
-  // Close open sockets. This is a derived timer based on requests_pending_timer
-  // to close sockets if they don't drain in given time. The shutdown code
-  // starts flush on all sockets. If the sockets are taking too long to drain,
-  // instead of allowing them to continue forever, close the sockets right away.
-  // This is initialized once we start waiting for sockets to close.
-  size_t force_close_sockets_counter_{0};
+  // Close open connections. This is a derived timer based on
+  // requests_pending_timer to close connections if they don't drain in given
+  // time. The shutdown code initiates flush on all connections. If the
+  // connections are taking too long to drain, instead of allowing them to
+  // continue forever, idea is to force close the connections. This is
+  // initialized once we start waiting for connection to close.
+  size_t force_close_conns_counter_{0};
 
   // timer that checks stuck requests and update counter if there are some
   // stuck requests
@@ -916,6 +930,18 @@ class Worker : public WorkContext {
   // Stop on EventLogStateMachine should only be called once.
   // Set to true once stop has been called
   bool event_log_stopped_{false};
+
+  SlowRequestCallback long_execution_cb_{nullptr};
+  SlowRequestCallback long_queued_cb_{nullptr};
+
+  // Error Injection settings:
+  double worker_stall_error_injection_chance_;
+  double worker_queue_stall_error_injection_chance_;
+  std::chrono::milliseconds worker_stall_inj_ms_;
+  std::chrono::milliseconds worker_queue_inj_ms_;
+
+ protected:
+  std::unique_ptr<SSLFetcher> ssl_fetcher_;
 
   friend struct ::testing::SocketConnectRequest;
 };

@@ -51,9 +51,9 @@ class SynchronizationFd {
   pid_t pid_;
 };
 
-/// Works like a Baton, but performs its handoff via a user-visible
-/// eventfd or pipe. This allows the caller to wait for multiple events
-/// simultaneously using epoll, poll, select, or a wrapping library
+/// Works like a Baton, but is reusable and performs its handoff via a
+/// user-visible eventfd or pipe. This allows the caller to wait for multiple
+/// events simultaneously using epoll, poll, select, or a wrapping library
 /// like libevent.
 /// All bets are off if you do anything to fd besides adding it to an
 /// epoll wait set (don't read from, write to, or close it).
@@ -68,13 +68,14 @@ template <template <typename> class Atom>
 class FdBaton {
  public:
   FOLLY_ALWAYS_INLINE void post() {
-    event_count_.fetch_add(1, std::memory_order_release);
+    bits_.fetch_add(1 + kFDWriteInProgress, std::memory_order_release);
     fd_.write();
+    bits_.fetch_sub(kFDWriteInProgress, std::memory_order_release);
   }
   FOLLY_ALWAYS_INLINE bool try_wait() noexcept {
     auto res = fd_.read();
     if (res) {
-      event_count_.fetch_sub(1, std::memory_order_acquire);
+      bits_.fetch_sub(1, std::memory_order_acquire);
     }
     return res;
   }
@@ -109,12 +110,20 @@ class FdBaton {
 
   /// Introduces an acquire memory barrier to match a release one set by post
   FOLLY_ALWAYS_INLINE int get_event_count() noexcept {
-    return event_count_.load(std::memory_order_acquire);
+    return bits_.load(std::memory_order_acquire) & (kFDWriteInProgress - 1);
   }
 
   /// Waits for baton to become active but does not consume an event.
   FOLLY_ALWAYS_INLINE void wait_readable() noexcept {
     fd_.poll();
+  }
+
+  ~FdBaton() {
+    // Wait for any in-flight fd_.write() calls to return, making it safe to
+    // destroy the fd.
+    while (bits_.load(std::memory_order_acquire) >= kFDWriteInProgress) {
+      std::this_thread::yield();
+    }
   }
 
  private:
@@ -134,8 +143,16 @@ class FdBaton {
     }
     return res;
   }
+
   SynchronizationFd fd_;
-  Atom<int> event_count_{0};
+
+  // The low 32 bits are event count, i.e. number of post() calls minus number
+  // of wait() calls done so far.
+  // The high 32 bits are number of writes to fd_
+  // that might be in progress right now; this is used for detecting when fd_ is
+  // safe to destroy during shutdown.
+  Atom<uint64_t> bits_{0};
+  static constexpr uint64_t kFDWriteInProgress = 1ul << 32;
 };
 
 /// This is a wrapper introduced for usage within LifoSem.
@@ -287,17 +304,23 @@ class LifoEventSemImpl
         throw folly::ShutdownSemError("semaphore has been shut down");
       }
 
-      try {
-        do {
-          func();
-        } while (--maxCalls > 0 && owner_.tryWait());
-      } catch (...) {
-        // recycle, but don't throw ShutdownSemError.  In the case of
-        // shutdown fd() will remain readable so we can throw on the next
-        // call to process(), which will happen very soon.
+      // We use a scope guard instead of try { ... } catch (...) { ...; throw; }
+      // because the rethrowing truncates stack trace if the exception is not
+      // caught: if we catch+rethrow, std::terminate will be called at the point
+      // of our rethrow, which makes stack trace much less useful; if we don't
+      // catch, std::terminate is called at the point of original throw.
+      auto if_exception = folly::makeGuard([&] {
+        // If func() throws, recycle, but don't throw ShutdownSemError.
+        // In the case of shutdown fd() will remain readable so we can throw on
+        // the next call to process(), which will happen very soon.
         recycleAndCheckShutdown();
-        throw;
-      }
+      });
+
+      do {
+        func();
+      } while (--maxCalls > 0 && owner_.tryWait());
+
+      if_exception.dismiss();
       recycle();
     }
 
@@ -332,39 +355,38 @@ class LifoEventSemImpl
         throw folly::ShutdownSemError("semaphore has been shut down");
       }
 
-      try {
-        assert(maxBatchSize > 0);
-        auto extra = maxBatchSize > 1 ? owner_.tryWait(maxBatchSize - 1) : 0ul;
-        func(1 + extra);
-      } catch (...) {
+      // See process() for explanation of this usage of scope guard.
+      auto if_exception = folly::makeGuard([&] {
+        // If func() throws, recycle, but don't throw ShutdownSemError.
+        // In the case of shutdown fd() will remain readable so we can throw on
+        // the next call to process(), which will happen very soon.
         recycleAndCheckShutdown();
-        throw;
-      }
+      });
+
+      assert(maxBatchSize > 0);
+      auto extra = maxBatchSize > 1 ? owner_.tryWait(maxBatchSize - 1) : 0ul;
+      func(1 + extra);
+
+      if_exception.dismiss();
       recycle();
     }
 
    private:
     ~AsyncWaiter() override {
-      // If we are not enqueued we consumed an event from queue but did not
-      // process it. If we weren't posted to because of shutdown we should
-      // return the event to semaphore as we will not process it.
-      if (!owner_.tryRemoveNode(*node_)) {
-        // If we are destroying just as we were dequeued from LifoSem but the
-        // post did not happen yet we need to wait for a post to happen
-        // otherwise we risk a post after we are already destroyed
-        node_->handoff().wait_readable();
-        // We need to call get_event_count in order to introduce acquire memory
-        // barrier as node_->isShutdownNotice() call is not safe without it.
-        if (FOLLY_UNLIKELY(node_->handoff().get_event_count() != 1)) {
-          // we just waited for fd to become readable so event count should be 1
-          // otherwise all bets are off
-          return;
-        }
-        // if it's not shutdown we got notified but we will not process the
-        // request so we need to return token to semaphore
-        if (!node_->isShutdownNotice()) {
-          owner_.post();
-        }
+      // If we were enqueued we can just return otherwise we consumed an event
+      // from semaphore but did not process it.
+      if (owner_.tryRemoveNode(*node_)) {
+        return;
+      }
+
+      // If we are destroying just as we were dequeued from LifoSem but the
+      // post did not happen yet we need to wait for a post to happen
+      // otherwise we risk a post after we are already destroyed.
+      node_->handoff().wait_readable();
+      // if it's not shutdown we got notified but we will not process the
+      // event so we need to return token to semaphore.
+      if (!node_->isShutdownNotice()) {
+        owner_.post();
       }
     }
     typedef typename LifoEventSemImpl<Atom>::WaitResult WaitResult;

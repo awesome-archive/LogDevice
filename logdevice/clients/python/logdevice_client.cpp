@@ -6,8 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include "logdevice/clients/python/logdevice_client.h"
+
 #include <cmath>
 #include <type_traits>
+#include <variant>
 
 #include <boost/format.hpp>
 #include <boost/python.hpp>
@@ -19,6 +22,7 @@
 #include "logdevice/common/ZookeeperClient.h"
 #include "logdevice/common/commandline_util_chrono.h"
 #include "logdevice/common/configuration/Configuration.h"
+#include "logdevice/common/configuration/InternalLogs.h"
 #include "logdevice/common/debug.h"
 #include "logdevice/common/toString.h"
 #include "logdevice/common/util.h"
@@ -201,7 +205,7 @@ boost::shared_ptr<Client> logdevice_make_client(object name,
         .setCredentials(std::move(credentials_str))
         .setClientSettings(std::move(client_settings))
         .setCSID(std::move(csid_str));
-    if (timeout.hasValue()) {
+    if (timeout.has_value()) {
       factory.setTimeout(timeout.value());
     }
     client = factory.create(std::move(config_path));
@@ -275,12 +279,48 @@ tuple logdevice_get_head_attributes(Client& self, logid_t logid) {
   }
 }
 
+namespace {
+folly::IOBuf string_to_iobuf(std::string&& s) {
+  auto data = std::make_unique<std::string>(std::move(s));
+  folly::IOBuf::FreeFunction deleter = +[](void* /* buf */, void* userData) {
+    delete reinterpret_cast<std::string*>(userData);
+  };
+  return folly::IOBuf{folly::IOBuf::TAKE_OWNERSHIP,
+                      data->data(),
+                      data->size(),
+                      deleter,
+                      reinterpret_cast<void*>(data.release())};
+}
+
+std::variant<std::string, PayloadGroup> extract_payload(const object& from,
+                                                        const char* name) {
+  extract<dict> get_dict(from);
+  if (get_dict.check()) {
+    PayloadGroup payload_group;
+    list items = get_dict().items();
+    for (int i = 0; i < len(items); i++) {
+      auto key = extract<int>(items[i][0]);
+      auto payload = extract_string(items[i][1], name);
+      payload_group[key] = string_to_iobuf(std::move(payload));
+    }
+    return payload_group;
+  } else {
+    return extract_string(from, name);
+  }
+}
+
+} // namespace
+
 lsn_t logdevice_append(Client& self, logid_t logid, object data) {
   lsn_t lsn;
-  std::string pl = extract_string(data, "data");
+  auto pl = extract_payload(data, "data");
   {
     gil_release_and_guard guard;
-    lsn = self.appendSync(logid, std::move(pl));
+    std::visit(
+        [&](auto& payload) {
+          lsn = self.appendSync(logid, std::move(payload));
+        },
+        pl);
   }
   if (lsn != LSN_INVALID)
     return lsn;
@@ -1129,4 +1169,10 @@ For example, all these are acceptable
   def("parse_log_level", &dbg::parseLoglevel, args("value"));
   def("use_python_logging", &logdevice_use_python_logging, args("callback"));
   def("set_log_fd", &dbg::useFD, args("fd"));
+  def("is_internal_log", +[](logid_t log_id) {
+    return configuration::InternalLogs::isInternal(log_id);
+  });
+  def("get_internal_log_name", +[](logid_t log_id) {
+    return configuration::InternalLogs::lookupByID(log_id);
+  });
 }

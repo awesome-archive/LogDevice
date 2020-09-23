@@ -15,37 +15,49 @@
 
 namespace facebook { namespace logdevice { namespace maintenance {
 
-using apache::thrift::util::enumName;
-
 folly::SemiFuture<MaintenanceStatus>
 ShardWorkflow::run(const membership::ShardState& shard_state,
+                   bool excluded_from_nodeset,
                    ShardDataHealth data_health,
                    RebuildingMode rebuilding_mode,
-                   ClusterStateNodeState node_gossip_state) {
-  ld_spew("%s",
-          folly::format(
-              "State before update:"
-              "current_storage_state_:{},"
-              "expected_storage_state_transition_:{},"
-              "current_rebuilding_mode_:{},"
-              "gossip_state:{},"
-              "current_data_health_:{},"
-              "status_:{},"
-              "event_type:{}",
-              membership::toString(current_storage_state_).str(),
-              membership::toString(expected_storage_state_transition_).str(),
-              toString(current_rebuilding_mode_),
-              ClusterState::getNodeStateString(node_gossip_state),
-              apache::thrift::util::enumNameSafe(current_data_health_),
-              apache::thrift::util::enumNameSafe(status_),
-              (event_) ? toString(event_->getType()) : "nullptr")
-              .str()
-              .c_str());
+                   bool is_draining,
+                   bool is_non_authoritative,
+                   ClusterStateNodeState node_gossip_state,
+                   bool use_force_restore_flag) {
+  ld_spew(
+      "%s",
+      folly::format(
+          "State before update:"
+          "current_storage_state_:{},"
+          "is_excluded_from_nodeset_:{},"
+          "expected_storage_state_transition_:{},"
+          "current_rebuilding_mode_:{},"
+          "gossip_state:{},"
+          "current_data_health_:{},"
+          "status_:{},"
+          "event_type:{}",
+          membership::toString(current_storage_state_).str(),
+          is_excluded_from_nodeset_ ? "true" : "false",
+          expected_storage_state_transition_.hasValue()
+              ? membership::toString(expected_storage_state_transition_.value())
+                    .str()
+              : "NONE",
+          toString(current_rebuilding_mode_),
+          ClusterState::getNodeStateString(node_gossip_state),
+          apache::thrift::util::enumNameSafe(current_data_health_),
+          apache::thrift::util::enumNameSafe(status_),
+          (event_) ? toString(event_->getType()) : "nullptr")
+          .str()
+          .c_str());
 
   current_storage_state_ = shard_state.storage_state;
+  is_excluded_from_nodeset_ = excluded_from_nodeset;
   current_data_health_ = data_health;
   gossip_state_ = node_gossip_state;
   current_rebuilding_mode_ = rebuilding_mode;
+  current_is_draining_ = is_draining;
+  current_rebuilding_is_non_authoritative_ = is_non_authoritative;
+  use_force_restore_flag_ = use_force_restore_flag;
   event_.reset();
   if (shard_state.manual_override) {
     updateStatus(MaintenanceStatus::BLOCKED_BY_ADMIN_OVERRIDE);
@@ -53,23 +65,29 @@ ShardWorkflow::run(const membership::ShardState& shard_state,
     computeMaintenanceStatus();
   }
 
-  ld_spew("%s",
-          folly::format(
-              "State after update:"
-              "current_storage_state_:{},"
-              "expected_storage_state_transition_:{},"
-              "current_rebuilding_mode_:{},"
-              "current_data_health_:{},"
-              "status_:{},"
-              "event_type:{}",
-              membership::toString(current_storage_state_).str(),
-              membership::toString(expected_storage_state_transition_).str(),
-              toString(current_rebuilding_mode_),
-              apache::thrift::util::enumNameSafe(current_data_health_),
-              apache::thrift::util::enumNameSafe(status_),
-              (event_) ? toString(event_->getType()) : "nullptr")
-              .str()
-              .c_str());
+  ld_spew(
+      "%s",
+      folly::format(
+          "State after update:"
+          "current_storage_state_:{},"
+          "is_excluded_from_nodeset_:{},"
+          "expected_storage_state_transition_:{},"
+          "current_rebuilding_mode_:{},"
+          "current_data_health_:{},"
+          "status_:{},"
+          "event_type:{}",
+          membership::toString(current_storage_state_).str(),
+          is_excluded_from_nodeset_ ? "true" : "false",
+          expected_storage_state_transition_.hasValue()
+              ? membership::toString(expected_storage_state_transition_.value())
+                    .str()
+              : "NONE",
+          toString(current_rebuilding_mode_),
+          apache::thrift::util::enumNameSafe(current_data_health_),
+          apache::thrift::util::enumNameSafe(status_),
+          (event_) ? toString(event_->getType()) : "nullptr")
+          .str()
+          .c_str());
 
   if (event_ != nullptr) {
     // We have a event that needs to be written to the event log.
@@ -81,7 +99,14 @@ ShardWorkflow::run(const membership::ShardState& shard_state,
         [mpromise, status = status_](Status st,
                                      lsn_t /*unused*/,
                                      const std::string& /*unused*/) mutable {
-          auto result = st == E::OK ? status : MaintenanceStatus::RETRY;
+          // Currently the EventLog will return E::ALREADY if requesting a drain
+          // on a shard that we have requested a drain for before and on other
+          // scenarios where it just wants to acknowledge that the operation
+          // does not need to be applied again. If the operation has ALREADY
+          // been applied to the event log, we should not fail, just move on.
+          auto result = (st == E::OK || st == E::ALREADY)
+              ? status
+              : MaintenanceStatus::RETRY;
           mpromise->setValue(result);
         });
     return std::move(promise_future.second);
@@ -125,6 +150,10 @@ void ShardWorkflow::computeMaintenanceStatusForDrain() {
 
   switch (current_storage_state_) {
     case membership::StorageState::NONE:
+      // If the node is provisioning, we can consider it drained as well. Any
+      // maintenance that needs this node to be drained will appear completed
+      // immediately.
+    case membership::StorageState::PROVISIONING:
       // We have reached the target already, there is no further transitions
       // needed to declare the shard as DRAINED.
       updateStatus(MaintenanceStatus::COMPLETED);
@@ -151,16 +180,14 @@ void ShardWorkflow::computeMaintenanceStatusForDrain() {
       // without waiting for transition to DATA_MIGRATION
       updateStatus(MaintenanceStatus::AWAITING_NODES_CONFIG_TRANSITION);
       if (restore_mode_rebuilding_ && isNcTransitionStuck()) {
-        createRebuildEventIfRequired(RebuildingMode::RESTORE, true /*force*/);
+        createRebuildEventIfRequired(true /*force*/);
       }
       break;
     case membership::StorageState::READ_ONLY:
       // Trigger rebuilding if one wasn't already triggered
       createRebuildEventIfRequired(
-          restore_mode_rebuilding_ ? RebuildingMode::RESTORE
-                                   : RebuildingMode::RELOCATE,
           status_ !=
-              MaintenanceStatus::AWAITING_START_DATA_MIGRATION /*force*/);
+          MaintenanceStatus::AWAITING_START_DATA_MIGRATION /*force*/);
       // If a new event was created, lets wait for this to event to be written
       // to event log
       if (event_) {
@@ -175,15 +202,16 @@ void ShardWorkflow::computeMaintenanceStatusForDrain() {
       }
       break;
     case membership::StorageState::DATA_MIGRATION:
-      createRebuildEventIfRequired(restore_mode_rebuilding_
-                                       ? RebuildingMode::RESTORE
-                                       : RebuildingMode::RELOCATE);
+      createRebuildEventIfRequired();
       // No new rebuild event was created. Check if the existing
       // rebuilding is complete.
       if (!event_ && current_data_health_ == ShardDataHealth::EMPTY) {
         expected_storage_state_transition_ =
             membership::StorageStateTransition::DATA_MIGRATION_COMPLETED;
         updateStatus(MaintenanceStatus::AWAITING_NODES_CONFIG_CHANGES);
+      } else if (current_data_health_ == ShardDataHealth::UNAVAILABLE &&
+                 current_rebuilding_is_non_authoritative_) {
+        updateStatus(MaintenanceStatus::REBUILDING_IS_BLOCKED);
       } else {
         updateStatus(MaintenanceStatus::AWAITING_DATA_REBUILDING);
       }
@@ -205,6 +233,14 @@ void ShardWorkflow::computeMaintenanceStatusForMayDisappear() {
   ld_check(!target_op_state_.count(ShardOperationalState::DRAINED));
   switch (current_storage_state_) {
     case membership::StorageState::NONE:
+      // We require that the node is in FULLY_STARTED|STARTING state before we
+      // proceed with making it READ_ONLY. This ensures that we are not setting
+      // the shards or sequencers to READ_ONLY before the nodes are actually up
+      // and running.
+      if (!isNodeAlive()) {
+        updateStatus(MaintenanceStatus::AWAITING_NODE_TO_BE_ALIVE);
+        return;
+      }
       createAbortEventIfRequired();
       expected_storage_state_transition_ =
           membership::StorageStateTransition::ENABLING_READ;
@@ -244,8 +280,7 @@ void ShardWorkflow::computeMaintenanceStatusForEnable() {
   // proceed with the enable workflow. This ensures that we are not setting the
   // shards or sequencers to READ_WRITE before the nodes are actually up and
   // running.
-  if (gossip_state_ != ClusterStateNodeState::FULLY_STARTED &&
-      gossip_state_ != ClusterStateNodeState::STARTING) {
+  if (!isNodeAlive()) {
     updateStatus(MaintenanceStatus::AWAITING_NODE_TO_BE_ALIVE);
     return;
   }
@@ -272,8 +307,14 @@ void ShardWorkflow::computeMaintenanceStatusForEnable() {
       updateStatus(MaintenanceStatus::AWAITING_NODES_CONFIG_CHANGES);
       break;
     case membership::StorageState::READ_WRITE:
+      // reset the expected transition.
+      expected_storage_state_transition_ = folly::none;
       createAbortEventIfRequired();
-      updateStatus(MaintenanceStatus::COMPLETED);
+      if (!is_excluded_from_nodeset_) {
+        updateStatus(MaintenanceStatus::COMPLETED);
+      } else {
+        updateStatus(MaintenanceStatus::AWAITING_NODES_CONFIG_CHANGES);
+      }
       break;
     case membership::StorageState::RW_TO_RO:
       // We can just abort the disable that is happening instead of waiting for
@@ -293,30 +334,66 @@ void ShardWorkflow::computeMaintenanceStatusForEnable() {
 }
 
 void ShardWorkflow::createAbortEventIfRequired() {
-  /* ShardDataHealth  RebuildingMode  Shard Rebuilding Type
+  /* ShardDataHealth  RebuildingMode  Shard Rebuilding Type  Draining
    * Healthy          Relocate        Full (ABORT)
    * Lost_Regions     Restore         Mini (DO NOT ABORT)
    * Healthy          Invalid         NA   (DO NOT ABORT)
    * Unavilable       Restore         Full (ABORT)
    * Underreplication Restore         Full (ABORT)
-   * Empty            Restore         Full (ABORT)
-   * Empty            Relocate        Full (ABORT)
+   * Empty            Restore         Full (ABORT)               0
+   * Empty            Relocate        Full (ABORT)               0
+   * Empty            Restore         Full (UNDRAIN)             1
+   * Empty            Relocate        Full (UNDRAIN)             1
    */
-  if (current_rebuilding_mode_ == RebuildingMode::RELOCATE ||
-      (current_data_health_ != ShardDataHealth::LOST_REGIONS &&
-       current_data_health_ != ShardDataHealth::HEALTHY)) {
+
+  if (current_data_health_ == ShardDataHealth::EMPTY && current_is_draining_) {
+    // The reason we are doing this here is due to how RebuildingCoordinator
+    // currently works. The UNDRAIN message will remove
+    // the drain flag (unset it) and ask the shards to write the
+    // RebuildingCompleteMetadata marker. This will ensure that the shard's
+    // internal rebuilding state is reset to NONE before we enable this shard.
+    //
+    // In principle, we don't need to do any of this (including the drain flag)
+    // once we make maintenance manager the only driver of rebuilding. The drain
+    // flag was designed to ask rebuilding to NOT enable shards again even if
+    // they are online. With maintenance manager this is controlled by whether
+    // the shard has effective DRAINED maintenances or not.
+
+    // Enabling a shard should be done only by maintenance manager in a single
+    // unified way once we clean up RebuildingCoordinator and the rest of
+    // rebuilding.
+    event_ = std::make_unique<SHARD_UNDRAIN_Event>(
+        shard_.node(), (uint32_t)shard_.shard());
+  } else if (current_rebuilding_mode_ == RebuildingMode::RELOCATE ||
+             (current_data_health_ != ShardDataHealth::LOST_REGIONS &&
+              current_data_health_ != ShardDataHealth::HEALTHY)) {
     event_ = std::make_unique<SHARD_ABORT_REBUILD_Event>(
         shard_.node(), (uint32_t)shard_.shard(), LSN_INVALID);
   }
 }
 
-void ShardWorkflow::createRebuildEventIfRequired(RebuildingMode new_mode,
-                                                 bool force) {
-  if (force || current_rebuilding_mode_ != new_mode) {
-    SHARD_NEEDS_REBUILD_flags_t flag{0};
-    if (new_mode == RebuildingMode::RELOCATE) {
-      flag = SHARD_NEEDS_REBUILD_Header::DRAIN;
+void ShardWorkflow::createRebuildEventIfRequired(bool force) {
+  SHARD_NEEDS_REBUILD_flags_t flag{0};
+  if (filter_relocate_shards_) {
+    flag |= SHARD_NEEDS_REBUILD_Header::FILTER_RELOCATE_SHARDS;
+  }
+  if (restore_mode_rebuilding_) {
+    if (current_rebuilding_mode_ != RebuildingMode::RESTORE || force) {
+      // Gated behind a setting since it requires an updated server that
+      // respects the FORCE_RESTORE flag.
+      if (use_force_restore_flag_) {
+        flag |= SHARD_NEEDS_REBUILD_Header::DRAIN;
+        flag |= SHARD_NEEDS_REBUILD_Header::FORCE_RESTORE;
+      }
+      event_ = std::make_unique<SHARD_NEEDS_REBUILD_Event>(
+          SHARD_NEEDS_REBUILD_Header{shard_.node(),
+                                     (uint32_t)shard_.shard(),
+                                     "ShardWorkflow",
+                                     "ShardWorkflow",
+                                     flag});
     }
+  } else if (!current_is_draining_ || force) {
+    flag |= SHARD_NEEDS_REBUILD_Header::DRAIN;
     event_ = std::make_unique<SHARD_NEEDS_REBUILD_Event>(
         SHARD_NEEDS_REBUILD_Header{shard_.node(),
                                    (uint32_t)shard_.shard(),
@@ -355,6 +432,11 @@ void ShardWorkflow::rebuildInRestoreMode(bool is_restore) {
   restore_mode_rebuilding_ = is_restore;
 }
 
+void ShardWorkflow::rebuildingFilterRelocateShards(
+    bool filter_relocate_shards) {
+  filter_relocate_shards_ = filter_relocate_shards;
+}
+
 folly::F14FastSet<ShardOperationalState>
 ShardWorkflow::getTargetOpStates() const {
   return target_op_state_;
@@ -368,7 +450,7 @@ SystemTimestamp ShardWorkflow::getCreationTimestamp() const {
   return created_at_;
 }
 
-membership::StorageStateTransition
+folly::Optional<membership::StorageStateTransition>
 ShardWorkflow::getExpectedStorageStateTransition() const {
   return expected_storage_state_transition_;
 }
@@ -384,6 +466,11 @@ bool ShardWorkflow::isNcTransitionStuck() const {
         Worker::onThisThread()
             ->settings()
             .nodes_configuration_manager_intermediary_shard_state_timeout));
+}
+
+bool ShardWorkflow::isNodeAlive() const {
+  return gossip_state_ == ClusterStateNodeState::FULLY_STARTED ||
+      gossip_state_ == ClusterStateNodeState::STARTING;
 }
 
 }}} // namespace facebook::logdevice::maintenance

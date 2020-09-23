@@ -391,7 +391,7 @@ void NodesConfigurationManager::onUpdateRequest(ncm::UpdateContext ctx,
           if (folly::kIsDebug) {
             auto extracted_version_opt =
                 NodesConfigurationCodec::extractConfigVersion(stored_data);
-            ld_assert(extracted_version_opt.hasValue());
+            ld_assert(extracted_version_opt.has_value());
             ld_assert_eq(stored_version, extracted_version_opt.value());
             // VERSION_MISMATCH <=> stored_version != current_version (i.e.,
             // base_version).
@@ -445,8 +445,8 @@ void NodesConfigurationManager::maybeProcessStagedConfig() {
            nodes_configuration_manager_pending_version,
            pending_nodes_config_->getVersion().val());
 
-  // Publish the NodesConfiguration to the NCM NC updateable.
-  deps_->processor_->config_->updateableNCMNodesConfiguration()->update(
+  // Publish the NodesConfiguration to the NC updateable.
+  deps_->processor_->config_->updateableNodesConfiguration()->update(
       pending_nodes_config_);
 
   auto futures = fulfill_on_all_workers<folly::Unit>(
@@ -461,14 +461,15 @@ void NodesConfigurationManager::maybeProcessStagedConfig() {
         p.setValue();
       },
       RequestType::NODES_CONFIGURATION_MANAGER,
-      /* with_retrying = */ true);
+      /* with_retrying = */ true,
+      folly::Executor::HI_PRI);
 
   // If one of the worker is stuck, it will block us from making progress.
   // This is probably OK since we would need to propagate new configs to every
   // worker anyway, so there's little we could do in that case.
   // TODO: handle / monitor worker config processing getting stuck, e.g., by
   // timeout.
-  folly::collectAllSemiFuture(std::move(futures))
+  folly::collectAll(std::move(futures))
       .toUnsafeFuture()
       .thenTry([pending_nodes_config = pending_nodes_config_,
                 ncm_weak_ptr = weak_from_this()](auto&& t) mutable {
@@ -537,10 +538,6 @@ void NodesConfigurationManager::onHeartBeat() {
   deps()->dcheckOnNCM();
   deps()->readFromStore(shouldDoConsistentConfigFetch());
   advanceIntermediaryShardStates();
-
-  if (deps()->processor_->settings()->server) {
-    deps()->checkAndReportConsistency();
-  }
 }
 
 void NodesConfigurationManager::advanceIntermediaryShardStates() {
@@ -554,7 +551,7 @@ void NodesConfigurationManager::advanceIntermediaryShardStates() {
           ->processor_->settings()
           ->nodes_configuration_manager_intermediary_shard_state_timeout;
   auto update_opt = tracker_.extractNCUpdate(till_timestamp);
-  if (update_opt.hasValue()) {
+  if (update_opt.has_value()) {
     ld_info("Proposing update to transition shards out of intermediary "
             "states that entered the state before %s...",
             till_timestamp.toString().c_str());

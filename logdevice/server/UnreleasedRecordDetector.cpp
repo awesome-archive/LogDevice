@@ -143,7 +143,6 @@ void UnreleasedRecordDetector::threadMain() noexcept try {
 
     // forget prev states, new states become prev states
     prev_states_.clear();
-    using std::swap;
     swap(prev_states_, new_states_);
   }
 
@@ -218,12 +217,7 @@ bool UnreleasedRecordDetector::collectLogStates() {
   const auto visitor = [this, sharded_local_log_store, &local_logs_config](
                            const logid_t log_id, const LogStorageState& state) {
     shard_index_t shard_idx = state.getShardIdx();
-
-    // read last released LSN with relaxed memory order (we do not care about
-    // consistency here, because we are only interested in logs where the last
-    // released LSN has not changed in a long time)
-    const lsn_t last_released_lsn =
-        state.getLastReleasedLSNWithoutSource(std::memory_order_relaxed);
+    const lsn_t last_released_lsn = state.getLastReleasedLSN().value();
 
     // read highest inserted LSN from local log store
     lsn_t highest_inserted_lsn;

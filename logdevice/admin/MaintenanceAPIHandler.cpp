@@ -8,10 +8,13 @@
 
 #include "logdevice/admin/MaintenanceAPIHandler.h"
 
+#include "logdevice/admin/AdminAPIUtils.h"
 #include "logdevice/admin/Conv.h"
 #include "logdevice/admin/maintenance/APIUtils.h"
 #include "logdevice/admin/maintenance/MaintenanceLogWriter.h"
 #include "logdevice/admin/maintenance/MaintenanceManager.h"
+#include "logdevice/admin/maintenance/MaintenanceManagerTracer.h"
+#include "logdevice/common/ThriftCodec.h"
 #include "logdevice/common/request_util.h"
 
 using namespace facebook::logdevice::thrift;
@@ -24,6 +27,15 @@ using ListMaintenanceDefs =
     folly::Expected<std::vector<MaintenanceDefinition>, MaintenanceError>;
 
 namespace facebook { namespace logdevice {
+
+namespace {
+template <class T>
+std::string debugString(T obj) {
+  return facebook::logdevice::ThriftCodec::serialize<
+      apache::thrift::SimpleJSONSerializer>(obj);
+}
+
+} // namespace
 // get maintenances
 folly::SemiFuture<std::unique_ptr<MaintenanceDefinitionResponse>>
 MaintenanceAPIHandler::semifuture_getMaintenances(
@@ -251,28 +263,47 @@ MaintenanceAPIHandler::semifuture_applyMaintenance(
    * manager if we have any. 6- Combine results and return.
    */
 
+  auto nodes_config = processor_->getNodesConfiguration();
+
+  MaintenanceManagerTracer::ApplyMaintenanceAPISample sample;
+  sample.ncm_version = nodes_config->getVersion();
+  sample.nc_published_time = nodes_config->getLastChangeTimestamp();
+  sample.service_discovery = nodes_config->getServiceDiscovery();
+
   // Step (1)
   auto validation = APIUtils::validateDefinition(*definition);
   if (validation) {
-    return *validation;
+    sample.error = true;
+    sample.error_reason = validation->what();
+    getTracer()->trace(std::move(sample));
+    return validation.value();
   }
-  auto nodes_config = processor_->getNodesConfiguration();
+
   // Step (2)
   folly::Expected<std::vector<MaintenanceDefinition>, InvalidRequest>
       expanded_maintenances =
           APIUtils::expandMaintenances(*definition, nodes_config);
   if (expanded_maintenances.hasError()) {
+    sample.error = true;
+    sample.error_reason = expanded_maintenances.error().what();
+    getTracer()->trace(std::move(sample));
     return expanded_maintenances.error();
   }
   // Step (3, 4, 5, and 6)
   return applyAndGetMaintenances(std::move(expanded_maintenances).value())
       .toUnsafeFuture()
-      .thenValue([](ListMaintenanceDefs&& result) {
+      .thenValue([sample = std::move(sample),
+                  this](ListMaintenanceDefs&& result) mutable {
         if (result.hasError()) {
+          sample.error = true;
+          sample.error_reason = result.error().what();
+          getTracer()->trace(std::move(sample));
           // Throw the right thrift exception.
           result.error().throwThriftException();
           ld_assert(false);
         }
+        sample.added_maintenances = result.value();
+        getTracer()->trace(std::move(sample));
         auto v = std::make_unique<MaintenanceDefinitionResponse>();
         v->set_maintenances(result.value());
         return v;
@@ -294,8 +325,7 @@ MaintenanceAPIHandler::semifuture_removeMaintenances(
   }
 
   ld_check(maintenance_manager_);
-  /*
-   */
+
   MaintenancesFilter filter = request->get_filter();
   return maintenance_manager_->getLatestMaintenanceState()
       .via(this->getThreadManager())
@@ -308,10 +338,21 @@ MaintenanceAPIHandler::semifuture_removeMaintenances(
               value.error().throwThriftException();
               ld_assert(false);
             }
+
+            auto nodes_config = processor_->getNodesConfiguration();
+
+            MaintenanceManagerTracer::RemoveMaintenanceAPISample sample;
+            sample.ncm_version = nodes_config->getVersion();
+            sample.nc_published_time = nodes_config->getLastChangeTimestamp();
+            sample.service_discovery = nodes_config->getServiceDiscovery();
+            sample.user = request->get_user();
+            sample.reason = request->get_reason();
+
             // We need to find the maintenances that we are going to remove
             // now since the returned state from the RSM will not contain them
             // after removal.
             auto filtered = APIUtils::filterMaintenances(filter, value.value());
+
             // We have the filtered results that we can return if the removal
             // is successful. Execute the remove
             MaintenanceDelta delta;
@@ -326,12 +367,19 @@ MaintenanceAPIHandler::semifuture_removeMaintenances(
                 // very simple merge.
                 .toUnsafeFuture()
                 .thenValue(
-                    [filtered = std::move(filtered)](MaintenanceOut&& value)
-                        -> std::unique_ptr<RemoveMaintenancesResponse> {
+                    [this,
+                     filtered = std::move(filtered),
+                     sample = std::move(sample)](MaintenanceOut&& value) mutable
+                    -> std::unique_ptr<RemoveMaintenancesResponse> {
                       if (value.hasError()) {
+                        sample.error = true;
+                        sample.error_reason = value.error().what();
+                        getTracer()->trace(std::move(sample));
                         value.error().throwThriftException();
                         ld_assert(false);
                       }
+                      sample.removed_maintenances = filtered;
+                      getTracer()->trace(std::move(sample));
                       auto response =
                           std::make_unique<RemoveMaintenancesResponse>();
                       response->set_maintenances(filtered);
@@ -354,22 +402,48 @@ MaintenanceAPIHandler::semifuture_markAllShardsUnrecoverable(
   }
 
   ld_check(maintenance_manager_);
-  return maintenance_manager_
-      ->markAllShardsUnrecoverable(request->get_user(), request->get_reason())
-      .via(this->getThreadManager())
-      .thenValue([](auto&& value) {
-        if (value.hasError()) {
-          MaintenanceError(value.error()).throwThriftException();
-          ld_assert(false);
-        }
-        std::vector<thrift::ShardID> shards_succeeded;
-        std::vector<thrift::ShardID> shards_failed;
-        auto response = std::make_unique<MarkAllShardsUnrecoverableResponse>();
-        response->set_shards_succeeded(
-            toThrift<thrift::ShardID>(value.value().first));
-        response->set_shards_failed(
-            toThrift<thrift::ShardID>(value.value().second));
-        return response;
+  return folly::futures::retrying(
+      get_ncm_retrying_policy(),
+      [this, request = std::move(request), thread_manager = getThreadManager()](
+          size_t trial)
+          -> folly::SemiFuture<
+              std::unique_ptr<MarkAllShardsUnrecoverableResponse>> {
+        ld_info("Handling markAllShardsUnrecoverable request (trial #%ld): %s",
+                trial,
+                debugString(*request).c_str());
+        return maintenance_manager_
+            ->markAllShardsUnrecoverable(
+                request->get_user(), request->get_reason())
+            .via(thread_manager)
+            .thenValue([trial](auto&& value) {
+              if (value.hasError() && value.error() == E::VERSION_MISMATCH) {
+                // We want to retry this, NCM needs to be updated.
+                ld_info("NCM version was updated before we were able to mark "
+                        "the shards unrecoverable. Retrying %lu.",
+                        trial);
+                thrift::NodesConfigurationManagerError err;
+                err.set_message(error_description(value.error()));
+                err.set_error_code(static_cast<int32_t>(value.error()));
+                throw err;
+              } else if (value.hasError()) {
+                MaintenanceError(value.error()).throwThriftException();
+                ld_assert(false);
+              }
+              std::vector<thrift::ShardID> shards_succeeded;
+              std::vector<thrift::ShardID> shards_failed;
+              auto response =
+                  std::make_unique<MarkAllShardsUnrecoverableResponse>();
+              response->set_shards_succeeded(
+                  toThrift<thrift::ShardID>(value.value().first));
+              response->set_shards_failed(
+                  toThrift<thrift::ShardID>(value.value().second));
+              return response;
+            });
       });
 }
+
+MaintenanceManagerTracer* MaintenanceAPIHandler::getTracer() const {
+  return maintenance_manager_->getTracer();
+}
+
 }} // namespace facebook::logdevice

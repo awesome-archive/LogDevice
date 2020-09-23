@@ -34,30 +34,11 @@
 #include "logdevice/server/locallogstore/RocksDBKeyFormat.h"
 #include "logdevice/server/locallogstore/RocksDBListener.h"
 #include "logdevice/server/locallogstore/RocksDBLogStoreFactory.h"
-#include "logdevice/server/locallogstore/ShardToPathMapping.h"
 #include "logdevice/server/storage_tasks/ShardedStorageThreadPool.h"
 
 namespace facebook { namespace logdevice {
 
 namespace fs = boost::filesystem;
-
-// Returns 1/0 if base_path looks like it contains an existing database, -1 on
-// error
-static int database_exists(const std::string& base_path);
-
-// Called when the database directory exists. Expect a NSHARDS file that
-// contains the number of shards this directory was created for. Verify that
-// this number matches `nshards_expected` which is retrieved from the
-// "num_shards" property of this node in the config.
-//
-// Returns 0 on success, or -1 on any error.
-static int check_nshards(const std::string& base_path,
-                         shard_size_t nshards_expected);
-
-// Tries to create a new sharded database at the given path, returns 0 on
-// success
-static int create_new_sharded_db(const std::string& base_path,
-                                 shard_size_t nshards);
 
 using DiskShardMappingEntry =
     ShardedRocksDBLocalLogStore::DiskShardMappingEntry;
@@ -65,83 +46,101 @@ using DiskShardMappingEntry =
 ShardedRocksDBLocalLogStore::ShardedRocksDBLocalLogStore(
     const std::string& base_path,
     shard_size_t nshards,
-    Settings settings,
     UpdateableSettings<RocksDBSettings> db_settings,
-    UpdateableSettings<RebuildingSettings> rebuilding_settings,
-    std::shared_ptr<UpdateableConfig> updateable_config,
-    RocksDBCachesInfo* caches,
+    std::unique_ptr<RocksDBCustomiser> customiser,
     StatsHolder* stats)
     : stats_(stats),
+      customiser_(std::move(customiser)),
       db_settings_(db_settings),
-      partitioned_(db_settings->partitioned) {
-  if (db_settings->num_levels < 2 &&
-      db_settings->compaction_style == rocksdb::kCompactionStyleLevel) {
+      // note that base_path_ may be overwritten
+      // by customiser_->validateAndOverrideBasePath()
+      base_path_(base_path),
+      nshards_(nshards),
+      partitioned_(db_settings->partitioned),
+      is_db_local_(customiser_->isDBLocal()) {
+  ld_check(customiser_);
+}
+
+bool ShardedRocksDBLocalLogStore::createOrValidatePaths() {
+  if (validated_paths_) {
+    // If called twice (by wipe(), then by init()), only do work the first time.
+    return true;
+  }
+
+  validated_paths_ = true;
+
+  if (!customiser_->validateAndOverrideBasePath(base_path_,
+                                                nshards_,
+                                                *db_settings_.get(),
+                                                &base_path_,
+                                                &disabled_shards_)) {
+    return false;
+  }
+
+  shard_paths_.resize(nshards_);
+  for (shard_index_t shard_idx = 0; shard_idx < nshards_; ++shard_idx) {
+    fs::path shard_path =
+        fs::path(base_path_) / fs::path("shard" + std::to_string(shard_idx));
+
+    if (!customiser_->validateShardPath(shard_path.string())) {
+      return false;
+    }
+
+    shard_paths_.at(shard_idx) = shard_path;
+  }
+
+  return true;
+}
+
+void ShardedRocksDBLocalLogStore::init(
+    Settings settings,
+    UpdateableSettings<RebuildingSettings> rebuilding_settings,
+    std::shared_ptr<UpdateableConfig> updateable_config,
+    RocksDBCachesInfo* caches) {
+  ld_check(!initialized_);
+  initialized_ = true;
+
+  if (db_settings_->num_levels < 2 &&
+      db_settings_->compaction_style == rocksdb::kCompactionStyleLevel) {
     ld_error("Level-style compaction requires at least 2 levels. %d given.",
-             db_settings->num_levels);
+             db_settings_->num_levels);
     throw ConstructorFailed();
   }
 
-  int rv = database_exists(base_path);
-  if (rv < 0) {
+  if (!createOrValidatePaths()) {
     throw ConstructorFailed();
-  }
-
-  // This value should have been validated by the Configuration module.
-  ld_check(nshards > 0 && nshards <= MAX_SHARDS);
-
-  if (rv) {
-    // Database exists, check that the number of shards matches.  We do not
-    // want to start up otherwise.
-    if (check_nshards(base_path, nshards) < 0) {
-      throw ConstructorFailed();
-    }
-  } else {
-    if (db_settings->auto_create_shards == false) {
-      ld_error("Auto creation of shards & directories is not enabled and "
-               "they do not exist");
-      throw ConstructorFailed();
-    }
-    // Directory does not exist.  Create a new sharded database.
-    if (nshards < 0) {
-      ld_error("Number of shards was not specified and database does not "
-               "exist.  Don't know how many shards to create!");
-      throw ConstructorFailed();
-    }
-
-    if (create_new_sharded_db(base_path, nshards) != 0) {
-      throw ConstructorFailed();
-    }
   }
 
   std::shared_ptr<Configuration> config =
       updateable_config ? updateable_config->get() : nullptr;
 
   std::vector<IOTracing*> tracing_ptrs;
-  for (shard_index_t i = 0; i < nshards; ++i) {
-    io_tracing_by_shard_.push_back(std::make_unique<IOTracing>(i));
+  for (shard_index_t i = 0; i < nshards_; ++i) {
+    io_tracing_by_shard_.push_back(std::make_unique<IOTracing>(i, stats_));
     tracing_ptrs.push_back(io_tracing_by_shard_[i].get());
   }
   // If tracing is enabled in settings, enable it before opening the DBs.
   refreshIOTracingSettings();
 
-  env_ = std::make_unique<RocksDBEnv>(db_settings, stats, tracing_ptrs);
+  env_ = std::make_unique<RocksDBEnv>(
+      customiser_->getEnv(), db_settings_, stats_, tracing_ptrs);
   {
-    int num_bg_threads_lo = db_settings->num_bg_threads_lo;
+    int num_bg_threads_lo = db_settings_->num_bg_threads_lo;
     if (num_bg_threads_lo == -1) {
-      num_bg_threads_lo = nshards * db_settings->max_background_compactions;
+      num_bg_threads_lo = nshards_ * db_settings_->max_background_compactions;
     }
     env_->SetBackgroundThreads(num_bg_threads_lo, rocksdb::Env::LOW);
   }
   {
-    int num_bg_threads_hi = db_settings->num_bg_threads_hi;
+    int num_bg_threads_hi = db_settings_->num_bg_threads_hi;
     if (num_bg_threads_hi == -1) {
-      num_bg_threads_hi = nshards * db_settings->max_background_flushes;
+      num_bg_threads_hi = nshards_ * db_settings_->max_background_flushes;
     }
     env_->SetBackgroundThreads(num_bg_threads_hi, rocksdb::Env::HIGH);
   }
 
   rocksdb_config_ = RocksDBLogStoreConfig(
-      db_settings, rebuilding_settings, env_.get(), updateable_config, stats);
+      db_settings_, rebuilding_settings, env_.get(), updateable_config, stats_);
 
   // save the rocksdb cache information to be used by the SIGSEGV handler
   if (caches) {
@@ -155,11 +154,7 @@ ShardedRocksDBLocalLogStore::ShardedRocksDBLocalLogStore(
     }
   }
 
-  rv = ShardToPathMapping(base_path, nshards).get(&shard_paths_);
-  if (rv != 0) {
-    throw ConstructorFailed();
-  }
-  ld_check(static_cast<int>(shard_paths_.size()) == nshards);
+  ld_check(static_cast<int>(shard_paths_.size()) == nshards_);
 
   // Create shards in multiple threads since it's a bit slow
   using FutureResult =
@@ -167,7 +162,7 @@ ShardedRocksDBLocalLogStore::ShardedRocksDBLocalLogStore(
                 std::shared_ptr<RocksDBCompactionFilterFactory>>;
 
   std::vector<std::future<FutureResult>> futures;
-  for (shard_index_t shard_idx = 0; shard_idx < nshards; ++shard_idx) {
+  for (shard_index_t shard_idx = 0; shard_idx < nshards_; ++shard_idx) {
     fs::path shard_path = shard_paths_[shard_idx];
     ld_check(!shard_path.empty());
     futures.push_back(std::async(std::launch::async, [=]() {
@@ -179,11 +174,15 @@ ShardedRocksDBLocalLogStore::ShardedRocksDBLocalLogStore(
       shard_config.createMergeOperator(shard_idx);
 
       // Create SstFileManager for this shard
-      shard_config.addSstFileManagerForShard();
+      if (is_db_local_) {
+        shard_config.addSstFileManagerForShard();
+      } else {
+        // Don't throttle file deletion when using remote storage.
+      }
 
       // If rocksdb statistics are enabled, create a Statistics object for
       // each shard.
-      if (db_settings->statistics) {
+      if (db_settings_->statistics) {
         shard_config.options_.statistics = rocksdb::CreateDBStatistics();
       }
 
@@ -191,73 +190,61 @@ ShardedRocksDBLocalLogStore::ShardedRocksDBLocalLogStore(
       // setShardedStorageThreadPool()) we'll link it to the storage
       // thread pool so that it can see the world.
       auto filter_factory =
-          std::make_shared<RocksDBCompactionFilterFactory>(db_settings);
+          std::make_shared<RocksDBCompactionFilterFactory>(db_settings_);
       shard_config.options_.compaction_filter_factory = filter_factory;
 
-      if (stats) {
+      if (stats_) {
         shard_config.options_.listeners.push_back(
             std::make_shared<RocksDBListener>(
-                stats,
+                stats_,
                 shard_idx,
                 env_.get(),
                 io_tracing_by_shard_[shard_idx].get()));
       }
 
       RocksDBLogStoreFactory factory(
-          std::move(shard_config), settings, config, stats);
+          std::move(shard_config), settings, config, customiser_.get(), stats_);
       std::unique_ptr<LocalLogStore> shard_store;
 
       // Treat the shard as failed if we find a file named
       // LOGDEVICE_DISABLED. Used by tests.
-      auto disable_marker = shard_path / fs::path("LOGDEVICE_DISABLED");
-      bool should_open_shard = true;
+      bool should_open_shard =
+          std::count(
+              disabled_shards_.begin(), disabled_shards_.end(), shard_idx) == 0;
 
-      try {
-        if (fs::exists(disable_marker) && fs::is_regular_file(disable_marker)) {
-          ld_info("Found %s, not opening shard %d",
-                  disable_marker.string().c_str(),
-                  shard_idx);
-          should_open_shard = false;
-        }
-
-        if (fs::exists(shard_path) && !fs::is_directory(shard_path)) {
-          ld_info("%s exists but is not a directory; not opening shard %d",
-                  shard_path.string().c_str(),
-                  shard_idx);
-          should_open_shard = false;
-        }
-      } catch (const fs::filesystem_error& e) {
-        ld_error("Error while checking for existence of %s or %s: %s. "
-                 "Not opening shard %d",
-                 disable_marker.string().c_str(),
-                 shard_path.string().c_str(),
-                 e.what(),
-                 shard_idx);
-        should_open_shard = false;
-      }
-
+      auto tstart = std::chrono::steady_clock::now();
       if (should_open_shard) {
         shard_store = factory.create(shard_idx,
-                                     nshards,
+                                     nshards_,
                                      shard_path.string(),
                                      io_tracing_by_shard_[shard_idx].get());
       }
 
+      auto tend = std::chrono::steady_clock::now();
+      uint64_t open_duration_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(tend - tstart)
+              .count();
       if (shard_store) {
-        ld_info("Opened RocksDB instance at %s", shard_path.c_str());
+        PER_SHARD_STAT_SET(
+            stats_, rocksdb_open_duration_ms, shard_idx, open_duration_ms);
+        ld_info("Opened RocksDB instance at %s in %ld ms",
+                shard_path.c_str(),
+                open_duration_ms);
         ld_check(dynamic_cast<RocksDBLogStoreBase*>(shard_store.get()) !=
                  nullptr);
       } else {
         PER_SHARD_STAT_INCR(stats_, failing_log_stores, shard_idx);
         shard_store = std::make_unique<FailingLocalLogStore>();
-        ld_info("Opened FailingLocalLogStore instance for shard %d", shard_idx);
+        ld_info("Opened FailingLocalLogStore instance for shard %d in %ld ms",
+                shard_idx,
+                open_duration_ms);
       }
 
       return std::make_pair(std::move(shard_store), std::move(filter_factory));
     }));
   }
 
-  for (int shard_idx = 0; shard_idx < nshards; ++shard_idx) {
+  for (int shard_idx = 0; shard_idx < nshards_; ++shard_idx) {
     auto& future = futures[shard_idx];
 
     std::unique_ptr<LocalLogStore> shard_store;
@@ -277,19 +264,73 @@ ShardedRocksDBLocalLogStore::ShardedRocksDBLocalLogStore(
   }
 
   // Subscribe for rocksdb config updates after initializing shards.
-  rocksdb_settings_handle_ = db_settings.callAndSubscribeToUpdates(
+  rocksdb_settings_handle_ = db_settings_.callAndSubscribeToUpdates(
       std::bind(&ShardedRocksDBLocalLogStore::onSettingsUpdated, this));
 
-  if (failing_log_store_shards_.size() >= nshards && nshards > 0) {
+  if (failing_log_store_shards_.size() >= nshards_ && nshards_ > 0) {
     ld_critical("All shards failed to open. Not starting the server.");
     throw ConstructorFailed();
   }
 
   // Check that we can map shards to devices
-  if (createDiskShardMapping() != nshards) {
+  if (createDiskShardMapping() != nshards_) {
     throw ConstructorFailed();
   }
-  printDiskShardMapping();
+  if (is_db_local_) {
+    printDiskShardMapping();
+  }
+
+  ld_info("Initialized sharded RocksDB instance at %s with %d shards",
+          base_path_.c_str(),
+          nshards_);
+}
+
+bool ShardedRocksDBLocalLogStore::wipe(
+    const std::vector<shard_index_t>& shard_indexes) {
+  ld_check(!initialized_);
+  if (initialized_) {
+    ld_critical("Wipe called after RocksDB initialisation. Ignoring.");
+    return false;
+  }
+
+  if (!is_db_local_) {
+    ld_critical("Wipe not supported for remote storage");
+    // The caller is supposed to make sure the DB is local.
+    ld_check(false);
+    return false;
+  }
+
+  if (!createOrValidatePaths()) {
+    return false;
+  }
+
+  for (shard_index_t shard_idx : shard_indexes) {
+    fs::path shard_path = shard_paths_.at(shard_idx);
+
+    try {
+      // Do not wipe "disabled" shards
+      if (fs::exists(shard_path) && !fs::is_directory(shard_path)) {
+        ld_info("%s exists but is not a directory. Not wiping shard %d",
+                shard_path.string().c_str(),
+                shard_idx);
+        continue;
+      }
+
+      // Recursively delete the directory contents (but not directory itself)
+      ld_info("Wiping shard %d at %s", shard_idx, shard_path.string().c_str());
+      for (fs::directory_iterator end_dir_it, dir_it(shard_path);
+           dir_it != end_dir_it;
+           ++dir_it) {
+        fs::remove_all(dir_it->path());
+      }
+    } catch (const fs::filesystem_error& e) {
+      ld_critical("Failed to wipe/validate %s: %s. Failing safe and aborting",
+                  shard_path.string().c_str(),
+                  e.what());
+      return false;
+    }
+  }
+  return true;
 }
 
 ShardedRocksDBLocalLogStore::~ShardedRocksDBLocalLogStore() {
@@ -319,123 +360,13 @@ ShardedRocksDBLocalLogStore::~ShardedRocksDBLocalLogStore() {
   }
 }
 
-static int database_exists(const std::string& base_path) {
-  boost::system::error_code code;
-
-  bool exists = fs::exists(base_path, code);
-  if (code.value() != boost::system::errc::success &&
-      code.value() != boost::system::errc::no_such_file_or_directory) {
-    ld_error("Error checking if path \"%s\" exists: %s",
-             base_path.c_str(),
-             code.message().c_str());
-    return -1;
-  }
-
-  if (!exists) {
-    return 0;
-  }
-
-  bool isdir = fs::is_directory(base_path, code);
-  if (code.value() != boost::system::errc::success &&
-      code.value() != boost::system::errc::not_a_directory) {
-    ld_error("Error checking if path \"%s\" is a directory: %s",
-             base_path.c_str(),
-             code.message().c_str());
-    return -1;
-  }
-
-  if (!isdir) {
-    ld_error("Path \"%s\" exists but is not a directory, cannot open local "
-             "log store",
-             base_path.c_str());
-    return -1;
-  }
-
-  bool isempty = fs::is_empty(base_path, code);
-  if (code.value() != boost::system::errc::success) {
-    ld_error("Error checking if path \"%s\" is empty: %s",
-             base_path.c_str(),
-             code.message().c_str());
-    return -1;
-  }
-
-  return !isempty;
-}
-
-static int check_nshards(const std::string& base_path,
-                         const shard_size_t nshards_expected) {
-  fs::path nshards_path = fs::path(base_path) / fs::path("NSHARDS");
-  FILE* fp = std::fopen(nshards_path.c_str(), "r");
-  if (fp == nullptr) {
-    ld_error("Database directory \"%s\" exists but there was an error opening "
-             "the NSHARDS file, errno=%d (%s).  To create a new sharded "
-             "database, please delete the directory and try again.",
-             base_path.c_str(),
-             errno,
-             strerror(errno));
-    return -1;
-  }
-
-  SCOPE_EXIT {
-    std::fclose(fp);
-  };
-
-  shard_size_t nshards_read;
-  if (std::fscanf(fp, "%hd", &nshards_read) != 1) {
-    ld_error("Error reading file \"%s\"", nshards_path.c_str());
-    return -1;
-  }
-
-  if (nshards_read != nshards_expected) {
-    ld_error("Tried to open existing sharded database \"%s\" with a different "
-             "number of shards (expected %d, found %d)",
-             base_path.c_str(),
-             nshards_expected,
-             nshards_read);
-    return -1;
-  }
-
-  return 0;
-}
-
-static int create_new_sharded_db(const std::string& base_path,
-                                 shard_size_t nshards) {
-  boost::system::error_code code;
-  fs::create_directories(base_path, code);
-  if (code.value() != boost::system::errc::success) {
-    ld_error("Error creating directory \"%s\": %s",
-             base_path.c_str(),
-             code.message().c_str());
-    return -1;
-  }
-
-  fs::path nshards_path = fs::path(base_path) / fs::path("NSHARDS");
-
-  FILE* fp = std::fopen(nshards_path.c_str(), "w");
-  if (fp == nullptr) {
-    ld_error("Failed to open \"%s\" for writing, errno=%d (%s)",
-             nshards_path.c_str(),
-             errno,
-             strerror(errno));
-    return -1;
-  }
-
-  SCOPE_EXIT {
-    std::fclose(fp);
-  };
-
-  if (std::fprintf(fp, "%d", nshards) < 0) {
-    ld_error("Error writing to \"%s\"", nshards_path.c_str());
-    return -1;
-  }
-
-  return 0;
-}
-
 int ShardedRocksDBLocalLogStore::trimLogsBasedOnSpaceIfNeeded(
     const DiskShardMappingEntry& mapping,
-    boost::filesystem::space_info info,
+    fs::space_info info,
     bool* full) {
+  // If DB is not in local file system, how did the caller even get space_info?
+  ld_check(is_db_local_);
+
   if (!partitioned_) {
     RATELIMIT_INFO(std::chrono::minutes(1),
                    1,
@@ -660,6 +591,10 @@ int ShardedRocksDBLocalLogStore::trimLogsBasedOnSpaceIfNeeded(
 
 void ShardedRocksDBLocalLogStore::setSequencerInitiatedSpaceBasedRetention(
     int shard_idx) {
+  if (!is_db_local_) {
+    return;
+  }
+
   ld_debug("shard_idx:%d, coordinated threshold:%lf",
            shard_idx,
            db_settings_->free_disk_space_threshold_low);
@@ -668,7 +603,7 @@ void ShardedRocksDBLocalLogStore::setSequencerInitiatedSpaceBasedRetention(
     return;
   }
 
-  auto disk_info_kv = fspath_to_dsme_.find(shard_to_devt_[shard_idx]);
+  auto disk_info_kv = fspath_to_dsme_.find(shard_to_devt_.at(shard_idx));
   if (disk_info_kv == fspath_to_dsme_.end()) {
     RATELIMIT_ERROR(std::chrono::seconds(1),
                     5,
@@ -685,11 +620,37 @@ void ShardedRocksDBLocalLogStore::setSequencerInitiatedSpaceBasedRetention(
 
 void ShardedRocksDBLocalLogStore::setShardedStorageThreadPool(
     const ShardedStorageThreadPool* sharded_pool) {
+  ld_check(!storage_thread_pool_assigned_);
+  storage_thread_pool_assigned_ = true;
   for (size_t i = 0; i < shards_.size(); ++i) {
     filters_[i]->setStorageThreadPool(&sharded_pool->getByIndex(i));
     shards_[i]->setProcessor(checked_downcast<Processor*>(
         &sharded_pool->getByIndex(i).getProcessor()));
   }
+}
+
+bool ShardedRocksDBLocalLogStore::switchToFailingLocalLogStore(
+    shard_index_t shard) {
+  ld_check(initialized_);
+  if (storage_thread_pool_assigned_) {
+    // too late.
+    return false;
+  }
+  auto store = getByIndex(shard);
+  if (store == nullptr) {
+    return false;
+  }
+  if (dynamic_cast<FailingLocalLogStore*>(store) != nullptr) {
+    // Do nothing.
+    return true;
+  }
+
+  shards_[shard].reset(new FailingLocalLogStore());
+  failing_log_store_shards_.insert(shard);
+  PER_SHARD_STAT_INCR(stats_, failing_log_stores, shard);
+  ld_info("Opened FailingLocalLogStore instance for shard %d", shard);
+
+  return true;
 }
 
 const std::unordered_map<dev_t, DiskShardMappingEntry>&
@@ -699,6 +660,13 @@ ShardedRocksDBLocalLogStore::getShardToDiskMapping() {
 
 size_t ShardedRocksDBLocalLogStore::createDiskShardMapping() {
   ld_check(!shard_paths_.empty());
+
+  if (!is_db_local_) {
+    // Leave shard_to_devt_ and fspath_to_dsme_ empty.
+    ld_info("DB is not in local file system. Disk space monitoring and "
+            "space-based trimming will be disabled.");
+    return nshards_;
+  }
 
   std::unordered_map<dev_t, size_t> dev_to_out_index;
   size_t success = 0, added_to_map = 0;
@@ -772,19 +740,31 @@ void ShardedRocksDBLocalLogStore::printDiskShardMapping() {
 }
 
 void ShardedRocksDBLocalLogStore::refreshIOTracingSettings() {
+  auto settings = db_settings_.get();
+  auto shards = settings->io_tracing_shards;
+
   std::vector<bool> enabled_by_shard(io_tracing_by_shard_.size());
-  for (shard_index_t idx : db_settings_.get()->io_tracing_shards) {
-    if (idx < 0 || idx >= enabled_by_shard.size()) {
-      ld_error("Shard idx out of range in --rocksdb-io-tracing-shards: %d not "
-               "in [0, %lu). Ignoring.",
-               static_cast<int>(idx),
-               io_tracing_by_shard_.size());
-      continue;
+  if (shards.all_shards) {
+    std::fill(enabled_by_shard.begin(), enabled_by_shard.end(), true);
+  } else {
+    for (shard_index_t idx : shards.shards) {
+      if (idx < 0 || idx >= enabled_by_shard.size()) {
+        ld_error(
+            "Shard idx out of range in --rocksdb-io-tracing-shards: %d not "
+            "in [0, %lu). Ignoring.",
+            static_cast<int>(idx),
+            io_tracing_by_shard_.size());
+        continue;
+      }
+      enabled_by_shard[idx] = true;
     }
-    enabled_by_shard[idx] = true;
   }
+
   for (shard_index_t i = 0; i < enabled_by_shard.size(); ++i) {
-    io_tracing_by_shard_[i]->setEnabled(enabled_by_shard[i]);
+    io_tracing_by_shard_[i]->updateOptions(
+        enabled_by_shard[i],
+        settings->io_tracing_threshold,
+        settings->io_tracing_stall_threshold);
   }
 }
 
@@ -797,6 +777,52 @@ void ShardedRocksDBLocalLogStore::onSettingsUpdated() {
     }
     rocksdb_shard->onSettingsUpdated(db_settings_.get());
   }
+}
+
+bool ShardedRocksDBLocalLogStore::parseFilePath(const std::string& path,
+                                                shard_index_t* out_shard,
+                                                std::string* out_filename) {
+  auto complainer = folly::makeGuard([&] {
+    RATELIMIT_ERROR(std::chrono::seconds(10),
+                    2,
+                    "Couldn't parse shard idx from path: %s",
+                    path.c_str());
+  });
+
+  // Looking for "/shard42/".
+  // Assuming that rocksdb doesn't use file names with word "shard" in them,
+  // and that it doesn't use subdirectories in the DB directory.
+
+  size_t p = path.rfind("shard");
+  if (p == std::string::npos || (p != 0 && path[p - 1] != '/')) {
+    return false;
+  }
+
+  size_t q = path.find_first_of('/', p);
+  q = q == std::string::npos ? path.size() : q;
+  p += strlen("shard");
+  ld_check(q >= p);
+
+  shard_index_t shard;
+  try {
+    shard = folly::to<shard_index_t>(path.substr(p, q - p));
+  } catch (std::range_error&) {
+    return false;
+  }
+
+  if (shard < 0 || shard >= MAX_SHARDS) {
+    return false;
+  }
+
+  if (out_shard != nullptr) {
+    *out_shard = shard;
+  }
+  if (out_filename != nullptr) {
+    *out_filename = path.substr(q + (q < path.size() ? 1 : 0));
+  }
+
+  complainer.dismiss();
+  return true;
 }
 
 }} // namespace facebook::logdevice

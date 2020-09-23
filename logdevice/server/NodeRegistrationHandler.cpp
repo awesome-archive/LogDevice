@@ -7,90 +7,75 @@
  */
 #include "logdevice/server/NodeRegistrationHandler.h"
 
+#include <folly/Expected.h>
 #include <folly/Random.h>
 #include <folly/String.h>
 
+#include "logdevice/common/RetryHandler.h"
 #include "logdevice/common/configuration/nodes/NodesConfigurationCodec.h"
-
-namespace facebook { namespace logdevice {
 
 using namespace facebook::logdevice::configuration::nodes;
 
+namespace facebook { namespace logdevice {
+
 namespace {
-constexpr size_t kMaxNumRetries = 5;
+constexpr size_t kMaxNumRetries = 10;
 
 // Maximum sleep duration before attempting register/update again
-constexpr std::chrono::milliseconds kMaxSleepDuration(10000);
+constexpr std::chrono::seconds kMaxSleepDuration(60);
 }; // namespace
 
 folly::Expected<node_index_t, E>
 NodeRegistrationHandler::registerSelf(NodeIndicesAllocator allocator) {
-  Status status = Status::OK;
-  for (size_t trials = 0; trials < kMaxNumRetries; trials++) {
-    auto idxs =
-        allocator.allocate(*nodes_configuration_->getServiceDiscovery(), 1);
-    ld_assert(idxs.size() > 0);
-    auto my_idx = idxs.front();
-    ld_info("Trying to register in the NodesConfiguration as N%d. Trial #%zu",
+  node_index_t my_idx;
+  auto result = RetryHandler<Status>::syncRun(
+      [this, &my_idx, &allocator](size_t trial_num) -> Status {
+        auto idxs = allocator.allocate(
+            *getNodesConfiguration().getServiceDiscovery(), 1);
+        ld_assert(idxs.size() > 0);
+        my_idx = idxs.front();
+        ld_info(
+            "Trying to register in the NodesConfiguration as N%d. Trial #%zu",
             my_idx,
-            trials);
+            trial_num);
 
-    auto update = buildSelfUpdate(my_idx, /* is_update= */ false);
-    if (!update.hasValue()) {
-      return folly::makeUnexpected(Status::INVALID_ATTRIBUTES);
-    }
-    status = applyUpdate(std::move(update).value());
+        auto update = buildSelfUpdate(my_idx, /* is_update= */ false);
+        if (!update.has_value()) {
+          return Status::INVALID_ATTRIBUTES;
+        }
+        return applyUpdate(std::move(update).value());
+      },
+      [](const Status& st) { return st == Status::VERSION_MISMATCH; },
+      /* num_tries */ kMaxNumRetries,
+      /* backoff_min */ std::chrono::seconds(1),
+      /* backoff_max */ kMaxSleepDuration,
+      /* jitter_param */ 0.25);
 
-    // Keep retrying as long as we get a VERSION_MISMATCH
-    if (status == Status::OK) {
-      return my_idx;
-    } else if (status != Status::VERSION_MISMATCH) {
-      return folly::makeUnexpected(status);
-    } else {
-      // It's a VERSION_MISMATCH. Keep retrying.
-      if (trials < kMaxNumRetries - 1) {
-        auto sleep_duration = folly::Random::rand64(kMaxSleepDuration.count());
-        ld_info("Version mismatch for NodesConfiguration registration, "
-                "will retry in %lu ms",
-                sleep_duration);
-        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_duration));
-      }
-    }
-  }
-  ld_error("Exhusted all retries. Giving up.");
-  ld_check(status == Status::VERSION_MISMATCH);
-  return folly::makeUnexpected(status);
+  auto status = result.first;
+  return status == Status::OK ? folly::makeExpected<E>(my_idx)
+                              : folly::makeUnexpected(status);
 }
 
 Status NodeRegistrationHandler::updateSelf(node_index_t my_idx) {
-  Status status = Status::OK;
-  for (size_t trials = 0; trials < kMaxNumRetries; trials++) {
-    ld_info("Checking if my attributes as N%d are up to date in the "
-            "NodesConfiguration. Trial #%zu",
-            my_idx,
-            trials);
-    auto update = buildSelfUpdate(my_idx, /* is_update= */ true);
-    if (!update.hasValue()) {
-      return Status::INVALID_ATTRIBUTES;
-    }
-    status = applyUpdate(std::move(update).value());
+  auto result = RetryHandler<Status>::syncRun(
+      [this, my_idx](size_t trial_num) -> Status {
+        ld_info("Trying to update node as N%d in the NodesConfiguration. "
+                "Trial #%zu",
+                my_idx,
+                trial_num);
+        auto update = buildSelfUpdate(my_idx, /* is_update= */ true);
+        if (!update.has_value()) {
+          return Status::INVALID_ATTRIBUTES;
+        }
+        return applyUpdate(std::move(update).value());
+      },
+      [](const Status& st) { return st == Status::VERSION_MISMATCH; },
+      /* num_tries */ kMaxNumRetries,
+      /* backoff_min */ std::chrono::seconds(1),
+      /* backoff_max */ kMaxSleepDuration,
+      /* jitter_param */ 0.25);
 
-    if (status != Status::VERSION_MISMATCH) {
-      return status;
-    } else {
-      // It's a VERSION_MISMATCH. Keep retrying.
-      if (trials < kMaxNumRetries - 1) {
-        auto sleep_duration = folly::Random::rand64(kMaxSleepDuration.count());
-        ld_info("Version mismatch for NodesConfiguration update, "
-                "will retry in %lu ms",
-                sleep_duration);
-        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_duration));
-      }
-    }
-  }
-  ld_error("Exhusted all retries. Giving up.");
-  ld_check(status == Status::VERSION_MISMATCH);
-  return status;
+  return result.first;
 }
 
 configuration::nodes::NodeUpdateBuilder
@@ -99,10 +84,15 @@ NodeRegistrationHandler::updateBuilderFromSettings(node_index_t my_idx) const {
 
   update_builder.setNodeIndex(my_idx).setName(server_settings_.name);
 
+  if (server_settings_.version.has_value()) {
+    update_builder.setVersion(server_settings_.version.value());
+  }
+
   if (!server_settings_.unix_socket.empty()) {
-    update_builder.setDataAddress(Sockaddr(server_settings_.unix_socket));
+    update_builder.setDefaultDataAddress(
+        Sockaddr(server_settings_.unix_socket));
   } else {
-    update_builder.setDataAddress(
+    update_builder.setDefaultDataAddress(
         Sockaddr(server_settings_.address, server_settings_.port));
   }
 
@@ -137,6 +127,53 @@ NodeRegistrationHandler::updateBuilderFromSettings(node_index_t my_idx) const {
     }
   }
 
+  // Dedicated server-to-server address is optional, so only set it if the unix
+  // socket is passed or if the port is greater than the default 0.
+  if (!server_settings_.server_to_server_unix_socket.empty()) {
+    update_builder.setServerToServerAddress(
+        Sockaddr(server_settings_.server_to_server_unix_socket));
+  } else if (server_settings_.server_to_server_port > 0) {
+    update_builder.setServerToServerAddress(Sockaddr(
+        server_settings_.address, server_settings_.server_to_server_port));
+  }
+
+  // Dedicated server-to-server Thrift API address is optional, so only set it
+  // if the unix socket is passed or if the port is greater than the default 0.
+  if (!server_settings_.server_thrift_api_unix_socket.empty()) {
+    update_builder.setServerThriftApiAddress(
+        Sockaddr(server_settings_.server_thrift_api_unix_socket));
+  } else if (server_settings_.server_thrift_api_port > 0) {
+    update_builder.setServerThriftApiAddress(Sockaddr(
+        server_settings_.address, server_settings_.server_thrift_api_port));
+  }
+
+  // Dedicated client-facing Thrift API address is optional, so only set it
+  // if the unix socket is passed or if the port is greater than the default 0.
+  if (!server_settings_.client_thrift_api_unix_socket.empty()) {
+    update_builder.setClientThriftApiAddress(
+        Sockaddr(server_settings_.client_thrift_api_unix_socket));
+  } else if (server_settings_.client_thrift_api_port > 0) {
+    update_builder.setClientThriftApiAddress(Sockaddr(
+        server_settings_.address, server_settings_.client_thrift_api_port));
+  }
+
+  // Ports per network priority is an optional feature. An empty map represents
+  // that setting is not set.
+  if (!server_settings_.unix_addresses_per_network_priority.empty()) {
+    for (const auto& [priority, socket_path] :
+         server_settings_.unix_addresses_per_network_priority) {
+      update_builder.setAddressForNetworkPriority(
+          priority, Sockaddr{socket_path});
+    }
+  } else if (!server_settings_.ports_per_network_priority.empty()) {
+    for (const auto& [priority, port] :
+         server_settings_.ports_per_network_priority) {
+      update_builder.setAddressForNetworkPriority(
+          priority,
+          Sockaddr{server_settings_.address, static_cast<in_port_t>(port)});
+    }
+  }
+
   if (!server_settings_.location.isEmpty()) {
     update_builder.setLocation(server_settings_.location);
   }
@@ -153,6 +190,11 @@ NodeRegistrationHandler::updateBuilderFromSettings(node_index_t my_idx) const {
         .setStorageCapacity(server_settings_.storage_capacity)
         .setNumShards(server_settings_.num_shards);
   }
+
+  for (const auto& kvp : server_settings_.tags) {
+    update_builder.setTag(kvp.first, kvp.second);
+  }
+
   return update_builder;
 }
 
@@ -167,11 +209,11 @@ NodeRegistrationHandler::buildSelfUpdate(node_index_t my_idx,
         std::move(updateBuilderFromSettings(my_idx))
             .buildAddNodeUpdate(
                 update,
-                nodes_configuration_->getSequencerMembership()->getVersion(),
-                nodes_configuration_->getStorageMembership()->getVersion());
+                getNodesConfiguration().getSequencerMembership()->getVersion(),
+                getNodesConfiguration().getStorageMembership()->getVersion());
   } else {
     result = std::move(updateBuilderFromSettings(my_idx))
-                 .buildUpdateNodeUpdate(update, *nodes_configuration_);
+                 .buildUpdateNodeUpdate(update, getNodesConfiguration());
   }
   if (result.status != Status::OK) {
     ld_error("Failed building selfUpdate: %s", result.message.c_str());
@@ -186,7 +228,7 @@ Status NodeRegistrationHandler::applyUpdate(
     return Status::UPTODATE;
   }
 
-  auto new_config = nodes_configuration_->applyUpdate(std::move(update));
+  auto new_config = getNodesConfiguration().applyUpdate(std::move(update));
   if (new_config == nullptr) {
     return err;
   }
@@ -198,10 +240,43 @@ Status NodeRegistrationHandler::applyUpdate(
 
   NodesConfigurationStore::version_t new_version;
   std::string config_out;
-  return store_->updateConfigSync(std::move(nc_serialized),
-                                  nodes_configuration_->getVersion(),
-                                  &new_version,
-                                  &config_out);
+  auto status = store_->updateConfigSync(std::move(nc_serialized),
+                                         getNodesConfiguration().getVersion(),
+                                         &new_version,
+                                         &config_out);
+  if (status == Status::VERSION_MISMATCH) {
+    // There's a new NC, let's refresh our updatable.
+    if (config_out.empty()) {
+      // NCS failed to provide us with the new version, so we need to fetch it
+      // ourselves.
+      auto read_status = store_->getConfigSync(&config_out);
+      if (read_status != Status::OK) {
+        ld_error("Got a NodesConfiguration version mismatch during update, but "
+                 "failed to fetch the new version: %s",
+                 error_name(read_status));
+        return read_status;
+      }
+    }
+    auto new_nc = NodesConfigurationCodec::deserialize(config_out);
+    if (new_nc == nullptr) {
+      ld_error("Got a NodesConfiguration version mismatch during update, but "
+               "failed to deserialize the new version: %s",
+               error_name(err));
+      return err;
+    }
+
+    ld_info("Got a NodesConfiguration version mismatch during update. "
+            "Updating NC version from %ld to %ld",
+            getNodesConfiguration().getVersion().val(),
+            new_nc->getVersion().val());
+    nodes_configuration_->update(std::move(new_nc));
+  }
+  return status;
+}
+
+const NodesConfiguration&
+NodeRegistrationHandler::getNodesConfiguration() const {
+  return *nodes_configuration_->get();
 }
 
 }} // namespace facebook::logdevice

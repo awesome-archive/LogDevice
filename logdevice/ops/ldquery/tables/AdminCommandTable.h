@@ -15,9 +15,9 @@
 #include "logdevice/common/configuration/Configuration.h"
 #include "logdevice/common/util.h"
 #include "logdevice/include/Client.h"
-#include "logdevice/ops/admin_command_client/AdminCommandClient.h"
 #include "logdevice/ops/ldquery/Context.h"
 #include "logdevice/ops/ldquery/Table.h"
+#include "logdevice/ops/py_extensions/admin_command_client/AdminCommandClient.h"
 
 namespace facebook { namespace logdevice { namespace ldquery {
 
@@ -41,7 +41,7 @@ class AdminCommandTable : public Table {
   explicit AdminCommandTable(std::shared_ptr<Context> ctx,
                              Type type = Type::JSON_TABLE)
       : Table(ctx), type_(type) {
-    ld_check(ctx->commandTimeout.hasValue());
+    ld_check(ctx->commandTimeout.has_value());
     command_timeout_ = ctx->commandTimeout.value();
   }
 
@@ -105,9 +105,8 @@ class AdminCommandTable : public Table {
   const TableColumns& getColumnsImpl() const;
 
   // Get the address to use to issue admin commands to node at pos `nid` in the
-  // cluster. and return both the address and wether it expects SSL.
-  std::tuple<folly::SocketAddress, AdminCommandClient::ConnectionType>
-  getAddrForNode(
+  // cluster. Returns folly::none if the admin_address is unknown.
+  folly::Optional<folly::SocketAddress> getAddrForNode(
       node_index_t nid,
       const std::shared_ptr<const configuration::nodes::NodesConfiguration>&
           nodes_configuration);

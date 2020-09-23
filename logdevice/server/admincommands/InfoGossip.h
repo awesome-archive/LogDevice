@@ -88,6 +88,7 @@ class InfoGossip : public AdminCommand {
       row["status"] = cs->isNodeAlive(idx) ? "ALIVE" : "DEAD";
       row["detector"] = detector->getStateJson(idx);
       row["boycott_status"] = cs->isNodeBoycotted(idx) ? "BOYCOTTED" : "-";
+      row["health_status"] = toString(cs->getNodeStatus(idx)).c_str();
       states.push_back(row);
     }
 
@@ -97,6 +98,7 @@ class InfoGossip : public AdminCommand {
       obj["domain_isolation"] = detector->getDomainIsolationString().c_str();
       // print current ISOLATION value
       obj["isolated"] = detector->isIsolated() ? "true" : "false";
+      obj["stable_state"] = detector->isStableState() ? "true" : "false";
     }
     return obj;
   }
@@ -128,11 +130,12 @@ class InfoGossip : public AdminCommand {
       if (!nodes_configuration->isNodeInServiceDiscoveryConfig(idx)) {
         continue;
       }
-      out_.printf("GOSSIP N%u %s %s %s\r\n",
+      out_.printf("GOSSIP N%u %s %s %s %s\r\n",
                   idx,
                   cs->isNodeAlive(idx) ? "ALIVE" : "DEAD",
                   detector->getStateString(idx).c_str(),
-                  cs->isNodeBoycotted(idx) ? "BOYCOTTED" : "-");
+                  cs->isNodeBoycotted(idx) ? "BOYCOTTED" : "-",
+                  toString(cs->getNodeStatus(idx)).c_str());
     }
 
     if (node_idx_ == node_index_t(-1)) {
@@ -141,6 +144,8 @@ class InfoGossip : public AdminCommand {
       out_.printf("%s", detector->getDomainIsolationString().c_str());
       // print current ISOLATION value
       out_.printf("ISOLATED %s\r\n", detector->isIsolated() ? "true" : "false");
+      out_.printf(
+          "STABLE_STATE %s\r\n", detector->isStableState() ? "true" : "false");
     }
   }
 };

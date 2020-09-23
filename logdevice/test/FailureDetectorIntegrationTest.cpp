@@ -48,11 +48,14 @@ TEST_F(FailureDetectorIntegrationTest, GossipListOnNodeRestarts) {
     }
   }
 
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes));
+
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .enableMessageErrorInjection()
-                     .setNodes(nodes)
+                     .setNodes(nodes_configuration)
                      .useHashBasedSequencerAssignment(10)
-                     .create(nodes.size());
+                     .create(nodes_configuration->clusterSize());
 
   // test liveness of all nodes in gossip list of node `src`
   auto fd_test_alive = [&](node_index_t src, bool alive) {
@@ -164,12 +167,14 @@ TEST_F(FailureDetectorIntegrationTest, DetectDomainIsolation) {
   // node 1, 2 is in the same rack in region 1
   // node 3-5 is in the same rack in region 2
   Configuration::Nodes nodes = createFailureDomainNodes();
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes));
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
-          .setNodes(nodes)
+          .setNodes(nodes_configuration)
           .useHashBasedSequencerAssignment() // enable failure detector
           .enableMessageErrorInjection()
-          .create(nodes.size());
+          .create(nodes_configuration->clusterSize());
 
   for (const auto& it : nodes) {
     node_index_t idx = it.first;
@@ -189,6 +194,9 @@ TEST_F(FailureDetectorIntegrationTest, DetectDomainIsolation) {
     wait_until(
         reason.c_str(), [&]() { return noIsolatedScope(cluster.get(), idx); });
   }
+
+  // Make sure everyone receives at least min_gossips_for_stable_state gossips.
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
 
   // stop node 0, 3, 4, 5, node 1 and 2 will detect themselve being isolated
   for (auto i : std::vector<int>{0, 3, 4, 5}) {
@@ -235,8 +243,9 @@ TEST_F(FailureDetectorIntegrationTest, ResetStoreTimerAfterIsolation) {
   // node 0 is in region 0
   // node 1-4 is in the same rack in region 1
   // node 5 is in the same rack in region 2
+  const auto nnodes = 6;
   Configuration::Nodes nodes;
-  for (int i = 0; i < 6; ++i) {
+  for (int i = 0; i < nnodes; ++i) {
     auto& node = nodes[i];
     node.addSequencerRole();
     node.addStorageRole(/*num_shards*/ 2);
@@ -252,32 +261,40 @@ TEST_F(FailureDetectorIntegrationTest, ResetStoreTimerAfterIsolation) {
     location.fromDomainString(domain_string);
     node.location = location;
   }
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(2);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(100);
-  log_attrs.set_syncReplicationScope(NodeLocationScope::REGION);
+  // Set metadata nodeset
+  nodes[0].metadata_node = true;
+  nodes[1].metadata_node = true;
+  nodes[5].metadata_node = true;
+
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(2)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(100)
+                       .with_syncReplicationScope(NodeLocationScope::REGION);
   int num_logs = 100;
 
-  // metadata logs are replicated cross-region as well
-  Configuration::MetaDataLogsConfig meta_config = createMetaDataLogsConfig(
-      /*nodeset=*/{0, 1, 5}, /*replication=*/3, NodeLocationScope::REGION);
+  Configuration::MetaDataLogsConfig meta_config =
+      ServerConfig::MetaDataLogsConfig();
   meta_config.nodeset_selector_type = NodeSetSelectorType::SELECT_ALL;
+
+  // metadata logs are replicated cross-region as well
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes), ReplicationProperty{{NodeLocationScope::REGION, 3}});
 
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
-          .setNodes(nodes)
+          .setNodes(nodes_configuration)
           .setLogGroupName("mylogs")
           .setLogAttributes(log_attrs)
           .setNumLogs(num_logs)
           .setMetaDataLogsConfig(std::move(meta_config))
           .useHashBasedSequencerAssignment() // enable failure detector
-          .create(nodes.size());
+          .create(nnodes);
 
   // look for a log with a sequencer running on node 2
   int log_id = -1;
-  std::vector<double> weights(nodes.size(), 1.0);
+  std::vector<double> weights(nnodes, 1.0);
   for (int i = 0; i < num_logs; i++) {
     auto seq = hashing::weighted_ch(i, weights);
     if (seq == 2) {
@@ -288,14 +305,14 @@ TEST_F(FailureDetectorIntegrationTest, ResetStoreTimerAfterIsolation) {
   EXPECT_NE(log_id, -1);
 
   // wait until domain isolation detection is enabled
-  for (int i = 0; i < nodes.size(); ++i) {
+  for (int i = 0; i < nnodes; ++i) {
     wait_until(
         [&]() { return domainIsolationDetectionEnabled(cluster.get(), i); });
   }
 
   // for each node, isolation status should eventually be NOT_ISOLATED on
   // all scopes
-  for (int i = 0; i < nodes.size(); ++i) {
+  for (int i = 0; i < nnodes; ++i) {
     wait_until([&]() { return noIsolatedScope(cluster.get(), i); });
   }
 
@@ -362,9 +379,7 @@ TEST_F(FailureDetectorIntegrationTest, MinorityIsolation) {
           .enableMessageErrorInjection()
           .create(num_nodes);
 
-  for (size_t idx = 0; idx < num_nodes; ++idx) {
-    cluster->getNode(idx).waitUntilAvailable();
-  }
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
 
   auto client = cluster->createClient();
   for (int i = 0; i < 10; ++i) {
@@ -409,11 +424,7 @@ TEST_F(FailureDetectorIntegrationTest, MinorityIsolation) {
   // resuscitate one node
   auto idx = dead_nodes.front();
   cluster->getNode(idx).resume();
-  std::string key = folly::to<std::string>("N", idx);
-  wait_until([&]() {
-    auto info = cluster->getNode(node_idx).gossipInfo();
-    return info[key] == "ALIVE";
-  });
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
 
   lsn_t lsn = client->appendSync(logid_t(1), Payload("hello", 5));
   EXPECT_NE(LSN_INVALID, lsn);
@@ -428,6 +439,7 @@ TEST_F(FailureDetectorIntegrationTest, GetClusterState) {
                      .enableMessageErrorInjection()
                      .setNumLogs(num_logs)
                      .create(num_nodes);
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
 
   // force client to have only one worker to make sure the same worker is going
   // to exectue all requests.
@@ -490,13 +502,12 @@ TEST_F(FailureDetectorIntegrationTest, StartingState) {
   const int num_nodes = 10;
 
   auto cluster_factory = IntegrationTestUtils::ClusterFactory();
-  logsconfig::LogAttributes log_attrs =
-      cluster_factory.createDefaultLogAttributes(num_nodes);
-  log_attrs.set_nodeSetSize(num_nodes);
+  auto log_attrs =
+      cluster_factory.createDefaultLogAttributes(num_nodes).with_nodeSetSize(
+          num_nodes);
 
-  logsconfig::LogAttributes internal_log_attrs;
-  internal_log_attrs.set_replicationFactor(1);
-  internal_log_attrs.set_nodeSetSize(1);
+  auto internal_log_attrs =
+      logsconfig::LogAttributes().with_replicationFactor(1).with_nodeSetSize(1);
 
   auto cluster = cluster_factory.enableLogsConfigManager()
                      .deferStart()
@@ -517,13 +528,14 @@ TEST_F(FailureDetectorIntegrationTest, StartingState) {
       NodeSetSelectorFactory::create(NodeSetSelectorType::CONSISTENT_HASHING);
 
   const auto config = cluster->getConfig()->get();
-  auto selected = selector->getStorageSet(
-      configuration::InternalLogs::CONFIG_LOG_DELTAS,
-      config.get(),
-      *config->getNodesConfigurationFromServerConfigSource(),
-      /* target_nodeset_size */ 1,
-      /* seed */ 0,
-      nullptr);
+  auto selected =
+      selector->getStorageSet(configuration::InternalLogs::CONFIG_LOG_DELTAS,
+                              config.get(),
+                              *cluster->getConfig()->getNodesConfiguration(),
+                              /* target_nodeset_size */ 1,
+                              /* seed */ 0,
+                              nullptr,
+                              NodeSetSelector::Options{});
   ASSERT_EQ(selected.decision, NodeSetSelector::Decision::NEEDS_CHANGE);
   ASSERT_EQ(selected.storage_set.size(), 1);
   auto S = selected.storage_set[0];
@@ -559,10 +571,10 @@ TEST_F(FailureDetectorIntegrationTest, StartingState) {
 
   /* we should not be able to create clients if we can't read internal logs */
   std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
-  ASSERT_THROW(
+  ASSERT_EQ(
+      nullptr,
       cluster->createClient(
-          /*timeout=*/std::chrono::seconds{2}, std::move(client_settings)),
-      ConstructorFailed);
+          /*timeout=*/std::chrono::seconds{2}, std::move(client_settings)));
 
   ld_info("Starting node N%d", S.node());
   cluster->getNode(S.node()).start();
@@ -572,13 +584,13 @@ TEST_F(FailureDetectorIntegrationTest, StartingState) {
     cluster->waitUntilGossip(/* alive */ true, idx);
   }
 
-  cluster->waitUntilStartupComplete();
-  cluster->waitForRecovery();
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
+  cluster->waitUntilAllSequencersQuiescent();
 
   /* create client */
   std::unique_ptr<ClientSettings> client_settings2(ClientSettings::create());
-  auto client = cluster->createIndependentClient(
-      this->testTimeout(), std::move(client_settings2));
+  auto client =
+      cluster->createClient(this->testTimeout(), std::move(client_settings2));
 
   /* we should be able to create log groups now */
   auto log_group = client->makeLogGroupSync(
@@ -607,17 +619,17 @@ TEST_F(FailureDetectorIntegrationTest, GetClusterStatePeerUnavailable) {
     nodes[i].generation = 1;
     nodes[i].addStorageRole(/*num_shards*/ 2);
   }
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes));
 
   auto cluster = IntegrationTestUtils::ClusterFactory()
-                     .setNodes(nodes)
+                     .setNodes(std::move(nodes_configuration))
                      .useHashBasedSequencerAssignment(10)
                      .enableMessageErrorInjection()
                      .useTcp()
                      .create(3);
 
-  for (size_t idx = 0; idx < 3; ++idx) {
-    cluster->getNode(idx).waitUntilAvailable();
-  }
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
 
   std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
   ASSERT_EQ(0, client_settings->set("cluster-state-refresh-interval", "1ms"));
@@ -673,16 +685,7 @@ TEST_F(FailureDetectorIntegrationTest, FDClusterExpandStateTransition) {
   // This number is after expansion, we'll start NUM_NODES-1 initially
   const int NUM_NODES = 3;
 
-  Configuration::Nodes nodes;
-  /* make all nodes as sequencers */
-  for (int i = 0; i < NUM_NODES - 1; ++i) {
-    nodes[i].generation = 1;
-    nodes[i].addSequencerRole();
-    nodes[i].addStorageRole(/*num_shards*/ 2);
-  }
-
   auto cluster = IntegrationTestUtils::ClusterFactory()
-                     .setNodes(nodes)
                      .useHashBasedSequencerAssignment()
                      .setParam("--gossip-interval", "100ms")
                      .setParam("--gossip-threshold", "20")

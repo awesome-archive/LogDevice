@@ -16,6 +16,7 @@
 
 #include <gtest/gtest.h>
 
+#include "logdevice/common/PayloadHolder.h"
 #include "logdevice/common/configuration/LocalLogsConfig.h"
 #include "logdevice/common/configuration/UpdateableConfig.h"
 #include "logdevice/common/test/TestUtil.h"
@@ -74,7 +75,7 @@ class MockShadow : public Shadow {
                                                          client_settings)) {}
 
   bool isReset() {
-    return !last_used_range_.hasValue() && range_cache_.empty() &&
+    return !last_used_range_.has_value() && range_cache_.empty() &&
         shadow_map_.empty();
   }
 
@@ -187,12 +188,12 @@ TEST_F(ShadowTest, LogRangeResolutionNoShadow) {
   ASSERT_FALSE(shadow->checkShadowConfig(logid_t{1}));
   ASSERT_EQ(err, E::SHADOW_LOADING);
   ASSERT_TRUE(shadow->isLogGroupLoaded(kTestData[0].range));
-  ASSERT_FALSE(shadow->getLoadedLogGroup(kTestData[0].range).attrs.hasValue());
+  ASSERT_FALSE(shadow->getLoadedLogGroup(kTestData[0].range).attrs.has_value());
 
   ASSERT_FALSE(shadow->checkShadowConfig(logid_t{201}));
   ASSERT_EQ(err, E::SHADOW_LOADING);
   ASSERT_TRUE(shadow->isLogGroupLoaded(kTestData[1].range));
-  ASSERT_FALSE(shadow->getLoadedLogGroup(kTestData[1].range).attrs.hasValue());
+  ASSERT_FALSE(shadow->getLoadedLogGroup(kTestData[1].range).attrs.has_value());
 }
 
 // Test logid -> log range resolution with shadow configured
@@ -207,14 +208,14 @@ TEST_F(ShadowTest, LogRangeResolutionWithShadow) {
   ASSERT_FALSE(shadow->checkShadowConfig(logid_t{1}));
   ASSERT_EQ(err, E::SHADOW_LOADING);
   ASSERT_TRUE(shadow->isLogGroupLoaded(kTestData[0].range));
-  ASSERT_TRUE(shadow->getLoadedLogGroup(kTestData[0].range).attrs.hasValue());
+  ASSERT_TRUE(shadow->getLoadedLogGroup(kTestData[0].range).attrs.has_value());
   ASSERT_EQ(shadow->getLoadedLogGroup(kTestData[0].range).attrs.value(),
             kTestData[0].attrs);
 
   ASSERT_FALSE(shadow->checkShadowConfig(logid_t{201}));
   ASSERT_EQ(err, E::SHADOW_LOADING);
   ASSERT_TRUE(shadow->isLogGroupLoaded(kTestData[1].range));
-  ASSERT_TRUE(shadow->getLoadedLogGroup(kTestData[1].range).attrs.hasValue());
+  ASSERT_TRUE(shadow->getLoadedLogGroup(kTestData[1].range).attrs.has_value());
   ASSERT_EQ(shadow->getLoadedLogGroup(kTestData[1].range).attrs.value(),
             kTestData[1].attrs);
 
@@ -283,15 +284,28 @@ TEST_F(ShadowTest, LogRangeAutoUpdate) {
 
 // Make sure shadow client initializes without crashing
 TEST(ShadowClientTest, ShadowClientInitAppend) {
+  auto nodes_config_path =
+      provisionTempNodesConfiguration(*createSimpleNodesConfig(1));
+  std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
+  client_settings->set(
+      "nodes-configuration-file-store-dir", nodes_config_path->path().string());
+  client_settings->set("admin-client-capabilities", "true");
+
   LogAttributes::Shadow shadowAttr{
       std::string("file:") + TEST_CONFIG_FILE("sample_no_ssl.conf"), 0.1};
-  std::shared_ptr<ShadowClient> shadow_client = ShadowClient::create(
-      "test", shadowAttr, std::chrono::seconds(10), nullptr);
+  std::shared_ptr<ShadowClient> shadow_client =
+      ShadowClient::create("test",
+                           shadowAttr,
+                           std::chrono::seconds(10),
+                           nullptr,
+                           std::move(client_settings));
   ASSERT_NE(shadow_client, nullptr);
 
-  std::string payload_str = "test";
-  Payload payload{payload_str.data(), payload_str.size()};
-  int rv = shadow_client->append(logid_t{1}, payload, {}, false);
+  int rv = shadow_client->append(logid_t{1},
+                                 PayloadHolder::copyString("test"),
+                                 {},
+                                 /* buffered_writer_blob */ false,
+                                 /* payload_set */ false);
   ASSERT_EQ(rv, 0);
 }
 

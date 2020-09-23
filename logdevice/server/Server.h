@@ -12,10 +12,7 @@
 
 #include <folly/io/async/EventBaseThread.h>
 
-#include "logdevice/admin/AdminServer.h"
-#include "logdevice/admin/settings/AdminServerSettings.h"
 #include "logdevice/common/PermissionChecker.h"
-#include "logdevice/common/PrincipalParser.h"
 #include "logdevice/common/configuration/ServerConfig.h"
 #include "logdevice/common/configuration/UpdateableConfig.h"
 #include "logdevice/common/settings/GossipSettings.h"
@@ -23,12 +20,12 @@
 #include "logdevice/common/stats/Stats.h"
 #include "logdevice/include/ConfigSubscriptionHandle.h"
 #include "logdevice/server/ConnectionListener.h"
-#include "logdevice/server/LocalLogFile.h"
 #include "logdevice/server/ServerSettings.h"
 #include "logdevice/server/UnreleasedRecordDetector.h"
-#include "logdevice/server/admincommands/CommandListener.h"
+#include "logdevice/server/admincommands/CommandProcessor.h"
 #include "logdevice/server/locallogstore/LocalLogStoreSettings.h"
 #include "logdevice/server/locallogstore/RocksDBSettings.h"
+#include "logdevice/server/thrift/LogDeviceThriftServer.h"
 
 namespace facebook { namespace logdevice {
 
@@ -48,6 +45,8 @@ class ShardedRocksDBLocalLogStore;
 class ShardedStorageThreadPool;
 class TraceLogger;
 class UnreleasedRecordDetector;
+class AdminAPIHandler;
+class AdminServerSettings;
 
 namespace maintenance {
 class ClusterMaintenanceStateMachine;
@@ -78,6 +77,9 @@ class ServerParameters {
   ServerParameters(const ServerParameters& rhs) = delete;
   ServerParameters& operator=(const ServerParameters& rhs) = delete;
 
+  // Must be called before passing the params object to the server.
+  void init();
+
   // Not mutually exclusive.
   bool isStorageNode() const;
   bool isSequencingEnabled() const;
@@ -88,7 +90,6 @@ class ServerParameters {
 
   std::shared_ptr<UpdateableConfig> getUpdateableConfig();
   std::shared_ptr<TraceLogger> getTraceLogger();
-  const std::shared_ptr<LocalLogFile>& getAuditLog();
   StatsHolder* getStats();
   void requestStop();
   std::shared_ptr<PluginRegistry> getPluginRegistry() const {
@@ -147,7 +148,6 @@ class ServerParameters {
 
   std::shared_ptr<UpdateableConfig> updateable_config_;
   std::shared_ptr<TraceLogger> trace_logger_;
-  std::shared_ptr<LocalLogFile> audit_log_;
 
   // Assigned when config is loaded.
   folly::Optional<NodeID> my_node_id_;
@@ -167,11 +167,10 @@ class ServerParameters {
   bool setConnectionLimits();
 
   // NodesConfiguration Hooks
-  bool shutdownIfMyNodeIdChanged(const NodesConfiguration& config);
-  bool isSameMyNodeID(const NodesConfiguration& config);
+  bool shutdownIfMyNodeInfoChanged(const NodesConfiguration& config);
+  bool hasMyNodeInfoChanged(const NodesConfiguration& config);
 
   // Server Config Hooks
-  bool updateServerOrigin(ServerConfig& config);
   bool updateConfigSettings(ServerConfig& config);
 
   // The main server config hook that invokes other hooks
@@ -235,10 +234,16 @@ class Server {
 
   RebuildingCoordinator* getRebuildingCoordinator();
 
+  EventLogStateMachine* getEventLogStateMachine();
+
   maintenance::MaintenanceManager* getMaintenanceManager();
 
   SettingsUpdater& getSettings() {
     return *settings_updater_;
+  }
+
+  std::shared_ptr<SettingsUpdater> getSettingsUpdater() {
+    return settings_updater_;
   }
 
   const UpdateableSettings<ServerSettings>& getServerSettings() const {
@@ -260,8 +265,6 @@ class Server {
     }
   }
 
-  void rotateLocalLogs();
-
  private:
   ServerParameters* params_;
 
@@ -272,19 +275,30 @@ class Server {
   std::shared_ptr<ServerConfig> server_config_;
   std::shared_ptr<SettingsUpdater> settings_updater_;
 
+  // Must outlive the the command listener and the admin server.
+  std::unique_ptr<CommandProcessor> admin_command_processor_;
+
   // initListeners()
   std::unique_ptr<folly::EventBaseThread> connection_listener_loop_;
-  std::unique_ptr<folly::EventBaseThread> ssl_connection_listener_loop_;
-  std::unique_ptr<folly::EventBaseThread> command_listener_loop_;
   std::unique_ptr<folly::EventBaseThread> gossip_listener_loop_;
-  std::unique_ptr<AdminServer> admin_server_handle_;
+  std::unique_ptr<folly::EventBaseThread> server_to_server_listener_loop_;
+  std::unique_ptr<LogDeviceThriftServer> s2s_thrift_api_handle_;
+  std::unique_ptr<LogDeviceThriftServer> c2s_thrift_api_handle_;
+  std::unique_ptr<LogDeviceThriftServer> admin_server_handle_;
   std::unique_ptr<Listener> connection_listener_;
   std::unique_ptr<Listener> ssl_connection_listener_;
-  std::unique_ptr<Listener> command_listener_;
   std::unique_ptr<Listener> gossip_listener_;
+  std::unique_ptr<Listener> server_to_server_listener_;
+  std::map<ServerSettings::ClientNetworkPriority, std::unique_ptr<Listener>>
+      listeners_per_network_priority_;
 
   // initStore()
   std::unique_ptr<ShardedRocksDBLocalLogStore> sharded_store_;
+
+  // initLogStorageStateMap()
+  std::unique_ptr<LogStorageStateMap> log_storage_state_map_ = nullptr;
+
+  // initStorageThreadPool()
   std::unique_ptr<ShardedStorageThreadPool> sharded_storage_thread_pool_;
 
   // initProcessor()
@@ -317,9 +331,9 @@ class Server {
   std::atomic<bool> is_shut_down_{false};
 
   // ResourceBudget used to limit the total number of accepted connections
-  // which have not been processed by workers. It is the same as looking at the
-  // number of incomplete NewConnectionRequest
-  // See Settings::max_new_connections.
+  // which have not been processed by workers. It is the same as looking at
+  // the number of incomplete NewConnectionRequest See
+  // Settings::max_new_connections.
   ResourceBudget conn_budget_backlog_;
 
   // Similar to above but we don't want to limit for some listeners.
@@ -328,26 +342,36 @@ class Server {
   // These methods should be called in this order.
   // In case of error, log it and return false.
   bool initListeners();
+  // Initializes both (client-facing and server-to-server) Thrift API servers
+  bool initThriftServers();
+  // Initializes single Thrift API server and returns pointer to it or nullptr
+  // if server is disabled
+  std::unique_ptr<LogDeviceThriftServer>
+  initThriftServer(std::string name, const folly::Optional<Sockaddr>& address);
+
   bool initStore();
+  bool initLogStorageStateMap();
+  bool initStorageThreadPool();
   bool initProcessor();
+  bool initFailureDetector();
+  bool startWorkers();
+  bool initNCM();
   bool repopulateRecordCaches();
   bool initSequencers();
   bool initLogStoreMonitor();
-  bool initFailureDetector();
   bool initSequencerPlacement();
   bool initRebuildingCoordinator();
   bool initClusterMaintenanceStateMachine();
-  bool createAndAttachMaintenanceManager(AdminServer* server);
+  bool createAndAttachMaintenanceManager(AdminAPIHandler*);
   bool initUnreleasedRecordDetector();
   bool initLogsConfigManager();
   bool initAdminServer();
+  bool initRocksDBMetricsExport();
 
   // Calls gracefulShutdown in separate thread and does _exit(EXIT_FAILURE)
   // if it takes longer than server_settings_->shutdown_timeout ms.
   void shutdownWithTimeout();
 
-  bool startCommandListener(std::unique_ptr<Listener>& handle);
   bool startConnectionListener(std::unique_ptr<Listener>& handle);
 };
-
 }} // namespace facebook::logdevice

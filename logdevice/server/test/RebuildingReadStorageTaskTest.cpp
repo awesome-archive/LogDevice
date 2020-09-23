@@ -5,12 +5,14 @@
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
  */
+#include "logdevice/server/rebuilding/RebuildingReadStorageTask.h"
+
 #include <gtest/gtest.h>
 
 #include "logdevice/common/settings/SettingsUpdater.h"
 #include "logdevice/common/test/NodeSetTestUtil.h"
+#include "logdevice/common/test/NodesConfigurationTestUtil.h"
 #include "logdevice/server/locallogstore/test/TemporaryLogStore.h"
-#include "logdevice/server/rebuilding/RebuildingReadStorageTaskV2.h"
 
 using namespace facebook::logdevice;
 
@@ -36,13 +38,13 @@ lsn_t mklsn(epoch_t::raw_type epoch, esn_t::raw_type esn) {
   return compose_lsn(epoch_t(epoch), esn_t(esn));
 }
 
-class RebuildingReadStorageTaskTest : public ::testing::Test {
+class RebuildingReadStorageTaskTest : public ::testing::TestWithParam<bool> {
  public:
-  class MockRebuildingReadStorageTaskV2 : public RebuildingReadStorageTaskV2 {
+  class MockRebuildingReadStorageTask : public RebuildingReadStorageTask {
    public:
-    MockRebuildingReadStorageTaskV2(RebuildingReadStorageTaskTest* test,
-                                    std::weak_ptr<Context> context)
-        : RebuildingReadStorageTaskV2(context), test(test) {}
+    MockRebuildingReadStorageTask(RebuildingReadStorageTaskTest* test,
+                                  std::weak_ptr<Context> context)
+        : RebuildingReadStorageTask(context), test(test) {}
 
     RebuildingReadStorageTaskTest* test;
 
@@ -62,9 +64,6 @@ class RebuildingReadStorageTaskTest : public ::testing::Test {
         override {
       return test->store->readAllLogs(opts, logs);
     }
-    bool fetchTrimPoints(Context* context) override {
-      return true;
-    }
     void updateTrimPoint(logid_t log,
                          Context* context,
                          Context::LogState* log_state) override {}
@@ -77,43 +76,48 @@ class RebuildingReadStorageTaskTest : public ::testing::Test {
     // Create nodes and logs config. This part is super boilerplaty, just skip
     // the code and read comments.
 
-    configuration::Nodes nodes;
+    auto nodes = std::make_shared<const NodesConfiguration>();
     // Nodes 0..9.
-    NodeSetTestUtil::addNodes(&nodes, /* nodes */ 10, /* shards */ 2, "....");
+    NodeSetTestUtil::addNodes(nodes, /* nodes */ 10, /* shards */ 2, "....");
 
+    // Metadata logs, nodeset 5..9, replication factor 3.
+    nodes = nodes->applyUpdate(
+        NodesConfigurationTestUtil::setStorageMembershipUpdate(
+            *nodes,
+            {ShardID(5, -1),
+             ShardID(6, -1),
+             ShardID(7, -1),
+             ShardID(8, -1),
+             ShardID(9, -1)},
+            folly::none,
+            membership::MetaDataStorageState::METADATA));
+    nodes = nodes->applyUpdate(
+        NodesConfigurationTestUtil::setMetadataReplicationPropertyUpdate(
+            *nodes, ReplicationProperty{{NodeLocationScope::NODE, 3}}));
     auto logs_config = std::make_shared<configuration::LocalLogsConfig>();
-    logsconfig::LogAttributes log_attrs;
     // Logs 1..10, replication factor 3.
-    log_attrs.set_backlogDuration(std::chrono::seconds(3600 * 24 * 1));
-    log_attrs.set_replicationFactor(3);
+    auto log_attrs =
+        logsconfig::LogAttributes()
+            .with_backlogDuration(std::chrono::seconds(3600 * 24 * 1))
+            .with_replicationFactor(3);
     logs_config->insert(
         boost::icl::right_open_interval<logid_t::raw_type>(1, 10),
         "lg1",
         log_attrs);
     // Event log, replication factor 3.
-    log_attrs.set_backlogDuration(folly::none);
-    log_attrs.set_replicationFactor(3);
+    log_attrs =
+        log_attrs.with_backlogDuration(folly::none).with_replicationFactor(3);
     configuration::InternalLogs internal_logs;
     ld_check(internal_logs.insert("event_log_deltas", log_attrs));
     logs_config->setInternalLogsConfig(internal_logs);
     logs_config->markAsFullyLoaded();
-    // Metadata logs, nodeset 5..9, replication factor 3.
-    configuration::MetaDataLogsConfig meta_logs_config;
-    meta_logs_config.metadata_nodes = {5, 6, 7, 8, 9};
-    meta_logs_config.setMetadataLogGroup(
-        logsconfig::LogGroupNode("metadata logs",
-                                 log_attrs,
-                                 logid_range_t(LOGID_INVALID, LOGID_INVALID)));
 
     auto server_config = std::shared_ptr<ServerConfig>(
-        ServerConfig::fromDataTest("RebuildingReadStorageTaskTest",
-                                   configuration::NodesConfig(nodes),
-                                   meta_logs_config));
+        ServerConfig::fromDataTest("RebuildingReadStorageTaskTest"));
 
-    auto cfg = std::make_shared<Configuration>(server_config, logs_config);
+    auto cfg = std::make_shared<Configuration>(
+        server_config, logs_config, std::move(nodes));
     config = std::make_shared<UpdateableConfig>(cfg);
-    config->updateableNodesConfiguration()->update(
-        config->getNodesConfigurationFromServerConfigSource());
 
     // Create local log store (logsdb) and 6 partitions, 15 minutes apart.
     store = std::make_unique<TemporaryPartitionedStore>();
@@ -123,20 +127,24 @@ class RebuildingReadStorageTaskTest : public ::testing::Test {
       store->createPartition();
       partition_start.push_back(t);
     }
+
+    setRebuildingSettings(
+        {{"rebuilding-new-to-old", GetParam() ? "true" : "false"}});
   }
 
   void
   setRebuildingSettings(std::unordered_map<std::string, std::string> settings) {
+    settings["rebuilding-new-to-old"] = GetParam() ? "true" : "false";
     SettingsUpdater u;
     u.registerSettings(rebuildingSettings);
     u.setFromConfig(settings);
   }
 
   // The caller needs to assign `onDone` and `logs` afterwards.
-  std::shared_ptr<RebuildingReadStorageTaskV2::Context>
+  std::shared_ptr<RebuildingReadStorageTask::Context>
   createContext(std::shared_ptr<const RebuildingSet> rebuilding_set,
                 ShardID my_shard_id = ShardID(1, 0)) {
-    auto c = std::make_shared<RebuildingReadStorageTaskV2::Context>();
+    auto c = std::make_shared<RebuildingReadStorageTask::Context>();
     c->rebuildingSet = rebuilding_set;
     c->rebuildingSettings = rebuildingSettings;
     c->myShardID = my_shard_id;
@@ -185,18 +193,20 @@ convertChunks(const std::vector<std::unique_ptr<ChunkData>>& chunks) {
     for (size_t i = 0; i < c->numRecords(); ++i) {
       EXPECT_EQ(c->address.min_lsn + i, c->getLSN(i));
       Payload payload;
-      int rv = LocalLogStoreRecordFormat::parse(c->getRecordBlob(i),
-                                                nullptr,
-                                                nullptr,
-                                                nullptr,
-                                                nullptr,
-                                                nullptr,
-                                                nullptr,
-                                                0,
-                                                nullptr,
-                                                nullptr,
-                                                &payload,
-                                                shard_index_t(0));
+      folly::IOBuf blob = c->getRecordBlob(i);
+      int rv =
+          LocalLogStoreRecordFormat::parse(Slice(blob.data(), blob.length()),
+                                           nullptr,
+                                           nullptr,
+                                           nullptr,
+                                           nullptr,
+                                           nullptr,
+                                           nullptr,
+                                           0,
+                                           nullptr,
+                                           nullptr,
+                                           &payload,
+                                           shard_index_t(0));
       EXPECT_EQ(0, rv);
       std::string expected_payload;
       if (big) {
@@ -227,7 +237,7 @@ std::ostream& operator<<(std::ostream& out, const ChunkDescription& c) {
   return out;
 }
 
-TEST_F(RebuildingReadStorageTaskTest, Basic) {
+TEST_P(RebuildingReadStorageTaskTest, Basic) {
   logid_t L1(1), L2(2), L3(3), L4(4);
   logid_t M1 = MetaDataLog::metaDataLogID(L1);
   logid_t I1 = configuration::InternalLogs::EVENT_LOG_DELTAS;
@@ -279,6 +289,7 @@ TEST_F(RebuildingReadStorageTaskTest, Basic) {
   store->putRecord(M1, mklsn(2, 2), BASE_TIME - MINUTE, {N2, N1, N0}); // +
   store->putRecord(M1, mklsn(3, 1), BASE_TIME - MINUTE, {N1, N3, N4}); // -
   store->putRecord(M1, mklsn(3, 2), BASE_TIME - MINUTE, {N1, N2, N3}); // +
+
   // Data logs in partition 0.
   store->putRecord(L1, mklsn(1, 10), P[0] + MINUTE, {N2, N1, N3});     // -
   store->putRecord(L1, mklsn(2, 10), P[0] + MINUTE, {N2, N1, N3});     // -
@@ -318,73 +329,144 @@ TEST_F(RebuildingReadStorageTaskTest, Basic) {
   // Sanity check that the records didn't end up in totally wrong partitions.
   EXPECT_EQ(std::vector<size_t>({4, 1, 0, 4}), store->getNumLogsPerPartition());
 
-  {
-    // Read up to the big record that exceeds the byte limit.
-    MockRebuildingReadStorageTaskV2 task(this, c);
-    task.execute();
-    task.onDone();
-    EXPECT_FALSE(c->reachedEnd);
-    EXPECT_FALSE(c->persistentError);
-    EXPECT_EQ(std::vector<ChunkDescription>({{I1, mklsn(1, 10)},
-                                             {M1, mklsn(2, 1), 2},
-                                             {M1, mklsn(3, 2)},
-                                             {L1, mklsn(3, 11), 2}}),
+  if (GetParam()) { // new-to-old
+    // Metadata and partition 3.
+    // Read up to the long range of filtered out records.
+    {
+      MockRebuildingReadStorageTask task(this, c);
+      task.execute();
+      task.onDone();
+      EXPECT_FALSE(c->reachedEnd);
+      EXPECT_FALSE(c->persistentError);
+      EXPECT_EQ(std::vector<ChunkDescription>({{I1, mklsn(1, 10)},
+                                               {M1, mklsn(2, 1), 2},
+                                               {M1, mklsn(3, 2)},
+                                               {L1, mklsn(4, 2)},
+                                               {L1, mklsn(8, 50)},
+                                               {L2, mklsn(10, 40)},
+                                               {L4, mklsn(1, 3)}}),
+                convertChunks(chunks));
+    }
+
+    // Partition 3, 2, 1, 0.
+    // Read through a long sequence of CSI that doesn't pass filter.
+    // The next nonempty batch will stop at the big record in partition 0.
+    int empty_batches = 0;
+    while (true) {
+      MockRebuildingReadStorageTask task(this, c);
+      task.execute();
+      task.onDone();
+      EXPECT_FALSE(c->persistentError);
+      if (!chunks.empty()) {
+        break;
+      }
+      EXPECT_EQ(false, c->reachedEnd);
+      ++empty_batches;
+      // Invalidate iterator after first batch.
+      if (empty_batches == 1) {
+        c->iterator->invalidate();
+      }
+    }
+    EXPECT_GE(empty_batches, 2);
+    EXPECT_EQ(std::vector<ChunkDescription>(
+                  {{L4, mklsn(1, 100000)}, {L1, mklsn(3, 11), 2}}),
               convertChunks(chunks));
-  }
-  size_t block_id;
-  {
+
+    // Partition 0.
     // Read up to the next big record. Note that the first big record doesn't
     // count towards the limit for this batch because it was counted by the
     // previous batch.
-    MockRebuildingReadStorageTaskV2 task(this, c);
-    task.execute();
-    task.onDone();
-    EXPECT_FALSE(c->reachedEnd);
-    EXPECT_FALSE(c->persistentError);
-    EXPECT_EQ(
-        std::vector<ChunkDescription>({{L1, mklsn(4, 1), 1, /* big */ true}}),
-        convertChunks(chunks));
-    block_id = chunks.at(0)->blockID;
-  }
-  {
-    MockRebuildingReadStorageTaskV2 task(this, c);
-    task.execute();
-    task.onDone();
-    EXPECT_FALSE(c->reachedEnd);
-    EXPECT_FALSE(c->persistentError);
-    EXPECT_EQ(
-        std::vector<ChunkDescription>({{L4, mklsn(1, 1), 1, /* big */ true},
-                                       {L1, mklsn(4, 2)},
-                                       {L1, mklsn(8, 50)},
-                                       {L2, mklsn(10, 40)},
-                                       {L4, mklsn(1, 3)}}),
-        convertChunks(chunks));
-    // Check that chunk e4n2 from this batch has the same block ID as chunk
-    // e4n1 from previous batch.
-    EXPECT_EQ(block_id, chunks.at(1)->blockID);
-    // Check that next chunk for same log has next block ID.
-    EXPECT_EQ(block_id + 1, chunks.at(2)->blockID);
-  }
-  // Read through a long sequence of CSI that doesn't pass filter.
-  int empty_batches = 0;
-  while (true) {
-    MockRebuildingReadStorageTaskV2 task(this, c);
-    task.execute();
-    task.onDone();
-    EXPECT_FALSE(c->persistentError);
-    if (c->reachedEnd) {
-      break;
+    {
+      MockRebuildingReadStorageTask task(this, c);
+      task.execute();
+      task.onDone();
+      EXPECT_FALSE(c->reachedEnd);
+      EXPECT_FALSE(c->persistentError);
+      EXPECT_EQ(
+          std::vector<ChunkDescription>({{L1, mklsn(4, 1), 1, /* big */ true}}),
+          convertChunks(chunks));
     }
-    EXPECT_EQ(0, chunks.size());
-    ++empty_batches;
-    // Invalidate iterator after first batch.
-    if (empty_batches == 1) {
-      c->iterator->invalidate();
+
+    // Partition 0. Read the second big record, and we're done.
+    {
+      MockRebuildingReadStorageTask task(this, c);
+      task.execute();
+      task.onDone();
+      EXPECT_TRUE(c->reachedEnd);
+      EXPECT_FALSE(c->persistentError);
+      EXPECT_EQ(
+          std::vector<ChunkDescription>({{L4, mklsn(1, 1), 1, /* big */ true}}),
+          convertChunks(chunks));
     }
+  } else {
+    {
+      // Read up to the big record that exceeds the byte limit.
+      MockRebuildingReadStorageTask task(this, c);
+      task.execute();
+      task.onDone();
+      EXPECT_FALSE(c->reachedEnd);
+      EXPECT_FALSE(c->persistentError);
+      EXPECT_EQ(std::vector<ChunkDescription>({{I1, mklsn(1, 10)},
+                                               {M1, mklsn(2, 1), 2},
+                                               {M1, mklsn(3, 2)},
+                                               {L1, mklsn(3, 11), 2}}),
+                convertChunks(chunks));
+    }
+    size_t block_id;
+    {
+      // Read up to the next big record. Note that the first big record doesn't
+      // count towards the limit for this batch because it was counted by the
+      // previous batch.
+      MockRebuildingReadStorageTask task(this, c);
+      task.execute();
+      task.onDone();
+      EXPECT_FALSE(c->reachedEnd);
+      EXPECT_FALSE(c->persistentError);
+      EXPECT_EQ(
+          std::vector<ChunkDescription>({{L1, mklsn(4, 1), 1, /* big */ true}}),
+          convertChunks(chunks));
+      block_id = chunks.at(0)->blockID;
+    }
+    {
+      MockRebuildingReadStorageTask task(this, c);
+      task.execute();
+      task.onDone();
+      EXPECT_FALSE(c->reachedEnd);
+      EXPECT_FALSE(c->persistentError);
+      EXPECT_EQ(
+          std::vector<ChunkDescription>({{L4, mklsn(1, 1), 1, /* big */ true},
+                                         {L1, mklsn(4, 2)},
+                                         {L1, mklsn(8, 50)},
+                                         {L2, mklsn(10, 40)},
+                                         {L4, mklsn(1, 3)}}),
+          convertChunks(chunks));
+      // Check that chunk e4n2 from this batch has the same block ID as chunk
+      // e4n1 from previous batch.
+      EXPECT_EQ(block_id, chunks.at(1)->blockID);
+      // Check that next chunk for same log has next block ID.
+      EXPECT_EQ(block_id + 1, chunks.at(2)->blockID);
+    }
+    // Read through a long sequence of CSI that doesn't pass filter.
+    int empty_batches = 0;
+    while (true) {
+      MockRebuildingReadStorageTask task(this, c);
+      task.execute();
+      task.onDone();
+      EXPECT_FALSE(c->persistentError);
+      if (c->reachedEnd) {
+        break;
+      }
+      EXPECT_EQ(0, chunks.size());
+      ++empty_batches;
+      // Invalidate iterator after first batch.
+      if (empty_batches == 1) {
+        c->iterator->invalidate();
+      }
+    }
+    EXPECT_GE(empty_batches, 2);
+    EXPECT_EQ(std::vector<ChunkDescription>({{L4, mklsn(1, 100000)}}),
+              convertChunks(chunks));
   }
-  EXPECT_GE(empty_batches, 2);
-  EXPECT_EQ(std::vector<ChunkDescription>({{L4, mklsn(1, 100000)}}),
-            convertChunks(chunks));
 
   // Run a task after Context is destroyed. Check that callback is not called.
   {
@@ -392,7 +474,7 @@ TEST_F(RebuildingReadStorageTaskTest, Basic) {
     chunks.push_back(std::make_unique<ChunkData>());
     chunks.back()->address.min_lsn = 42;
 
-    MockRebuildingReadStorageTaskV2 task(this, c);
+    MockRebuildingReadStorageTask task(this, c);
     c.reset();
     task.execute();
     task.onDone();
@@ -401,7 +483,7 @@ TEST_F(RebuildingReadStorageTaskTest, Basic) {
   }
 }
 
-TEST_F(RebuildingReadStorageTaskTest, TimeRanges) {
+TEST_P(RebuildingReadStorageTaskTest, TimeRanges) {
   // N1 is us.
   // N2 needs to be rebuilt for partitions 0-2.
   // N3 needs to be rebuilt for partitions 1 and 4.
@@ -503,19 +585,37 @@ TEST_F(RebuildingReadStorageTaskTest, TimeRanges) {
       std::vector<size_t>({2, 1, 1, 2, 1, 2}), store->getNumLogsPerPartition());
 
   {
-    MockRebuildingReadStorageTaskV2 task(this, c);
+    MockRebuildingReadStorageTask task(this, c);
     task.execute();
     task.onDone();
     EXPECT_TRUE(c->reachedEnd);
     EXPECT_FALSE(c->persistentError);
-    EXPECT_EQ(std::vector<ChunkDescription>({{L1, mklsn(3, 2)},
-                                             {L1, mklsn(3, 5), 2},
-                                             {L1, mklsn(3, 7)},
-                                             {L1, mklsn(3, 9)},
-                                             {L1, mklsn(3, 10)},
-                                             {L1, mklsn(4, 1)},
-                                             {L1, mklsn(4, 5)},
-                                             {L2, mklsn(2, 3)}}),
-              convertChunks(chunks));
+    if (GetParam()) { // new-to-old
+      EXPECT_EQ(std::vector<ChunkDescription>({
+                    {L2, mklsn(2, 3)},   // p5
+                    {L1, mklsn(4, 5)},   // p4
+                    {L1, mklsn(3, 7)},   // p1
+                    {L1, mklsn(3, 9)},   // p1
+                    {L1, mklsn(3, 10)},  // p1
+                    {L1, mklsn(4, 1)},   // p1
+                    {L1, mklsn(3, 2)},   // p0
+                    {L1, mklsn(3, 5), 2} // p0
+                }),
+                convertChunks(chunks));
+    } else {
+      EXPECT_EQ(std::vector<ChunkDescription>({{L1, mklsn(3, 2)},
+                                               {L1, mklsn(3, 5), 2},
+                                               {L1, mklsn(3, 7)},
+                                               {L1, mklsn(3, 9)},
+                                               {L1, mklsn(3, 10)},
+                                               {L1, mklsn(4, 1)},
+                                               {L1, mklsn(4, 5)},
+                                               {L2, mklsn(2, 3)}}),
+                convertChunks(chunks));
+    }
   }
 }
+
+INSTANTIATE_TEST_CASE_P(P,
+                        RebuildingReadStorageTaskTest,
+                        ::testing::Values(false, true));

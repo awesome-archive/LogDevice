@@ -31,12 +31,11 @@ static Configuration::Nodes createFailureDomainNodes() {
 
     // store data on all nodes
     node.addStorageRole(/*num_shards*/ 2);
-    ld_check(nodes[i].isWritableStorageNode());
 
     // node 0 running sequencer
     if (i == 0) {
       node.addSequencerRole();
-      ld_check_eq(node.sequencer_attributes->getEffectiveWeight(), 1);
+      ld_check_eq(node.sequencer_attributes->weight, 1);
     }
 
     std::string domain_string;
@@ -61,24 +60,30 @@ TEST_F(FailureDomainIntegrationTest, TolerateRegionFailure) {
   // cluster is still able to perform writing and reading.
   const logid_t logid(2);
   Configuration::Nodes nodes = createFailureDomainNodes();
-
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(2);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(2048);
-  // cross-region replication
-  log_attrs.set_syncReplicationScope(NodeLocationScope::REGION);
+  // Set metadata nodeset
+  nodes[0].metadata_node = true;
+  nodes[1].metadata_node = true;
+  nodes[3].metadata_node = true;
 
   // metadata logs are replicated cross-region as well
-  // this nodeset, with replication = 2, enforces cross-region replication
-  Configuration::MetaDataLogsConfig meta_config = createMetaDataLogsConfig(
-      /*nodeset=*/{0, 1, 3}, /*replication=*/2, NodeLocationScope::REGION);
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes), ReplicationProperty{{NodeLocationScope::REGION, 2}});
+
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(2)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(2048)
+                       // cross-region replication
+                       .with_syncReplicationScope(NodeLocationScope::REGION);
+
+  Configuration::MetaDataLogsConfig meta_config =
+      ServerConfig::MetaDataLogsConfig();
   meta_config.nodeset_selector_type = NodeSetSelectorType::SELECT_ALL;
 
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
-          .setNodes(nodes)
+          .setNodes(nodes_configuration)
           .setLogGroupName("mylog")
           .setLogAttributes(log_attrs)
           .setMetaDataLogsConfig(meta_config)
@@ -86,9 +91,9 @@ TEST_F(FailureDomainIntegrationTest, TolerateRegionFailure) {
               IntegrationTestUtils::ClusterFactory::EventLogMode::NONE)
           .setConfigLogAttributes(log_attrs)
           .setMaintenanceLogAttributes(log_attrs)
-          .create(nodes.size());
+          .create(nodes_configuration->clusterSize());
 
-  cluster->waitForMetaDataLogWrites();
+  cluster->waitUntilAllSequencersQuiescent();
 
   std::map<lsn_t, std::string> lsn_map;
   lsn_t first_lsn = LSN_INVALID;
@@ -132,7 +137,7 @@ TEST_F(FailureDomainIntegrationTest, TolerateRegionFailure) {
   write_records();
 
   // recovery should finish despite one region (3 nodes) is down
-  cluster->waitForRecovery();
+  cluster->waitUntilAllSequencersQuiescent();
 
   std::vector<std::unique_ptr<DataRecord>> records;
   GapRecord gap;
@@ -176,25 +181,32 @@ TEST_F(FailureDomainIntegrationTest, TolerateRegionFailure) {
 TEST_F(FailureDomainIntegrationTest, ReadHealthWithFailureDomain) {
   const logid_t LOG_ID(1);
   Configuration::Nodes nodes = createFailureDomainNodes();
+  // Set metadata nodeset
+  nodes[0].metadata_node = true;
+  nodes[1].metadata_node = true;
+  nodes[3].metadata_node = true;
 
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(2);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(256);
-  // cross-region replication
-  log_attrs.set_syncReplicationScope(NodeLocationScope::REGION);
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes), ReplicationProperty{{NodeLocationScope::REGION, 2}});
+
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(2)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(256)
+                       // cross-region replication
+                       .with_syncReplicationScope(NodeLocationScope::REGION);
 
   Configuration::MetaDataLogsConfig meta_config =
-      createMetaDataLogsConfig({0, 1, 3}, 2, NodeLocationScope::REGION);
+      ServerConfig::MetaDataLogsConfig();
   meta_config.nodeset_selector_type = NodeSetSelectorType::SELECT_ALL;
 
   auto cluster = IntegrationTestUtils::ClusterFactory()
-                     .setNodes(nodes)
+                     .setNodes(nodes_configuration)
                      .setLogGroupName("mylog")
                      .setLogAttributes(log_attrs)
                      .setMetaDataLogsConfig(meta_config)
-                     .create(nodes.size());
+                     .create(nodes_configuration->clusterSize());
 
   std::shared_ptr<Client> client = cluster->createClient();
   std::shared_ptr<const Configuration> config = cluster->getConfig()->get();
@@ -217,7 +229,9 @@ TEST_F(FailureDomainIntegrationTest, ReadHealthWithFailureDomain) {
   ld_info("Killing the third region (node 3, 4, 5), should not affect "
           "connection health");
   for (int i = 3; i <= 5; ++i) {
-    ld_check(config->serverConfig()->getNode(i)->isReadableStorageNode());
+    ld_check(config->getNodesConfiguration()
+                 ->getStorageMembership()
+                 ->hasShardShouldReadFrom(i));
     cluster->getNode(i).kill();
   }
 
@@ -235,7 +249,9 @@ TEST_F(FailureDomainIntegrationTest, ReadHealthWithFailureDomain) {
   cluster->getNode(4).start();
   cluster->getNode(3).waitUntilStarted();
   cluster->getNode(4).waitUntilStarted();
-  ld_check(config->serverConfig()->getNode(0)->isReadableStorageNode());
+  ld_check(config->getNodesConfiguration()
+               ->getStorageMembership()
+               ->hasShardShouldReadFrom(0));
   cluster->getNode(0).kill();
 
   /* sleep override */
@@ -256,33 +272,38 @@ TEST_F(FailureDomainIntegrationTest,
     auto& node = it.second;
     node.addSequencerRole();
   }
-
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(2);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(2048);
-  // cross-region replication
-  log_attrs.set_syncReplicationScope(NodeLocationScope::REGION);
-  log_attrs.set_nodeSetSize(3); // 3 regions
+  // Set metadata nodeset
+  nodes[0].metadata_node = true;
+  nodes[1].metadata_node = true;
+  nodes[3].metadata_node = true;
 
   // metadata logs are replicated cross-region as well
   // this nodeset, with replication = 2, enforces cross-region replication
-  Configuration::MetaDataLogsConfig meta_config = createMetaDataLogsConfig(
-      /*nodeset=*/{0, 1, 3}, 2, NodeLocationScope::REGION);
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes), ReplicationProperty{{NodeLocationScope::REGION, 2}});
+
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(2)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(2048)
+                       // cross-region replication
+                       .with_syncReplicationScope(NodeLocationScope::REGION)
+                       .with_nodeSetSize(3); // 3 regions
 
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
-          .setNodes(nodes)
+          .setNodes(nodes_configuration)
           .setLogGroupName("mylog")
           .setLogAttributes(log_attrs)
-          .setMetaDataLogsConfig(meta_config)
           // TODO(#8466255): remove.
           .eventLogMode(
               IntegrationTestUtils::ClusterFactory::EventLogMode::NONE)
           .useHashBasedSequencerAssignment(100, "10s")
           .enableMessageErrorInjection()
-          .create(nodes.size());
+          .create(nodes_configuration->clusterSize());
+
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
 
   std::map<lsn_t, std::string> lsn_map;
   lsn_t first_lsn = LSN_INVALID;
@@ -335,7 +356,7 @@ TEST_F(FailureDomainIntegrationTest,
   write_records(true);
 
   // recovery should finish despite one region (3 nodes) is down
-  cluster->waitForRecovery();
+  cluster->waitUntilAllSequencersQuiescent();
 
   std::vector<std::unique_ptr<DataRecord>> records;
   GapRecord gap;
@@ -377,34 +398,36 @@ TEST_F(FailureDomainIntegrationTest,
 // read availability and no write availability.
 TEST_F(FailureDomainIntegrationTest, ThreeRackReplication) {
   // 4 racks, with different number of nodes.
-  Configuration::Nodes nodes_cfg;
+  auto nodes = std::make_shared<const NodesConfiguration>();
   std::vector<node_index_t> rack_start = {0};
-  NodeSetTestUtil::addNodes(&nodes_cfg, 4, 1, "region.dc.cl.ro.rk1"); // 0,1,2,3
-  rack_start.push_back(nodes_cfg.size());
-  NodeSetTestUtil::addNodes(&nodes_cfg, 3, 1, "region.dc.cl.ro.rk2"); // 4, 5, 6
-  rack_start.push_back(nodes_cfg.size());
-  NodeSetTestUtil::addNodes(&nodes_cfg, 2, 1, "region.dc.cl.ro.rk3"); // 7, 8
-  rack_start.push_back(nodes_cfg.size());
-  NodeSetTestUtil::addNodes(&nodes_cfg, 2, 1, "region.dc.cl.ro.rk4"); // 9, 10
-  rack_start.push_back(nodes_cfg.size());
+  NodeSetTestUtil::addNodes(nodes, 4, 1, "region.dc.cl.ro.rk1"); // 0,1,2,3
+  rack_start.push_back(nodes->clusterSize());
+  NodeSetTestUtil::addNodes(nodes, 3, 1, "region.dc.cl.ro.rk2"); // 4, 5, 6
+  rack_start.push_back(nodes->clusterSize());
+  NodeSetTestUtil::addNodes(nodes, 2, 1, "region.dc.cl.ro.rk3"); // 7, 8
+  rack_start.push_back(nodes->clusterSize());
+  NodeSetTestUtil::addNodes(nodes, 2, 1, "region.dc.cl.ro.rk4"); // 9, 10
+  rack_start.push_back(nodes->clusterSize());
+
+  // Metadata nodeset is whole cluster.
+  nodes =
+      nodes->applyUpdate(NodesConfigurationTestUtil::setStorageMembershipUpdate(
+          *nodes,
+          nodes->getStorageMembership()->getAllShards(),
+          folly::none,
+          membership::MetaDataStorageState::METADATA));
+
+  // Replicate metadata logs to all 4 racks.
+  nodes = nodes->applyUpdate(
+      NodesConfigurationTestUtil::setMetadataReplicationPropertyUpdate(
+          *nodes, ReplicationProperty{{NodeLocationScope::RACK, 4}}));
 
   configuration::MetaDataLogsConfig meta_logs_config;
-  // Metadata nodeset is whole cluster.
-  meta_logs_config.metadata_nodes.resize(rack_start.back());
-  std::iota(meta_logs_config.metadata_nodes.begin(),
-            meta_logs_config.metadata_nodes.end(),
-            0);
-  meta_logs_config.setMetadataLogGroup(logsconfig::LogGroupNode(
-      "metadata logs",
-      logsconfig::LogAttributes()
-          // Replicate internal logs to all 4 racks.
-          .with_replicateAcross({{NodeLocationScope::RACK, 4}}),
-      logid_range_t()));
   meta_logs_config.sequencers_write_metadata_logs = true;
   meta_logs_config.sequencers_provision_epoch_store = true;
 
   auto cluster = IntegrationTestUtils::ClusterFactory()
-                     .setNodes(nodes_cfg)
+                     .setNodes(std::move(nodes))
                      .setLogGroupName("test_logs")
                      .setLogAttributes(logsconfig::LogAttributes()
                                            .with_replicateAcross(
@@ -420,35 +443,39 @@ TEST_F(FailureDomainIntegrationTest, ThreeRackReplication) {
                      .setParam("--rocksdb-use-copyset-index", "false")
                      .create(0);
 
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
+
   const std::chrono::seconds client_timeout(3);
   auto client = cluster->createClient(client_timeout);
   const logid_t logid(2);
+  std::vector<lsn_t> lsns;
 
   // Write some records.
   auto write_records = [&](int n, bool expect_success) {
-    std::vector<lsn_t> lsns;
     for (int i = 0; i < n; ++i) {
       lsn_t lsn;
       auto append_start_time = std::chrono::steady_clock::now();
       do {
-        lsn = client->appendSync(logid, std::to_string(i));
+        lsn = client->appendSync(logid, std::to_string(lsns.size()));
 
         if (!expect_success) {
           EXPECT_EQ(LSN_INVALID, lsn);
-          return lsns;
+          return;
         }
 
         if (lsn == LSN_INVALID) {
           // It's possible for append to fail if there's an appender that
           // started while a rack was down and hasn't yet noticed that the
           // rack is up again. Keep trying.
-          EXPECT_TRUE(err == E::SEQNOBUFS || err == E::ISOLATED) << (int)err;
+          EXPECT_TRUE(err == E::SEQNOBUFS || err == E::ISOLATED ||
+                      err == E::TIMEDOUT)
+              << error_name(err);
 
           if (std::chrono::steady_clock::now() - append_start_time >
               std::chrono::seconds(10)) {
             // This is not supposed to take so long.
-            ADD_FAILURE() << "Can't append";
-            return lsns;
+            ADD_FAILURE() << "Can't append " << error_name(err);
+            return;
           }
 
           /* sleep override */
@@ -458,17 +485,30 @@ TEST_F(FailureDomainIntegrationTest, ThreeRackReplication) {
 
       lsns.push_back(lsn);
     }
-    return lsns;
   };
+
   ld_info("Writing with all nodes up.");
-  auto lsns1 = write_records(50, true);
-  EXPECT_EQ(50, lsns1.size()) << errorStrings()[err].name;
+  write_records(10, true);
+
+  // Make sure some records have copyset entirely in 2 racks + 1 node which
+  // we're going to stop later in the test.
+  ld_info("Writing with a forced copyset.");
+  cluster->updateSetting("test-do-not-pick-in-copysets", "0,1,2,3,10");
+  write_records(5, true);
+
+  ld_info("Writing some more.");
+  cluster->unsetSetting("test-do-not-pick-in-copysets");
+  write_records(5, true);
+
+  EXPECT_EQ(20, lsns.size());
 
   // Read them back.
   auto read_records = [&](const std::vector<lsn_t>& lsns,
-                          int restarted_at = -1) {
+                          int restarted_at = -1,
+                          std::chrono::milliseconds timeout =
+                              std::chrono::seconds(20)) {
     auto reader = client->createReader(1);
-    reader->setTimeout(std::chrono::seconds(5));
+    reader->setTimeout(timeout);
     reader->startReading(logid, LSN_OLDEST, lsns.back());
     size_t nread = 0;
     size_t expected_payload = 0;
@@ -479,15 +519,6 @@ TEST_F(FailureDomainIntegrationTest, ThreeRackReplication) {
       if (n == -1) {
         EXPECT_EQ(GapType::BRIDGE, gap.type);
       } else if (n == 0) {
-        bool first = true;
-        wait_until([&first, &logid, &reader]() {
-          bool res = reader->isConnectionHealthy(logid);
-          if (!res && !first) {
-            ld_error("Got 0 records but connection still considered healthy!");
-          }
-          first = false;
-          return res;
-        });
         return false;
       } else {
         if (nread >= lsns.size()) {
@@ -498,8 +529,6 @@ TEST_F(FailureDomainIntegrationTest, ThreeRackReplication) {
           // times out, the Appender keeps trying forever. After we bring some
           // nodes back, the Appender succeeds, producing an unexpected record.
           // This branch skips such records.
-          // Also resets the expected_payload counter.
-          expected_payload = 0;
         } else {
           EXPECT_EQ(lsns[nread], recs[0]->attrs.lsn);
           EXPECT_EQ(
@@ -522,7 +551,7 @@ TEST_F(FailureDomainIntegrationTest, ThreeRackReplication) {
     return true;
   };
   ld_info("Reading with all nodes up.");
-  EXPECT_TRUE(read_records(lsns1));
+  EXPECT_TRUE(read_records(lsns));
 
   // Stop 2/4 racks.
   ld_info("Shutting down racks 2 and 3.");
@@ -534,11 +563,12 @@ TEST_F(FailureDomainIntegrationTest, ThreeRackReplication) {
 
   // Read the records again.
   ld_info("Reading without 2/4 racks.");
-  EXPECT_TRUE(read_records(lsns1));
+  EXPECT_TRUE(read_records(lsns));
+  int records_before_failed_writes = static_cast<int>(lsns.size());
 
   // Try writing something. It should fail.
   ld_info("Writing without 2/4 racks (should fail).");
-  EXPECT_EQ(std::vector<lsn_t>(), write_records(50, false));
+  write_records(50, false);
 
   // Stop one more node. Note that the rack has 2 nodes and both are in nodeset.
   ld_info("Killing another node.");
@@ -546,8 +576,7 @@ TEST_F(FailureDomainIntegrationTest, ThreeRackReplication) {
 
   // Reads should fail now.
   ld_info("Reading without 2/4 racks and one node (should fail).");
-  // TODO(T31455346) Make this an actual check which will not be flaky
-  read_records(lsns1);
+  EXPECT_FALSE(read_records(lsns, -1, std::chrono::seconds(10)));
 
   // Bring one rack back.
   ld_info("Starting rack 2.");
@@ -556,12 +585,12 @@ TEST_F(FailureDomainIntegrationTest, ThreeRackReplication) {
     std::iota(nodes.begin(), nodes.end(), rack_start[1]);
     EXPECT_EQ(0, cluster->start(nodes));
   }
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
 
   // Writes and reads should work now.
   ld_info("Writing without a rack and a node.");
-  auto lsns2 = write_records(50, true);
-  EXPECT_EQ(50, lsns2.size()) << errorStrings()[err].name;
+  write_records(20, true);
+  EXPECT_EQ(40, lsns.size());
   ld_info("Reading without a rack and a node.");
-  lsns2.insert(lsns2.begin(), lsns1.begin(), lsns1.end());
-  EXPECT_TRUE(read_records(lsns2, (int)lsns1.size()));
+  EXPECT_TRUE(read_records(lsns, records_before_failed_writes));
 }

@@ -16,7 +16,6 @@
 #include <boost/intrusive/unordered_set.hpp>
 #include <folly/Optional.h>
 #include <folly/small_vector.h>
-#include <opentracing/tracer.h>
 
 #include "logdevice/common/AppenderTracer.h"
 #include "logdevice/common/CopySetManager.h"
@@ -127,9 +126,7 @@ class Appender : public IntrusiveUnorderedMapHook {
            ClientID return_address,
            epoch_t seen_epoch,
            size_t full_appender_size,
-           lsn_t lsn_before_redirect,
-           std::shared_ptr<opentracing::Tracer> e2e_tracer = nullptr,
-           std::shared_ptr<opentracing::Span> appender_span = nullptr);
+           lsn_t lsn_before_redirect);
 
   virtual ~Appender();
 
@@ -260,8 +257,9 @@ class Appender : public IntrusiveUnorderedMapHook {
    * Send a single STORE message to the specified destination. Log and triage
    * errors.
    *
-   * Pre-condition: Sender::checkConnection() was called on this worker thread
-   * in this event loop iteration, and returned AVAILABLE or AVAILABLE_NOCHAIN.
+   * Pre-condition: Sender::checkServerConnection() was called on this worker
+   * thread in this event loop iteration, and returned AVAILABLE or
+   * AVAILABLE_NOCHAIN.
    *
    * @param  copyset  copyset to put in message header. Its size is in
    *                  store_hdr_.copyset_size. If the message is
@@ -289,8 +287,7 @@ class Appender : public IntrusiveUnorderedMapHook {
   int sendSTORE(const StoreChainLink copyset[],
                 copyset_off_t copyset_offset,
                 folly::Optional<lsn_t> block_starting_lsn,
-                STORE_flags_t flags,
-                std::shared_ptr<opentracing::Span> store_span = nullptr);
+                STORE_flags_t flags);
 
   /**
    * Called by a Recipient whose initial attempt to send a STORE message was
@@ -405,7 +402,7 @@ class Appender : public IntrusiveUnorderedMapHook {
               ShardID rebuildingRecipient = ShardID());
 
   const PayloadHolder* getPayload() const {
-    return payload_.get();
+    return &payload_;
   }
 
   const AppendAttributes& getAppendAttributes() {
@@ -450,7 +447,9 @@ class Appender : public IntrusiveUnorderedMapHook {
     return reply_to_;
   }
 
-  std::unique_ptr<SocketProxy> getClientSocketProxy() const;
+  // Return socket closed status for clients to cache. If true the socket is
+  // active.
+  std::shared_ptr<const std::atomic<bool>> getClientConnectionToken() const;
 
   request_id_t getClientRequestID() const {
     return append_request_id_;
@@ -481,7 +480,7 @@ class Appender : public IntrusiveUnorderedMapHook {
   }
 
   void setAcceptableEpoch(folly::Optional<epoch_t> epoch) {
-    if (epoch.hasValue() && !MetaDataLog::isMetaDataLog(log_id_)) {
+    if (epoch.has_value() && !MetaDataLog::isMetaDataLog(log_id_)) {
       // conditional appends are only supported for metadata log records
       ld_critical(
           "attempting to set acceptable epoch for data log %lu", log_id_.val());
@@ -598,11 +597,7 @@ class Appender : public IntrusiveUnorderedMapHook {
    * Used only in tests. See Settings::test_sequencer_corrupt_stores
    */
   void TEST_corruptPayload() {
-    payload_->TEST_corruptPayload();
-  }
-
-  void setPrevTracingSpan(std::shared_ptr<opentracing::Span> previous_span) {
-    previous_span_ = std::move(previous_span);
+    payload_.TEST_corruptPayload();
   }
 
   /** Helper functions for appends that belong to a write stream. */
@@ -659,15 +654,7 @@ class Appender : public IntrusiveUnorderedMapHook {
            logid_t log_id,
            PayloadHolder payload,
            epoch_t seen_epoch,
-           size_t full_appender_size,
-           std::shared_ptr<opentracing::Tracer> e2e_tracer = nullptr,
-           std::shared_ptr<opentracing::Span> appender_span = nullptr);
-
-  // I want to keep track of all stores sent, identifying a store message sent
-  // by pair (wave, dest)
-  std::unordered_map<std::pair<uint32_t, ShardID>,
-                     std::shared_ptr<opentracing::Span>>
-      all_store_spans_;
+           size_t full_appender_size);
 
   // EpochSequencer that accepted and assigned LSN for this Appender. A shared
   // reference is held here to ensure that EpochSequencer is destroyed only
@@ -706,14 +693,10 @@ class Appender : public IntrusiveUnorderedMapHook {
 
   // Initialize/activate/cancel timers used by this Appender.
   virtual void initStoreTimer();
-  virtual void initRetryTimer();
   virtual void cancelStoreTimer();
   virtual void activateStoreTimer(std::chrono::milliseconds delay);
   virtual void fireStoreTimer();
   virtual bool storeTimerIsActive();
-  virtual void cancelRetryTimer();
-  virtual void activateRetryTimer();
-  virtual bool retryTimerIsActive();
   virtual bool isNodeAlive(NodeID node);
 
  private:
@@ -783,7 +766,7 @@ class Appender : public IntrusiveUnorderedMapHook {
   // so that we can expect to get replies from them.
   copyset_size_t replies_expected_;
 
-  // the following members keep track of the status of STOREs accross waves:
+  // the following members keep track of the status of STOREs across waves:
   // number of successful STORE messages
   bool stored_{false};
   // the number of failed STORE messages with E::PREEMPTED
@@ -822,7 +805,7 @@ class Appender : public IntrusiveUnorderedMapHook {
   AppendAttributes attrs_;
 
   // payload of record we are appending.
-  std::shared_ptr<PayloadHolder> payload_;
+  PayloadHolder payload_;
 
   // tail record for this append, will pass to sequencer when this appender
   // is reaped
@@ -865,7 +848,7 @@ class Appender : public IntrusiveUnorderedMapHook {
   // with non-zero STORE timeout, used for diagnosing append failures
   bool store_timeout_set_{false};
 
-  // Set to NONE or PER_EPOCH if at some point it is decided that this Appender
+  // Set to NONE if at some point it is decided that this Appender
   // should not send a global RELEASE message. This can happen if the Appender
   // is aborted because we called retire() before the record was fully
   // replicated, or if noteAppenderReaped returns false, meaning the Sequencer
@@ -900,18 +883,6 @@ class Appender : public IntrusiveUnorderedMapHook {
   static const uint8_t FINISH = 1u << 0u;
   static const uint8_t REAPED = 1u << 1u;
   static const uint8_t REPLIED = 1u << 2u;
-
-  // OpenTracing tracer object used in distributed e2e tracing
-  std::shared_ptr<opentracing::Tracer> e2e_tracer_;
-  std::shared_ptr<opentracing::Span> appender_span_;
-
-  // e2e tracing span that is received from the AppenderPrep side
-  std::shared_ptr<opentracing::Span> previous_span_;
-  // tracing span corresponding to the last wave that was attempted to be sent
-  // If another wave is to be sent, then in e2e tracing we will
-  // create a span for the new wave in a FollowsFrom relationship with previous
-  std::unique_ptr<opentracing::Span> prev_wave_send_span_;
-  std::unique_ptr<opentracing::Span> wave_send_span_;
 
   /**
    * Called when the state machine completed (record is fully replicated) or we
@@ -1086,7 +1057,8 @@ class Appender : public IntrusiveUnorderedMapHook {
   virtual const std::shared_ptr<Configuration> getClusterConfig() const;
   virtual NodeID getMyNodeID() const;
   virtual std::string describeConnection(const Address& addr) const;
-  virtual bool bytesPendingLimitReached() const;
+
+  virtual bool bytesPendingLimitReached(const PeerType peer_type) const;
   virtual bool isAcceptingWork() const;
   virtual NodeID checkIfPreempted(epoch_t epoch);
   virtual void retireAppender(Status st, lsn_t lsn, Reaper& reaper);
@@ -1095,8 +1067,7 @@ class Appender : public IntrusiveUnorderedMapHook {
   virtual bool noteAppenderReaped(FullyReplicated replicated,
                                   lsn_t reaped_lsn,
                                   std::shared_ptr<TailRecord> tail_record,
-                                  epoch_t* last_released_epoch_out,
-                                  bool* lng_changed_out);
+                                  epoch_t* last_released_epoch_out);
   virtual bool epochMetaDataAvailable(epoch_t epoch) const;
 
   virtual void
@@ -1104,9 +1075,12 @@ class Appender : public IntrusiveUnorderedMapHook {
                        std::chrono::steady_clock::time_point until_time,
                        NodeSetState::NotAvailableReason reason);
   virtual StatsHolder* getStats();
-  virtual int registerOnSocketClosed(NodeID nid, SocketCallback& cb);
+  virtual int registerOnConnectionClosed(NodeID nid, SocketCallback& cb);
   virtual void replyToAppendRequest(APPENDED_Header& replyhdr);
   virtual void schedulePeriodicReleases();
+  // Sends a new wave when previous one fails. We keep this as separate virtual
+  // method to allow tighter control over execution in tests.
+  virtual void sendRetryWave();
 
   // Request that is used to send an E::OK reply back to a client on the worker
   // it received the append message on. Used in onReaped().

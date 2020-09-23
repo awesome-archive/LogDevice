@@ -134,6 +134,8 @@ macro(ld_thrift_py3_library file_name services options file_path output_path inc
   set(_cython_includes
     "-I${CMAKE_BINARY_DIR}/fbthrift-prefix/src/fbthrift-build/thrift/lib/py3/cybld"
   )
+  set(_thrift_includes)
+  list(APPEND _thrift_includes "${CMAKE_SOURCE_DIR}/..")
 
   set(_nextarg)
   foreach(_arg ${ARGN})
@@ -143,6 +145,8 @@ macro(ld_thrift_py3_library file_name services options file_path output_path inc
       set(_nextarg "CYTHON_INCLUDES")
     elseif ("${_arg}" STREQUAL "PY3_NAMESPACE")
       set(_nextarg "PY3_NAMESPACE")
+    elseif ("${_arg}" STREQUAL "THRIFT_INCLUDE_DIRECTORIES")
+      set(_nextarg "THRIFT_INCLUDE_DIRECTORIES")
     else()
       if("${_nextarg}" STREQUAL "DEPENDS")
         list(APPEND _dependencies ${_arg})
@@ -151,6 +155,8 @@ macro(ld_thrift_py3_library file_name services options file_path output_path inc
       elseif("${_nextarg}" STREQUAL "PY3_NAMESPACE")
         set(_py3_namespace "${_arg}/")
         set(_nextarg)
+      elseif("${_nextarg}" STREQUAL "THRIFT_INCLUDE_DIRECTORIES")
+        list(APPEND _thrift_includes "${_arg}")
       else()
         message(FATAL_ERROR "Unexpected parameter '${_arg}' in "
           "ld_thrift_py3_library call")
@@ -166,7 +172,7 @@ macro(ld_thrift_py3_library file_name services options file_path output_path inc
     "${file_path}"
     "${output_path}"
     "${include_prefix}"
-    THRIFT_INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/.."
+    THRIFT_INCLUDE_DIRECTORIES ${_thrift_includes}
   )
 
   if(thriftpy3)
@@ -183,7 +189,7 @@ macro(ld_thrift_py3_library file_name services options file_path output_path inc
       "${file_path}"
       "${output_path}"
       "${include_prefix}"
-      THRIFT_INCLUDE_DIRECTORIES "${CMAKE_SOURCE_DIR}/.."
+      THRIFT_INCLUDE_DIRECTORIES ${_thrift_includes}
     )
 
     # TODO: Why not read the py3_namespace from the thrift source file?
@@ -228,15 +234,15 @@ macro(ld_thrift_py3_library file_name services options file_path output_path inc
         target_link_libraries(${_module_name}
           PRIVATE
           "${file_name}-cpp2"
-          thriftcpp2_shared
-          folly_pic
+          ${FBTHRIFT_LIBRARIES}
+          ${FOLLY_LIBRARIES}
         )
       else()
         target_link_libraries(${_module_name}
           PRIVATE
           "${file_name}-cpp2"
-          FBThrift::thriftcpp2_shared
-          Folly::folly_pic
+          FBThrift::thriftcpp2
+          Folly::folly
         )
       endif()
       target_include_directories(${_module_name} PUBLIC ${PYTHON_INCLUDE_DIRS})
@@ -245,6 +251,19 @@ macro(ld_thrift_py3_library file_name services options file_path output_path inc
         LIBRARY_OUTPUT_DIRECTORY
           "${output_path}/gen-py3/${_py3_namespace}${file_name}"
         LIBRARY_OUTPUT_NAME ${_src})
+
+      # Symlink the output to LOGDEVICE_PY_OUT
+      file(MAKE_DIRECTORY
+        "${LOGDEVICE_PY_OUT}/gen-py3/${_py3_namespace}${file_name}"
+      )
+
+      add_custom_command(TARGET ${_module_name} POST_BUILD
+        COMMAND
+          ${CMAKE_COMMAND} -E create_symlink
+          "${output_path}/gen-py3/${_py3_namespace}${file_name}/${_src}.so"
+          "${LOGDEVICE_PY_OUT}/gen-py3/${_py3_namespace}${file_name}/${_src}.so"
+      )
+
     endforeach()
   endif() # thriftpy3
 endmacro()

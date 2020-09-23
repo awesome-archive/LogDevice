@@ -29,6 +29,7 @@
 #include "logdevice/include/Err.h"
 #include "logdevice/server/locallogstore/IOTracing.h"
 #include "logdevice/server/locallogstore/IteratorSearch.h"
+#include "logdevice/server/locallogstore/RocksDBCustomiser.h"
 #include "logdevice/server/locallogstore/RocksDBEnv.h"
 #include "logdevice/server/locallogstore/RocksDBKeyFormat.h"
 #include "logdevice/server/locallogstore/RocksDBWriterMergeOperator.h"
@@ -52,18 +53,35 @@ RocksDBLocalLogStore::RocksDBLocalLogStore(uint32_t shard_idx,
                                            uint32_t num_shards,
                                            const std::string& path,
                                            RocksDBLogStoreConfig rocksdb_config,
+                                           RocksDBCustomiser* customiser,
                                            StatsHolder* stats,
                                            IOTracing* io_tracing)
     : RocksDBLogStoreBase(shard_idx,
                           num_shards,
                           path,
                           std::move(rocksdb_config),
+                          customiser,
                           stats,
                           io_tracing) {
   rocksdb::DB* db;
   rocksdb::Status status;
 
-  status = rocksdb::DB::Open(rocksdb_config_.options_, path, &db);
+  // Even though RocksDBLocalLogStore doesn't use column families (only logsdb
+  // does), we use the verbose column-family-aware API for creating DB, just
+  // so RocksDBCustomiser doesn't have to redundantly wrap two flavors of
+  // openDB() (with and without column families). These few lines of boilerplate
+  // is way less than the alternative.
+  std::vector<rocksdb::ColumnFamilyDescriptor> column_families;
+  column_families.emplace_back(
+      rocksdb::kDefaultColumnFamilyName,
+      rocksdb::ColumnFamilyOptions(rocksdb_config_.options_));
+  std::vector<rocksdb::ColumnFamilyHandle*> handles;
+  status = customiser_->openDB(
+      rocksdb_config_.options_, path, column_families, &handles, &db);
+  if (status.ok()) {
+    ld_check_eq(handles.size(), 1);
+    delete handles[0];
+  }
 
   if (!status.ok()) {
     ld_error("could not open RocksDB store at \"%s\",  Open() failed with "
@@ -199,8 +217,7 @@ int RocksDBLocalLogStore::performCompaction() {
     enterFailSafeIfFailed(status, "CompactRange()");
     return -1;
   }
-  ld_debug(
-      "Performed manual compaction on RocksDB shard: %s.", getDBPath().c_str());
+  ld_debug("Performed manual compaction on RocksDB shard: %d.", getShardIdx());
   updateManualCompactTime();
   return 0;
 }
@@ -551,13 +568,13 @@ void RocksDBLocalLogStore::CSIWrapper::seek(logid_t log,
 void RocksDBLocalLogStore::CSIWrapper::seek(lsn_t lsn,
                                             ReadFilter* filter,
                                             ReadStats* stats) {
-  ld_check(log_id_.hasValue());
+  ld_check(log_id_.has_value());
   seek(log_id_.value(), lsn, filter, stats);
 }
 
 void RocksDBLocalLogStore::CSIWrapper::seekForPrev(lsn_t lsn) {
   SCOPED_IO_TRACING_CONTEXT_FROM_ITERATOR(this, "seekForPrev");
-  ld_check(log_id_.hasValue());
+  ld_check(log_id_.has_value());
   moveTo(Location(log_id_.value(), lsn),
          Direction::BACKWARD,
          /* near */ false,
@@ -771,13 +788,8 @@ void RocksDBLocalLogStore::CSIWrapper::moveTo(const Location& target,
   bool current_is_filtered_out = false;
 
   if (stats) {
-    // We are executing a seek/next that may land us on an LSN that is less than
-    // stats->last_read.second. This can happen if the caller has previously
-    // seen a record with LSN above read limit but for some reason proceeded to
-    // make another seek anyway, usually using a different iterator.
-    // (As of the time of writing the only way this can happen is when logsdb
-    // iterator discards an "orphaned" record and has to seek an iterator in
-    // the next partition even if the orphaned record was over the limit.)
+    // Reset last_read on each operation, to allow reusing ReadStats for
+    // different seeks.
     stats->last_read = std::make_pair(LOGID_INVALID, LSN_INVALID);
   }
 
@@ -847,9 +859,6 @@ void RocksDBLocalLogStore::CSIWrapper::moveTo(const Location& target,
       //  * If we're doing a seek but know in advance that we're above
       //    timestamp
       //    window, stop immediately without even seeking any subiterators.
-      //    This is useful for LogRebuilding: normally, timestamp window is
-      //    aligned with partition boundaries, and this check prevents us from
-      //    creating iterators in the partition we're not interested in.
       if (current != target || (!near && stats->hardLimitReached())) {
         limit_reached();
         return;
@@ -920,7 +929,7 @@ void RocksDBLocalLogStore::CSIWrapper::moveTo(const Location& target,
     // Move data iterator to `current` and see if it passes filter.
     if (data_iterator_ != nullptr && !data_iterator_good &&
         !current_is_filtered_out) {
-      data_iterator_->skipped_dangling_amend_.clear();
+      data_iterator_->skipped_dangling_amend_.reset();
       adaptiveSeek(*data_iterator_, current, dir, data_near, getStatsHolder());
       data_iterator_good = true;
       data_near = true;
@@ -930,7 +939,7 @@ void RocksDBLocalLogStore::CSIWrapper::moveTo(const Location& target,
         state_ = data_iterator_->state();
         if (csi_iterator_good && state_ == IteratorState::AT_END) {
           STAT_INCR(getStatsHolder(), read_streams_num_csi_skips_no_record);
-          if (!data_iterator_->skipped_dangling_amend_.hasValue() ||
+          if (!data_iterator_->skipped_dangling_amend_.has_value() ||
               data_iterator_->skipped_dangling_amend_.value() != current) {
             RATELIMIT_INFO(std::chrono::seconds(10),
                            2,
@@ -948,7 +957,7 @@ void RocksDBLocalLogStore::CSIWrapper::moveTo(const Location& target,
         ld_check(current.before(data_loc, dir));
         if (csi_iterator_good) {
           STAT_INCR(getStatsHolder(), read_streams_num_csi_skips_no_record);
-          if (!data_iterator_->skipped_dangling_amend_.hasValue() ||
+          if (!data_iterator_->skipped_dangling_amend_.has_value() ||
               data_iterator_->skipped_dangling_amend_.value() != current) {
             RATELIMIT_INFO(std::chrono::seconds(10),
                            2,
@@ -1025,13 +1034,13 @@ RocksDBLocalLogStore::CSIWrapper::CopySetIndexIterator::CopySetIndexIterator(
       last_key_(parent_->log_id_.value_or(LOGID_INVALID),
                 std::numeric_limits<lsn_t>::max(),
                 CopySetIndexKey::LAST_ENTRY_TYPE) {
-  if (parent_->log_id_.hasValue() &&
+  if (parent_->log_id_.has_value() &&
       !parent_->getRocksDBStore()->getSettings()->disable_iterate_upper_bound) {
     upper_bound_ = rocksdb::Slice(
         reinterpret_cast<const char*>(&last_key_), sizeof(last_key_));
   }
   rocks_options_ = translateReadOptions(
-      parent_->read_opts_, parent_->log_id_.hasValue(), &upper_bound_);
+      parent_->read_opts_, parent_->log_id_.has_value(), &upper_bound_);
   registerTracking(parent_->cf_->GetName(),
                    parent_->log_id_.value_or(LOGID_INVALID),
                    rocks_options_.tailing,
@@ -1042,7 +1051,7 @@ RocksDBLocalLogStore::CSIWrapper::CopySetIndexIterator::CopySetIndexIterator(
 
 RocksDBLocalLogStore::CSIWrapper::CopySetIndexIterator::
     ~CopySetIndexIterator() {
-  if (iterator_.hasValue()) {
+  if (iterator_.has_value()) {
     STAT_INCR(
         parent_->getStatsHolder(), read_streams_num_csi_iterators_destroyed);
   }
@@ -1050,7 +1059,7 @@ RocksDBLocalLogStore::CSIWrapper::CopySetIndexIterator::
 
 void RocksDBLocalLogStore::CSIWrapper::CopySetIndexIterator::
     createIteratorIfNeeded() {
-  if (!iterator_.hasValue()) {
+  if (!iterator_.has_value()) {
     iterator_ =
         parent_->getRocksDBStore()->newIterator(rocks_options_, parent_->cf_);
     STAT_INCR(
@@ -1060,18 +1069,18 @@ void RocksDBLocalLogStore::CSIWrapper::CopySetIndexIterator::
 
 IteratorState
 RocksDBLocalLogStore::CSIWrapper::CopySetIndexIterator::state() const {
-  ld_check(iterator_.hasValue());
+  ld_check(iterator_.has_value());
   return state_;
 }
 
 void RocksDBLocalLogStore::CSIWrapper::CopySetIndexIterator::invalidate() {
-  iterator_.clear();
+  iterator_.reset();
   state_ = IteratorState::ERROR;
 }
 
 void RocksDBLocalLogStore::CSIWrapper::CopySetIndexIterator::
     checkIteratorAndParseCurrentEntry() {
-  ld_check(iterator_.hasValue());
+  ld_check(iterator_.has_value());
 
   state_ = IteratorState::MAX;
   SCOPE_EXIT {
@@ -1089,7 +1098,7 @@ void RocksDBLocalLogStore::CSIWrapper::CopySetIndexIterator::
         std::chrono::seconds(10),
         2,
         "RocksDB copyset index iterator for log %s failed with status %s",
-        parent_->log_id_.hasValue()
+        parent_->log_id_.has_value()
             ? folly::to<std::string>(parent_->log_id_.value().val_).c_str()
             : "all",
         status.ToString().c_str());
@@ -1125,7 +1134,7 @@ void RocksDBLocalLogStore::CSIWrapper::CopySetIndexIterator::
   current_single_log_id_ = CopySetIndexKey::getLogID(iterator_->key().data());
   current_single_lsn_ = CopySetIndexKey::getLSN(iterator_->key().data());
 
-  if (parent_->log_id_.hasValue() &&
+  if (parent_->log_id_.has_value() &&
       current_single_log_id_ != parent_->log_id_.value()) {
     state_ = IteratorState::AT_END;
     return;
@@ -1274,7 +1283,7 @@ RocksDBLocalLogStore::CSIWrapper::DataIterator::DataIterator(
               ? folly::none
               : parent_->log_id_),
       rocks_options_(translateReadOptions(parent_->read_opts_,
-                                          parent_->log_id_.hasValue(),
+                                          parent_->log_id_.has_value(),
                                           &upper_bound_.upper_bound)) {
   registerTracking(parent_->cf_->GetName(),
                    parent_->log_id_.value_or(LOGID_INVALID),
@@ -1285,19 +1294,19 @@ RocksDBLocalLogStore::CSIWrapper::DataIterator::DataIterator(
 }
 
 void RocksDBLocalLogStore::CSIWrapper::DataIterator::createIteratorIfNeeded() {
-  if (!iterator_.hasValue()) {
+  if (!iterator_.has_value()) {
     iterator_ =
         parent_->getRocksDBStore()->newIterator(rocks_options_, parent_->cf_);
   }
 }
 
 void RocksDBLocalLogStore::CSIWrapper::DataIterator::releaseIterator() {
-  iterator_.clear();
+  iterator_.reset();
   trackIteratorRelease();
 }
 
 IteratorState RocksDBLocalLogStore::CSIWrapper::DataIterator::state() const {
-  if (!iterator_.hasValue()) {
+  if (!iterator_.has_value()) {
     ld_check(false);
     return IteratorState::ERROR;
   }
@@ -1311,7 +1320,7 @@ IteratorState RocksDBLocalLogStore::CSIWrapper::DataIterator::state() const {
         std::chrono::seconds(10),
         2,
         "RocksDB data iterator for log %s failed with status %s",
-        parent_->log_id_.hasValue()
+        parent_->log_id_.has_value()
             ? folly::to<std::string>(parent_->log_id_.value().val_).c_str()
             : "all",
         status.ToString().c_str());
@@ -1339,7 +1348,7 @@ IteratorState RocksDBLocalLogStore::CSIWrapper::DataIterator::state() const {
                  hexdump_buf(slice.data(), slice.size(), 50).c_str())) {
     return IteratorState::ERROR;
   }
-  if (parent_->log_id_.hasValue() &&
+  if (parent_->log_id_.has_value() &&
       DataKey::getLogID(slice.data()) != parent_->log_id_.value()) {
     return IteratorState::AT_END;
   }
@@ -1401,7 +1410,7 @@ void RocksDBLocalLogStore::CSIWrapper::DataIterator::step(Direction dir) {
 
 void RocksDBLocalLogStore::CSIWrapper::DataIterator::
     handleKeyFormatMigration() {
-  ld_check(iterator_.hasValue());
+  ld_check(iterator_.has_value());
   while (true) {
     // If we're standing on a dangling amend in new format, step forward and
     // see if the next key has the same lsn. If it does, merge the two together.
@@ -1423,7 +1432,7 @@ void RocksDBLocalLogStore::CSIWrapper::DataIterator::
     logid_t log = DataKey::getLogID(key.data());
     lsn_t lsn = DataKey::getLSN(key.data());
 
-    if (parent_->log_id_.hasValue() && log != parent_->log_id_.value()) {
+    if (parent_->log_id_.has_value() && log != parent_->log_id_.value()) {
       break;
     }
 
@@ -1439,7 +1448,7 @@ void RocksDBLocalLogStore::CSIWrapper::DataIterator::
     // Alright, we've got a dangling amend in new format.
     STAT_INCR(getStatsHolder(), data_key_format_migration_steps);
 
-    if (!skipped_dangling_amend_.hasValue()) {
+    if (!skipped_dangling_amend_.has_value()) {
       skipped_dangling_amend_ = Location(log, lsn);
     }
 

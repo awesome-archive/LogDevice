@@ -39,10 +39,6 @@
 #include "logdevice/include/Record.h"
 #include "logdevice/include/types.h"
 
-namespace opentracing { inline namespace v2 {
-class Tracer;
-}} // namespace opentracing::v2
-
 namespace facebook { namespace logdevice {
 
 struct APPENDED_Header;
@@ -80,45 +76,16 @@ class AppendRequest : public AppendRequestBase,
   AppendRequest(ClientBridge* client,
                 logid_t logid,
                 AppendAttributes attrs,
-                const Payload& payload,
+                PayloadHolder&& payload,
                 std::chrono::milliseconds timeout,
                 append_callback_t callback)
       : AppendRequest(client,
                       logid,
                       std::move(attrs),
-                      payload,
+                      std::move(payload),
                       timeout,
                       std::move(callback),
                       std::make_unique<SequencerRouter>(logid, this)) {}
-  /**
-   * Constructor used by clients to submit an original AppendRequest to a
-   * Processor.
-   *
-   * @param client  ClientBridge to make write token checks through, may be
-   *                nullptr if bypassWriteTokenCheck() is called
-   * @param logid   log to append the record to
-   * @param payload record payload which becomes owned by append request and
-   *                will automatically be released after calling callback.
-   * @param timeout cancel the request and report E::TIMEDOUT to client
-   *                if a reply is not received for this many milliseconds
-   * @param callback functor to call when a reply is received or on timeout
-   */
-  AppendRequest(ClientBridge* client,
-                logid_t logid,
-                AppendAttributes attrs,
-                std::string payload,
-                std::chrono::milliseconds timeout,
-                append_callback_t callback)
-      : AppendRequest(client,
-                      logid,
-                      std::move(attrs),
-                      Payload(),
-                      timeout,
-                      std::move(callback),
-                      std::make_unique<SequencerRouter>(logid, this)) {
-    string_payload_ = std::move(payload);
-    record_.payload = Payload(string_payload_.data(), string_payload_.size());
-  }
 
   ~AppendRequest() override;
 
@@ -139,7 +106,7 @@ class AppendRequest : public AppendRequestBase,
   /**
    * Called when Configuration::getLogByIDAsync() returns with the log config.
    */
-  void onLogConfigAvailable(std::shared_ptr<LogsConfig::LogGroupNode> cfg);
+  void onLogConfigAvailable(LogsConfig::LogGroupNodePtr cfg);
 
   // implementation of the SequencerRouter::Handler interface
   void onSequencerKnown(NodeID dest, SequencerRouter::flags_t flags) override;
@@ -180,12 +147,25 @@ class AppendRequest : public AppendRequestBase,
     target_worker_ = id;
   }
 
+  // See client_payload_.
+  void setClientPayload(Payload p) {
+    client_payload_ = p;
+  }
+
   void setBufferedWriterBlobFlag() {
     buffered_writer_blob_flag_ = true;
   }
 
   bool getBufferedWriterBlobFlag() const {
     return buffered_writer_blob_flag_;
+  }
+
+  void setPayloadGroupFlag() {
+    payload_group_flag_ = true;
+  }
+
+  bool getPayloadGroupFlag() const {
+    return payload_group_flag_;
   }
 
   void setFailedToPost() {
@@ -219,30 +199,8 @@ class AppendRequest : public AppendRequestBase,
     return record_.logid;
   }
 
-  std::pair<Payload, AppendAttributes> getShadowData() const {
-    return std::make_pair(record_.payload, attrs_);
-  }
-
-  // Enable tracing for this request. Tracing setting should be modified
-  // according to configuration
-  void setTracingContext() {
-    is_traced_ = true;
-
-    if (e2e_tracer_) {
-      // now that tracing is enable we should create the corresponding span
-      // for this request
-      request_span_ = e2e_tracer_->StartSpan("AppendRequest_initiated");
-      request_span_->SetTag("destination_log_id", record_.logid.val_);
-      request_span_->Finish();
-    }
-  }
-
-  bool isE2ETracingOn() {
-    return is_traced_;
-  }
-
-  bool hasTracerObject() {
-    return e2e_tracer_ == nullptr ? false : true;
+  std::pair<PayloadHolder, AppendAttributes> getShadowData() const {
+    return std::make_pair(payload_, attrs_);
   }
 
   void cancel() {
@@ -271,7 +229,7 @@ class AppendRequest : public AppendRequestBase,
   AppendRequest(ClientBridge* client,
                 logid_t logid,
                 AppendAttributes attrs,
-                const Payload& payload,
+                PayloadHolder&& payload,
                 std::chrono::milliseconds timeout,
                 append_callback_t callback,
                 std::unique_ptr<SequencerRouter> router);
@@ -350,23 +308,31 @@ class AppendRequest : public AppendRequestBase,
     return timeout_;
   }
 
-  bool isTraced() const {
-    return is_traced_;
-  }
-
-  const std::string& getTracingContext() const {
-    return tracing_context_;
-  }
-
   SequencerRouter::flags_t getSequencerRouterFlags() const {
     return sequencer_router_flags_;
   }
+
+  // record_.payload points to payload_
+  PayloadHolder payload_;
+
+  // Pass this Payload to the callback. This is needed to support the legacy
+  // Client::append() API which (a) requires the user to keep the Payload alive
+  // until the callback is called, and (b) promises that the same Payload will
+  // be passed to the callback (whilch may e.g. free() it). Now (a) is obsolete
+  // because the Payload is copied into an IOBuf right away anyway, so (b) is
+  // not useful, except for the existing code that frees payload in callback.
+  folly::Optional<Payload> client_payload_;
 
   // This field contains the target log id, request creation time, and
   // payload supplied by a client. It is passed back to the client through
   // append_callback_t when the request completes. This field is used only if
   // this AppendRequest object was constructed on a client thread.
   DataRecord record_;
+
+  // Result of sequencer routing; this is the node we send an APPEND message
+  // to.
+  NodeID sequencer_node_;
+  SequencerRouter::flags_t sequencer_router_flags_;
 
  private:
   // Request creation time.  Latency is reported (for successful appends) from
@@ -383,10 +349,6 @@ class AppendRequest : public AppendRequestBase,
   AppendAttributes attrs_;
 
   std::unique_ptr<std::string> per_request_token_;
-
-  // If the ownership of the payload is transferred to LogDevice, this buffer
-  // contains that payload (and record_.payload points to it).
-  std::string string_payload_;
 
   // Here we cache the id of the worker on which this request must be running.
   // This is either set by setTargetWorker() or if setTargetWorker() was never
@@ -409,33 +371,19 @@ class AppendRequest : public AppendRequestBase,
 
   // Router object used to find a sequencer node to send an APPEND message to.
   std::unique_ptr<SequencerRouter> router_;
-  // Result of sequencer routing; this is the node we send an APPEND message
-  // to.
-  NodeID sequencer_node_;
-  SequencerRouter::flags_t sequencer_router_flags_;
 
   AppendProbeController* append_probe_controller_ = nullptr;
 
   // Client-side append tracer
   ClientAppendTracer tracer_;
 
-  // OpenTracing tracer object used for distributed tracing.
-  std::shared_ptr<opentracing::Tracer> e2e_tracer_;
-
-  // e2e distrubuted tracing span that is created when an append request is
-  // created
-  std::unique_ptr<opentracing::Span> request_span_;
-
-  // e2e distributed tracing span that is used to trace the actual execution
-  // of the request
-  std::unique_ptr<opentracing::Span> request_execution_span_;
-
-  // encoding of the tracing context associated to the request execution span
-  std::string tracing_context_;
-
   // Appends coming from BufferedWriter should have the BUFFERED_WRITER_BLOB
   // flag set in APPEND_Header.
   bool buffered_writer_blob_flag_ = false;
+
+  // Indicates that request contains serialized payload set. Such appends should
+  // have PAYLOAD_GROUP flag set in APPEND_Header.
+  bool payload_group_flag_ = false;
 
   bool bypass_write_token_check_ = false;
 

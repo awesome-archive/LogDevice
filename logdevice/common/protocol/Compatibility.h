@@ -41,6 +41,18 @@ enum ProtocolVersion : uint16_t {
 
   LOGS_CONFIG_API_MESSAGE_HAS_TIMEOUT, // = 99
 
+  // GOSSIP_Message includes health state of nodes
+  HEALTH_MONITOR_SUPPORT_IN_GOSSIP, // = 100
+
+  // GET_CLUSTER_STATE_REPLY_Message includes health state of nodes and hashmaps
+  // of node states and health statuses
+  NODE_STATUS_AND_HASHMAP_SUPPORT_IN_CLUSTER_STATE, // = 101
+
+  // Include RSM and NCM versions in GOSSIP Message
+  INCLUDE_VERSIONS_IN_GOSSIP, // = 102
+
+  GET_RSM_SNAPSHOT_MESSAGE_SUPPORT, // = 103
+
   // NOTE: insert new protocol versions here
 
   // Maximum version number of the protocol this version of LogDevice
@@ -61,6 +73,10 @@ static_assert(GSS_32BIT_FLAG == 96, "");
 static_assert(IS_LOG_EMPTY_IN_GSS_REPLY == 97, "");
 static_assert(STREAM_WRITER_SUPPORT == 98, "");
 static_assert(LOGS_CONFIG_API_MESSAGE_HAS_TIMEOUT == 99, "");
+static_assert(HEALTH_MONITOR_SUPPORT_IN_GOSSIP == 100, "");
+static_assert(NODE_STATUS_AND_HASHMAP_SUPPORT_IN_CLUSTER_STATE == 101, "");
+static_assert(INCLUDE_VERSIONS_IN_GOSSIP == 102, "");
+static_assert(GET_RSM_SNAPSHOT_MESSAGE_SUPPORT == 103, "");
 
 constexpr uint16_t MIN_PROTOCOL_SUPPORTED = PROTOCOL_VERSION_LOWER_BOUND + 1;
 constexpr uint16_t MAX_PROTOCOL_SUPPORTED = PROTOCOL_VERSION_UPPER_BOUND - 1;

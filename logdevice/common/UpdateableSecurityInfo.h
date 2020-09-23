@@ -8,23 +8,39 @@
 #pragma once
 
 #include "logdevice/common/PermissionChecker.h"
-#include "logdevice/common/Processor.h"
+#include "logdevice/common/SSLPrincipalParser.h"
+#include "logdevice/common/configuration/Configuration.h"
 #include "logdevice/common/configuration/SecurityConfig.h"
+#include "logdevice/common/plugin/PluginRegistry.h"
 #include "logdevice/include/ConfigSubscriptionHandle.h"
 
 namespace facebook { namespace logdevice {
 
 class UpdateableSecurityInfo {
  public:
-  UpdateableSecurityInfo(Processor* processor, bool server = true);
+  struct SecurityInfo {
+    // PermissionChecker owned by the processor used to determine if a client is
+    // allowed to perform a specific action on a given resource.
+    // nullptr iff permission checking is disabled.
+    std::shared_ptr<PermissionChecker> permission_checker;
+    // PrincipalParser owned by the processor used to obtain the principal after
+    // authentication
+    std::shared_ptr<SSLPrincipalParser> principal_parser;
+
+    AuthenticationType auth_type{AuthenticationType::NONE};
+    std::string cluster_node_identity;
+    bool enforce_cluster_node_identity{false};
+
+    bool isAuthenticationEnabled() const;
+  };
+
+  UpdateableSecurityInfo(std::shared_ptr<UpdateableServerConfig> server_config,
+                         std::shared_ptr<PluginRegistry> plugin_registry,
+                         bool server = true);
   virtual ~UpdateableSecurityInfo() {}
 
-  std::shared_ptr<PermissionChecker> getPermissionChecker();
-
-  std::shared_ptr<PrincipalParser> getPrincipalParser();
-
-  std::string getClusterNodeIdentity() const {
-    return cluster_node_identity_;
+  std::shared_ptr<const SecurityInfo> get() {
+    return current_.get();
   }
 
   /**
@@ -41,20 +57,18 @@ class UpdateableSecurityInfo {
   void shutdown();
 
  private:
-  Processor* processor_;
+  std::shared_ptr<UpdateableServerConfig> server_config_;
+  std::shared_ptr<PluginRegistry> plugin_registry_;
 
   // are we running on server
-  bool server_;
+  const bool server_;
 
-  // PermissionChecker owned by the processor used to determine if a client is
-  // allowed to perform a specific action on a given resource
-  UpdateableSharedPtr<PermissionChecker> permission_checker_;
-
-  // PrincipalParser owned by the processor used to obtain the principal after
-  // authentication
-  UpdateableSharedPtr<PrincipalParser> principal_parser_;
-
-  std::string cluster_node_identity_;
+  // Current state. Updated in config update callback. Read from anywhere.
+  // Putting all fields into one UpdateableSharedPtr makes reads faster and
+  // prevents torn reads (e.g. if one config update changed permission checker
+  // type and principal parser type, we'll never use new permission checker with
+  // old principal parser).
+  UpdateableSharedPtr<const SecurityInfo> current_;
 
   // comes last to ensure unsubscription before rest of destruction
   ConfigSubscriptionHandle config_update_sub_;

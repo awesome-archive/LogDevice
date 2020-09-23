@@ -19,6 +19,7 @@
 #include "logdevice/common/debug.h"
 #include "logdevice/common/test/MockBackoffTimer.h"
 #include "logdevice/common/test/NodeSetTestUtil.h"
+#include "logdevice/common/test/NodesConfigurationTestUtil.h"
 #include "logdevice/common/util.h"
 #include "logdevice/server/locallogstore/test/StoreUtil.h"
 #include "logdevice/server/locallogstore/test/TemporaryLogStore.h"
@@ -31,7 +32,6 @@ namespace facebook { namespace logdevice {
 using namespace facebook::logdevice::NodeSetTestUtil;
 
 using State = PurgeUncleanEpochs::State;
-using RecordSource = MetaDataLogReader::RecordSource;
 
 class MockPurgeUncleanEpochs;
 
@@ -116,7 +116,7 @@ class PurgeUncleanEpochsTest : public ::testing::Test {
 
   logid_t log_id_{222};
   const shard_index_t shard_{0};
-  folly::Optional<epoch_t> current_last_clean_epoch_;
+  epoch_t current_last_clean_epoch_;
   epoch_t purge_to_{EPOCH_INVALID};
   epoch_t new_last_clean_epoch_{EPOCH_INVALID};
   NodeID node_{1, 1};
@@ -163,8 +163,7 @@ class MockPurgeUncleanEpochs : public PurgeUncleanEpochs {
 
   std::shared_ptr<const configuration::nodes::NodesConfiguration>
   getNodesConfiguration() const override {
-    return test_->config_->serverConfig()
-        ->getNodesConfigurationFromServerConfigSource();
+    return test_->config_->getNodesConfiguration();
   }
 
   const std::shared_ptr<LogsConfig> getLogsConfig() const override {
@@ -189,7 +188,7 @@ class MockPurgeUncleanEpochs : public PurgeUncleanEpochs {
     ASSERT_EQ(E::UNKNOWN, test_->completion_);
     ld_info("PurgeUncleanEpochs for epoch [%u, %u] for log %lu completed "
             "with status %s.",
-            current_last_clean_epoch_.value().val_,
+            current_last_clean_epoch_.val_,
             purge_to_.val_,
             log_id_.val_,
             error_name(status));
@@ -221,21 +220,25 @@ void PurgeUncleanEpochsTest::setUp() {
   dbg::currentLevel = dbg::Level::DEBUG;
   dbg::assertOnData = true;
 
-  Configuration::Nodes nodes;
-  addNodes(&nodes, 1, 1, "....", 1);
-  Configuration::NodesConfig nodes_config(std::move(nodes));
+  auto nodes = std::make_shared<const NodesConfiguration>();
+  addNodes(nodes, 1, 1, "....", 1);
+  nodes =
+      nodes->applyUpdate(NodesConfigurationTestUtil::setStorageMembershipUpdate(
+          *nodes,
+          {ShardID(0, -1)},
+          folly::none,
+          membership::MetaDataStorageState::METADATA));
+  nodes = nodes->applyUpdate(
+      NodesConfigurationTestUtil::setMetadataReplicationPropertyUpdate(
+          *nodes, ReplicationProperty{{NodeLocationScope::NODE, 1}}));
 
   auto logs_config = std::make_shared<configuration::LocalLogsConfig>();
   addLog(logs_config.get(), log_id_, 1, 0, 1, {});
 
-  Configuration::MetaDataLogsConfig meta_config =
-      createMetaDataLogsConfig(nodes_config, nodes_config.getNodes().size(), 1);
-
   config_ = std::make_shared<Configuration>(
-      ServerConfig::fromDataTest("purge_unclean_epochs_test",
-                                 std::move(nodes_config),
-                                 std::move(meta_config)),
-      std::move(logs_config));
+      ServerConfig::fromDataTest("purge_unclean_epochs_test"),
+      std::move(logs_config),
+      std::move(nodes));
 
   if (test_metadata_log_) {
     log_id_ = MetaDataLog::metaDataLogID(log_id_);
@@ -263,6 +266,7 @@ TEST_F(PurgeUncleanEpochsTest, BasicWorkFlow) {
   // non-empty epochs: 7, 13, 18, 19
   // epoch metadata interval: [2, 14] [15, 15],[16, 18], [19, 210]
   purge_to_ = epoch_t(200);
+  current_last_clean_epoch_ = epoch_t(5);
   new_last_clean_epoch_ = epoch_t(201);
   setUp();
 
@@ -271,13 +275,6 @@ TEST_F(PurgeUncleanEpochsTest, BasicWorkFlow) {
 
   ASSERT_NE(nullptr, getRetryTimer());
   ASSERT_FALSE(getRetryTimer()->isActive());
-
-  // current LCE is unknown, we should read the LCE
-  ASSERT_EQ(State::READ_LAST_CLEAN, getState());
-  CHECK_STORAGE_TASK(PurgeReadLastCleanTask);
-
-  // local lce is read from the local log store
-  purge_->onLastCleanRead(E::OK, epoch_t(5));
 
   // state machine should advance to the next state
   ASSERT_EQ(State::GET_PURGE_EPOCHS, getState());
@@ -466,7 +463,7 @@ TEST_F(PurgeUncleanEpochsTest, EmptyEpochs) {
   // should perform purge in epochs [6, 20] then set the LCE to 20
   // non-empty epochs: none
   purge_to_ = epoch_t(20);
-  current_last_clean_epoch_.assign(epoch_t(6));
+  current_last_clean_epoch_ = epoch_t(6);
   new_last_clean_epoch_ = epoch_t(20);
   setUp();
 
@@ -545,7 +542,7 @@ TEST_F(PurgeUncleanEpochsTest, EmptyEpochsMetaDataLog) {
   // non-empty epochs: none
   test_metadata_log_ = true;
   purge_to_ = epoch_t(20);
-  current_last_clean_epoch_.assign(epoch_t(6));
+  current_last_clean_epoch_ = epoch_t(6);
   new_last_clean_epoch_ = epoch_t(20);
   setUp();
 
@@ -617,7 +614,7 @@ TEST_F(PurgeUncleanEpochsTest, EmptyEpochsDoNotFetchERM) {
   // should perform purge in epochs [6, 20] then set the LCE to 20
   // non-empty epochs: 15,16,19
   purge_to_ = epoch_t(20);
-  current_last_clean_epoch_.assign(epoch_t(6));
+  current_last_clean_epoch_ = epoch_t(6);
   new_last_clean_epoch_ = epoch_t(20);
   setUp();
   settings_.get_erm_for_empty_epoch = false;
@@ -701,7 +698,7 @@ TEST_F(PurgeUncleanEpochsTest, NoPurgeNeededButAdvanceLCE) {
   // new lce: 7
   // should NOT perform any purge but set the LCE to 7
   purge_to_ = epoch_t(6);
-  current_last_clean_epoch_.assign(epoch_t(6));
+  current_last_clean_epoch_ = epoch_t(6);
   new_last_clean_epoch_ = epoch_t(7);
   setUp();
 
@@ -727,7 +724,7 @@ TEST_F(PurgeUncleanEpochsTest, NoOp) {
   // new lce: 6
   // should complete synchronously
   purge_to_ = epoch_t(6);
-  current_last_clean_epoch_.assign(epoch_t(6));
+  current_last_clean_epoch_ = epoch_t(6);
   new_last_clean_epoch_ = epoch_t(6);
   setUp();
 
@@ -742,7 +739,7 @@ TEST_F(PurgeUncleanEpochsTest, DoNotPurgeBeyondPurgeTo) {
   // but there are data written in epoch 8 and 9
   // should perform purge in epochs [6, 6] then set the LCE to 7
   // should not purge epoch 8 or 9
-  current_last_clean_epoch_.assign(epoch_t(5));
+  current_last_clean_epoch_ = epoch_t(5);
   purge_to_ = epoch_t(6);
   new_last_clean_epoch_ = epoch_t(7);
   setUp();
@@ -816,7 +813,7 @@ TEST_F(PurgeUncleanEpochsTest, BadEpochMetadata) {
   // should perform purge in epochs [6, 200] then set the LCE to 201
   // non-empty epochs: 7, 13, 18, 19
   // epoch metadata interval: [7, 14] [15, 15],[16, 18], [19, 200]
-  current_last_clean_epoch_.assign(epoch_t(5));
+  current_last_clean_epoch_ = epoch_t(5);
   purge_to_ = epoch_t(200);
   new_last_clean_epoch_ = epoch_t(201);
   setUp();

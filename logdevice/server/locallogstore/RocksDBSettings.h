@@ -52,6 +52,10 @@ static_assert(ROCKSDB_MAJOR > 5 || (ROCKSDB_MAJOR == 5 && ROCKSDB_MINOR >= 7),
 #define LOGDEVICE_ROCKSDB_HAS_FIRST_KEY_IN_INDEX
 #endif
 
+#if ROCKSDB_MAJOR > 6 || (ROCKSDB_MAJOR == 6 && ROCKSDB_MINOR >= 8)
+#define LOGDEVICE_ROCKSDB_HAS_SKIP_CHECKING_SST_FILE_SIZES_ON_DB_OPEN
+#endif
+
 namespace boost { namespace program_options {
 class options_description;
 }} // namespace boost::program_options
@@ -59,6 +63,26 @@ class options_description;
 namespace facebook { namespace logdevice {
 
 class StatsHolder;
+
+// Some customized behaviour of rocksdb write-ahead log files, moving
+// potentially slow IO operations away from write path and increasing batching.
+// See RocksDBBufferedWALFile for full info.
+enum class WALBufferingMode {
+  // Don't do anything fancy, just stock rocksdb.
+  NONE,
+  // Offload WritableFile::RangeSync() (Linux sync_file_range()) to background
+  // thread.
+  BACKGROUND_RANGE_SYNC,
+  // Offload file writes to background thread. When rocksdb asks us to flush
+  // the writes to the file (usually at the end of a write batch) - trigger the
+  // flush but don't wait for it. Sync/fsync are still synchronous.
+  // Also does BACKGROUND_RANGE_SYNC.
+  BACKGROUND_APPEND,
+  // Like BACKGROUND_APPEND, but the buffer is only flushed if it gets full, or
+  // a sync happens, or file is closed. Sync/fsync are still synchronous.
+  // The buffer may remain unflushed indefinitely if the file is not used.
+  DELAYED_APPEND,
+};
 
 class RocksDBSettings : public SettingsBundle {
  public:
@@ -93,8 +117,9 @@ class RocksDBSettings : public SettingsBundle {
   // position.
   int skip_list_lookahead;
 
-  // Do RangeSync() for WAL files in a background thread.
-  bool background_wal_sync;
+  WALBufferingMode wal_buffering;
+
+  uint64_t wal_buffer_size;
 
   // IO priority to request for lo-pri rocksdb threads.
   folly::Optional<std::pair<int, int>> low_ioprio;
@@ -225,8 +250,8 @@ class RocksDBSettings : public SettingsBundle {
   // its uncommitted data.
   std::chrono::milliseconds partition_idle_flush_trigger;
 
-  // Minumum guaranteed time period for a node to re-dirty a partition after
-  // a MemTable is flushed without incurring a syncronous write penalty to
+  // Minimum guaranteed time period for a node to re-dirty a partition after
+  // a MemTable is flushed without incurring a synchronous write penalty to
   // update the partition dirty metadata
   std::chrono::milliseconds partition_redirty_grace_period;
 
@@ -265,6 +290,9 @@ class RocksDBSettings : public SettingsBundle {
 
   // See cpp file for doc.
   rate_limit_t compaction_rate_limit_;
+
+  // if true, all records will have the copyset index written for them
+  bool write_copyset_index_;
 
   enum class FlushBlockPolicyType {
     DEFAULT,
@@ -333,6 +361,8 @@ class RocksDBSettings : public SettingsBundle {
   // as corrupted.
   bool test_corrupt_stores{false};
 
+  bool test_stall_sst_reads{false};
+
   // Various settings related to the rocksdb flush policy.
 
   // Total size limit for all memtables in the system.
@@ -346,7 +376,15 @@ class RocksDBSettings : public SettingsBundle {
 
   bool print_details;
 
-  std::vector<shard_index_t> io_tracing_shards;
+  struct IOTracingShards {
+    std::vector<shard_index_t> shards;
+    bool all_shards = false;
+  };
+  IOTracingShards io_tracing_shards;
+
+  std::chrono::milliseconds io_tracing_threshold;
+
+  std::chrono::milliseconds io_tracing_stall_threshold;
 
   // When ld manages flushes, memory limit for the node and memtable
   // within rocksdb set to a very high value. rocksdb should never be
@@ -406,6 +444,10 @@ class RocksDBSettings : public SettingsBundle {
   bool auto_create_shards;
   bool use_direct_reads;
   bool use_direct_io_for_flush_and_compaction;
+  bool paranoid_checks;
+#ifdef LOGDEVICE_ROCKSDB_HAS_SKIP_CHECKING_SST_FILE_SIZES_ON_DB_OPEN
+  bool skip_checking_sst_file_sizes_on_db_open;
+#endif
   int max_open_files;
   uint64_t compaction_max_bytes_at_once;
   uint64_t bytes_per_sync;
@@ -421,6 +463,9 @@ class RocksDBSettings : public SettingsBundle {
   int max_bytes_for_level_multiplier;
   int max_write_buffer_number;
   int num_levels;
+  int keep_log_file_num;
+  uint64_t max_log_file_size;
+  size_t log_readahead_size;
   uint64_t target_file_size_base;
   size_t write_buffer_size;
   uint64_t max_total_wal_size;
@@ -431,6 +476,7 @@ class RocksDBSettings : public SettingsBundle {
   unsigned int uc_max_size_amplification_percent;
   unsigned int uc_size_ratio;
   uint64_t sst_delete_bytes_per_sec;
+  size_t writable_file_max_buffer_size;
 
   // Applies the settings that directly correspond to rocksdb::Options fields.
   // Note that this is not the whole logic of making rocksdb::Options.

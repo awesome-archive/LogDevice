@@ -94,10 +94,10 @@ WeightedCopySetSelector::WeightedCopySetSelector(
 
   // Find my node's failure domain name.
   folly::Optional<std::string> my_domain;
-  if (my_node_id.hasValue()) {
+  if (my_node_id.has_value()) {
     node_index_t my_node = my_node_id.value().index();
     const auto* node_sd = nodes_configuration->getNodeServiceDiscovery(my_node);
-    if (node_sd && node_sd->location.hasValue()) {
+    if (node_sd && node_sd->location.has_value()) {
       my_domain =
           node_sd->location->getDomain(secondary_replication_scope_, my_node);
     }
@@ -206,7 +206,7 @@ WeightedCopySetSelector::WeightedCopySetSelector(
   }
 
   // Find my node's domain.
-  if (my_domain.hasValue() && secondary_domain_idx.count(my_domain.value())) {
+  if (my_domain.has_value() && secondary_domain_idx.count(my_domain.value())) {
     my_domain_idx_ = secondary_domain_idx[my_domain.value()];
   }
 
@@ -283,12 +283,6 @@ std::vector<double> WeightedCopySetSelector::calculateWeightsBasedOnConfig(
       // domain target weight
       domain_target_weight[domain] +=
           nodes_configuration.getNodeWritableStorageCapacity(node);
-    } else {
-      // Some positive-weight domain has no positive-weight nodes in nodeset.
-      // This is unusual but possible if e.g. a new rack was added to config,
-      // and nodesets haven't been updated yet.
-      // Act as if this domain had zero weight.
-      domain_target_weight[domain]; // make sure domain is in the map
     }
   }
 
@@ -344,20 +338,6 @@ void WeightedCopySetSelector::optimizeWeightsForLocality(
     const configuration::nodes::NodesConfiguration& nodes_configuration,
     const logsconfig::LogAttributes* log_attrs,
     std::unordered_map<std::string, double>& domain_target_weight) {
-  // Find primary sequencer domain.
-  ld_check(log_attrs != nullptr);
-  node_index_t sequencer_node =
-      HashBasedSequencerLocator::getPrimarySequencerNode(
-          logid_, nodes_configuration, log_attrs);
-
-  const auto* node_sd =
-      nodes_configuration.getNodeServiceDiscovery(sequencer_node);
-  ld_check(node_sd != nullptr);
-  std::string sequencer_domain =
-      node_sd->location.value_or(NodeLocation())
-          .getDomain(secondary_replication_scope_, sequencer_node);
-  ld_check(domain_target_weight.count(sequencer_domain));
-
   // See doc/weighted-copyset-selector-locality.md for explanation.
 
   // First calculate some total weights.
@@ -372,6 +352,10 @@ void WeightedCopySetSelector::optimizeWeightsForLocality(
                                       ->getEffectiveSequencerWeight(n);
     domain_sequencer_weight[domain] += sequencer_weight;
     total_sequencer_weight += sequencer_weight;
+
+    // Make sure domain_target_weight has the same set of keys as
+    // domain_sequencer_weight, including sequencer-only domains.
+    domain_target_weight[domain];
   }
 
   // Note that, unlike the doc, we have unnormalized weights, so we'll need to
@@ -379,6 +363,10 @@ void WeightedCopySetSelector::optimizeWeightsForLocality(
   double total_weight = 0;
   for (const auto& p : domain_target_weight) {
     total_weight += p.second;
+
+    // Make sure domain_sequencer_weight has the same set of keys as
+    // domain_target_weight, including storage-only domains.
+    domain_sequencer_weight[p.first];
   }
 
   if (total_sequencer_weight < Sampling::EPSILON ||
@@ -391,6 +379,22 @@ void WeightedCopySetSelector::optimizeWeightsForLocality(
         total_sequencer_weight);
     return;
   }
+
+  // Find primary sequencer domain.
+
+  ld_check(log_attrs != nullptr);
+  node_index_t sequencer_node =
+      HashBasedSequencerLocator::getPrimarySequencerNode(
+          logid_, nodes_configuration, log_attrs);
+
+  const auto* node_sd =
+      nodes_configuration.getNodeServiceDiscovery(sequencer_node);
+  ld_check(node_sd != nullptr);
+  std::string sequencer_domain =
+      node_sd->location.value_or(NodeLocation())
+          .getDomain(secondary_replication_scope_, sequencer_node);
+
+  ld_check(domain_target_weight.count(sequencer_domain));
 
   // Pick domain_weight_shift[s] (a.k.a. D[s]) for every s. D[s] is by how much
   // we want to increase the weight of sequencer domain for logs with
@@ -607,7 +611,7 @@ std::string WeightedCopySetSelector::getName() const {
 WeightedCopySetSelector::NodeAvailabilityCache&
 WeightedCopySetSelector::prepareCachedNodeAvailability() const {
   NodeAvailabilityCache& cache = *node_availability_cache_.get();
-  if (!cache.adjusted_hierarchy.hasValue()) {
+  if (!cache.adjusted_hierarchy.has_value()) {
     ld_check(cache.unavailable_nodes.empty());
     cache.adjusted_hierarchy.emplace(&hierarchy_);
   }
@@ -756,9 +760,12 @@ WeightedCopySetSelector::select(copyset_size_t extras,
     RATELIMIT_ERROR(
         std::chrono::seconds(10),
         2,
-        "Failed to select %d nodes for log %lu because too many nodes are "
-        "unavailable. Nodeset: %s. Unavailable nodes: %s",
+        "Failed to select %d %ss in %d %ss for log %lu because too many nodes "
+        "are unavailable. Nodeset: %s. Unavailable nodes: %s",
         (int)replication_,
+        NodeLocation::scopeNames()[replication_scope_].c_str(),
+        (int)secondary_replication_,
+        NodeLocation::scopeNames()[secondary_replication_scope_].c_str(),
         logid_.val_,
         toString(nodeset_indices_).c_str(),
         toString(cache.unavailable_nodes).c_str());
@@ -766,7 +773,7 @@ WeightedCopySetSelector::select(copyset_size_t extras,
   };
 
   bool pick_local_separately = false;
-  if (locality_enabled_ && my_domain_idx_.hasValue() &&
+  if (locality_enabled_ && my_domain_idx_.has_value() &&
       !cache.avoid_detaching_my_domain) {
     // If locality is enabled, we should maximize the probability that copyset
     // will have at least one copy from local domain, but we should still
@@ -1007,7 +1014,7 @@ void WeightedCopySetSelector::splitExistingCopySet(
                  need_new_domains);
       }
       size_t domain_idx = path[0];
-      if (my_domain_idx_.hasValue() && domain_idx == my_domain_idx_.value()) {
+      if (my_domain_idx_.has_value() && domain_idx == my_domain_idx_.value()) {
         ld_check(!have_local_copies);
         have_local_copies = true;
       } else {
@@ -1195,7 +1202,7 @@ WeightedCopySetSelector::augment(StoreChainLink inout_copyset[],
 
     // 1. Pick as many as allowed from my (local) domain.
     if (have_local_copies && replication_ - out_size > need_new_domains) {
-      ld_check(my_domain_idx_.hasValue());
+      ld_check(my_domain_idx_.has_value());
       out_size +=
           selectFlat(replication_ - out_size - need_new_domains,
                      hierarchy.getRoot().getSubdomain(my_domain_idx_.value()),

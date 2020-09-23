@@ -31,11 +31,11 @@ class ParametrizedLogsConfigIntegrationTest
 };
 
 TEST_P(ParametrizedLogsConfigIntegrationTest, ConnectionHandling) {
-  logsconfig::LogAttributes internal_log_attrs;
-  internal_log_attrs.set_singleWriter(false);
-  internal_log_attrs.set_replicationFactor(3);
-  internal_log_attrs.set_extraCopies(0);
-  internal_log_attrs.set_syncedCopies(0);
+  auto internal_log_attrs = logsconfig::LogAttributes()
+                                .with_singleWriter(false)
+                                .with_replicationFactor(3)
+                                .with_extraCopies(0)
+                                .with_syncedCopies(0);
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .enableLogsConfigManager()
                      .setConfigLogAttributes(internal_log_attrs)
@@ -46,8 +46,8 @@ TEST_P(ParametrizedLogsConfigIntegrationTest, ConnectionHandling) {
     settings->set("enable-initial-get-cluster-state", "false");
   }
   settings->set("on-demand-logs-config", "true");
-  std::shared_ptr<Client> client = cluster->createIndependentClient(
-      std::chrono::seconds(60), std::move(settings));
+  std::shared_ptr<Client> client =
+      cluster->createClient(std::chrono::seconds(60), std::move(settings));
   std::unique_ptr<client::Directory> dir = client->makeDirectorySync(
       "/my_logs", false, client::LogAttributes().with_replicationFactor(22));
   ASSERT_NE(nullptr, dir);
@@ -68,7 +68,7 @@ INSTANTIATE_TEST_CASE_P(ParametrizedLogsConfigIntegrationTest,
 
 TEST_F(LogsConfigIntegrationTest, NotSupported) {
   auto cluster = IntegrationTestUtils::ClusterFactory().create(2);
-  std::shared_ptr<Client> client = cluster->createIndependentClient();
+  std::shared_ptr<Client> client = cluster->createClient();
   auto dir =
       client->makeDirectorySync("/my_logs", false, client::LogAttributes());
   ASSERT_EQ(nullptr, dir);
@@ -79,7 +79,7 @@ TEST_F(LogsConfigIntegrationTest, MakeDirectory) {
   auto cluster =
       IntegrationTestUtils::ClusterFactory().enableLogsConfigManager().create(
           3);
-  std::shared_ptr<Client> client = cluster->createIndependentClient();
+  std::shared_ptr<Client> client = cluster->createClient();
   std::unique_ptr<client::Directory> dir = client->makeDirectorySync(
       "/my_logs", false, client::LogAttributes().with_replicationFactor(22));
 
@@ -105,7 +105,7 @@ TEST_F(LogsConfigIntegrationTest, MakeLogGroup) {
   auto cluster =
       IntegrationTestUtils::ClusterFactory().enableLogsConfigManager().create(
           3);
-  std::shared_ptr<Client> client = cluster->createIndependentClient();
+  std::shared_ptr<Client> client = cluster->createClient();
   std::unique_ptr<client::LogGroup> lg1 = client->makeLogGroupSync(
       "/log1",
       logid_range_t(logid_t(1), logid_t(100)),
@@ -149,7 +149,7 @@ TEST_F(LogsConfigIntegrationTest, Rename) {
   auto cluster =
       IntegrationTestUtils::ClusterFactory().enableLogsConfigManager().create(
           3);
-  std::shared_ptr<Client> client = cluster->createIndependentClient();
+  std::shared_ptr<Client> client = cluster->createClient();
   std::unique_ptr<client::Directory> dir = client->makeDirectorySync(
       "/my_logs", false, client::LogAttributes().with_replicationFactor(22));
   ASSERT_NE(nullptr, dir);
@@ -205,7 +205,7 @@ TEST_F(LogsConfigIntegrationTest, Remove) {
       IntegrationTestUtils::ClusterFactory().enableLogsConfigManager().create(
           3);
   uint64_t version;
-  std::shared_ptr<Client> client = cluster->createIndependentClient();
+  std::shared_ptr<Client> client = cluster->createClient();
   ASSERT_NE(nullptr,
             client->makeDirectorySync(
                 "/my_logs",
@@ -247,7 +247,7 @@ TEST_F(LogsConfigIntegrationTest, Defaults) {
   auto cluster =
       IntegrationTestUtils::ClusterFactory().enableLogsConfigManager().create(
           3);
-  std::shared_ptr<Client> client = cluster->createIndependentClient();
+  std::shared_ptr<Client> client = cluster->createClient();
   ASSERT_EQ(logsconfig::DefaultLogAttributes().maxWritesInFlight().value(),
             client->getDirectorySync("/")->attrs().maxWritesInFlight().value());
 
@@ -297,7 +297,7 @@ TEST_F(LogsConfigIntegrationTest, SetAttributes) {
   auto cluster =
       IntegrationTestUtils::ClusterFactory().enableLogsConfigManager().create(
           3);
-  std::shared_ptr<Client> client = cluster->createIndependentClient();
+  std::shared_ptr<Client> client = cluster->createClient();
   ASSERT_NE(nullptr,
             client->makeDirectorySync(
                 "/my_logs",
@@ -342,7 +342,7 @@ TEST_F(LogsConfigIntegrationTest, SetLogRange) {
   auto cluster =
       IntegrationTestUtils::ClusterFactory().enableLogsConfigManager().create(
           3);
-  std::shared_ptr<Client> client = cluster->createIndependentClient();
+  std::shared_ptr<Client> client = cluster->createClient();
   ASSERT_NE(nullptr,
             client->makeDirectorySync(
                 "/my_logs",
@@ -402,8 +402,8 @@ TEST_F(LogsConfigIntegrationTest, TooBigConfig) {
 
   std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
   client_settings->set("on-demand-logs-config", "false");
-  std::shared_ptr<Client> client = cluster->createIndependentClient(
-      DEFAULT_TEST_TIMEOUT, std::move(client_settings));
+  std::shared_ptr<Client> client =
+      cluster->createClient(DEFAULT_TEST_TIMEOUT, std::move(client_settings));
 
   uint64_t version = 0;
   for (int i = 0; i < num_logs; i++) {
@@ -439,8 +439,8 @@ TEST_F(LogsConfigIntegrationTest, ClientTest) {
           3);
   std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
   ASSERT_EQ(0, client_settings->set("enable-logsconfig-manager", true));
-  std::shared_ptr<Client> client = cluster->createIndependentClient(
-      DEFAULT_TEST_TIMEOUT, std::move(client_settings));
+  std::shared_ptr<Client> client =
+      cluster->createClient(DEFAULT_TEST_TIMEOUT, std::move(client_settings));
   ClientImpl* raw_client = static_cast<ClientImpl*>(client.get());
   auto updateable_config = raw_client->getConfig();
   auto local_config1 = updateable_config->getLocalLogsConfig();
@@ -466,8 +466,8 @@ TEST_F(LogsConfigIntegrationTest, notifyOnLogsConfigVersionTest) {
           3);
   std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
   ASSERT_EQ(0, client_settings->set("enable-logsconfig-manager", true));
-  std::shared_ptr<Client> client = cluster->createIndependentClient(
-      DEFAULT_TEST_TIMEOUT, std::move(client_settings));
+  std::shared_ptr<Client> client =
+      cluster->createClient(DEFAULT_TEST_TIMEOUT, std::move(client_settings));
   ClientImpl* raw_client = static_cast<ClientImpl*>(client.get());
   auto updateable_config = raw_client->getConfig();
   // give it a couple of seconds to recover
@@ -486,7 +486,8 @@ TEST_F(LogsConfigIntegrationTest, notifyOnLogsConfigVersionTest) {
 
 TEST_F(LogsConfigIntegrationTest, TextConfigUpdaterIsDisabled) {
   auto config = Configuration::fromJsonFile(
-      TEST_CONFIG_FILE("logsconfig_manager_with_logs.conf"));
+                    TEST_CONFIG_FILE("logsconfig_manager_with_logs.conf"))
+                    ->withNodesConfiguration(createSimpleNodesConfig(4));
   ASSERT_NE(nullptr, config);
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .enableLogsConfigManager()
@@ -499,8 +500,8 @@ TEST_F(LogsConfigIntegrationTest, TextConfigUpdaterIsDisabled) {
   cluster->start();
 
   std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
-  std::shared_ptr<Client> client = cluster->createIndependentClient(
-      DEFAULT_TEST_TIMEOUT, std::move(client_settings));
+  std::shared_ptr<Client> client =
+      cluster->createClient(DEFAULT_TEST_TIMEOUT, std::move(client_settings));
   auto root1 = client->getDirectorySync("/");
   ASSERT_NE(nullptr, root1);
   ASSERT_EQ(0, root1->logs().size());
@@ -561,7 +562,7 @@ TEST_F(LogsConfigIntegrationTest, GetByIDForInternalLogs) {
   auto cluster =
       IntegrationTestUtils::ClusterFactory().enableLogsConfigManager().create(
           3);
-  std::shared_ptr<Client> client = cluster->createIndependentClient();
+  std::shared_ptr<Client> client = cluster->createClient();
 
   ASSERT_EQ(
       nullptr, client->getLogGroupByIdSync(logid_t(9223372036854775809ul)));
@@ -601,7 +602,8 @@ TEST_F(LogsConfigIntegrationTest, LogsConfigAPIMetadataLogs) {
 
 TEST_F(LogsConfigIntegrationTest, ConfigManagerFromServerSettings) {
   auto config = Configuration::fromJsonFile(
-      TEST_CONFIG_FILE("logsconfig_manager_with_logs.conf"));
+                    TEST_CONFIG_FILE("logsconfig_manager_with_logs.conf"))
+                    ->withNodesConfiguration(createSimpleNodesConfig(4));
   ASSERT_NE(nullptr, config);
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .setParam("--file-config-update-interval", "10ms")
@@ -613,8 +615,8 @@ TEST_F(LogsConfigIntegrationTest, ConfigManagerFromServerSettings) {
 
   std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
   client_settings->set("on-demand-logs-config", "true");
-  std::shared_ptr<Client> client = cluster->createIndependentClient(
-      DEFAULT_TEST_TIMEOUT, std::move(client_settings));
+  std::shared_ptr<Client> client =
+      cluster->createClient(DEFAULT_TEST_TIMEOUT, std::move(client_settings));
   ASSERT_NE(nullptr, client);
   auto root1 = client->getDirectorySync("/");
   ASSERT_NE(nullptr, root1);
@@ -623,7 +625,8 @@ TEST_F(LogsConfigIntegrationTest, ConfigManagerFromServerSettings) {
 
 TEST_F(LogsConfigIntegrationTest, StartServerWithNoLogsSection) {
   auto config = Configuration::fromJsonFile(
-      TEST_CONFIG_FILE("logsconfig_manager_without_logs.conf"));
+                    TEST_CONFIG_FILE("logsconfig_manager_without_logs.conf"))
+                    ->withNodesConfiguration(createSimpleNodesConfig(4));
   ASSERT_NE(nullptr, config);
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .setParam("--file-config-update-interval", "10ms")
@@ -635,8 +638,8 @@ TEST_F(LogsConfigIntegrationTest, StartServerWithNoLogsSection) {
 
   std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
   client_settings->set("on-demand-logs-config", "true");
-  std::shared_ptr<Client> client = cluster->createIndependentClient(
-      DEFAULT_TEST_TIMEOUT, std::move(client_settings));
+  std::shared_ptr<Client> client =
+      cluster->createClient(DEFAULT_TEST_TIMEOUT, std::move(client_settings));
   auto dir =
       client->makeDirectorySync("/my_logs", false, client::LogAttributes());
   ASSERT_NE(nullptr, dir);
@@ -648,7 +651,8 @@ TEST_F(LogsConfigIntegrationTest, StartServerWithNoLogsSection) {
 
 TEST_F(LogsConfigIntegrationTest, StartClientWithNoLogsSection) {
   auto config = Configuration::fromJsonFile(
-      TEST_CONFIG_FILE("logsconfig_manager_without_logs.conf"));
+                    TEST_CONFIG_FILE("logsconfig_manager_without_logs.conf"))
+                    ->withNodesConfiguration(createSimpleNodesConfig(4));
   ASSERT_NE(nullptr, config);
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .setParam("--file-config-update-interval", "10ms")
@@ -660,8 +664,8 @@ TEST_F(LogsConfigIntegrationTest, StartClientWithNoLogsSection) {
   cluster->start();
 
   std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
-  std::shared_ptr<Client> client = cluster->createIndependentClient(
-      DEFAULT_TEST_TIMEOUT, std::move(client_settings));
+  std::shared_ptr<Client> client =
+      cluster->createClient(DEFAULT_TEST_TIMEOUT, std::move(client_settings));
   auto dir =
       client->makeDirectorySync("/my_logs", false, client::LogAttributes());
   ASSERT_NE(nullptr, dir);
@@ -680,7 +684,8 @@ TEST_F(LogsConfigIntegrationTest, StartClientWithNoLogsSection) {
 
 TEST_F(LogsConfigIntegrationTest, StartWithNoLogsSectionCLI) {
   auto config = Configuration::fromJsonFile(
-      TEST_CONFIG_FILE("logsconfig_manager_without_logs.conf"));
+                    TEST_CONFIG_FILE("logsconfig_manager_without_logs.conf"))
+                    ->withNodesConfiguration(createSimpleNodesConfig(4));
   ASSERT_NE(nullptr, config);
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .setParam("--file-config-update-interval", "10ms")
@@ -693,8 +698,8 @@ TEST_F(LogsConfigIntegrationTest, StartWithNoLogsSectionCLI) {
 
   std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
   client_settings->set("on-demand-logs-config", "true");
-  std::shared_ptr<Client> client = cluster->createIndependentClient(
-      DEFAULT_TEST_TIMEOUT, std::move(client_settings));
+  std::shared_ptr<Client> client =
+      cluster->createClient(DEFAULT_TEST_TIMEOUT, std::move(client_settings));
   auto dir =
       client->makeDirectorySync("/my_logs", false, client::LogAttributes());
   ASSERT_NE(nullptr, dir);
@@ -706,7 +711,8 @@ TEST_F(LogsConfigIntegrationTest, StartWithNoLogsSectionCLI) {
 
 TEST_F(LogsConfigIntegrationTest, RemoveLogsSection) {
   auto config = Configuration::fromJsonFile(
-      TEST_CONFIG_FILE("logsconfig_manager_with_logs.conf"));
+                    TEST_CONFIG_FILE("logsconfig_manager_with_logs.conf"))
+                    ->withNodesConfiguration(createSimpleNodesConfig(4));
   ASSERT_NE(nullptr, config);
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .enableLogsConfigManager()
@@ -719,8 +725,8 @@ TEST_F(LogsConfigIntegrationTest, RemoveLogsSection) {
 
   std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
   client_settings->set("on-demand-logs-config", "false");
-  std::shared_ptr<Client> client = cluster->createIndependentClient(
-      DEFAULT_TEST_TIMEOUT, std::move(client_settings));
+  std::shared_ptr<Client> client =
+      cluster->createClient(DEFAULT_TEST_TIMEOUT, std::move(client_settings));
   auto root1 = client->getDirectorySync("/");
   ASSERT_NE(nullptr, root1);
   ASSERT_EQ(1, root1->version());
@@ -785,7 +791,7 @@ TEST_F(LogsConfigIntegrationTest, LogGroupById) {
   auto cluster =
       IntegrationTestUtils::ClusterFactory().enableLogsConfigManager().create(
           3);
-  std::shared_ptr<Client> client = cluster->createIndependentClient();
+  std::shared_ptr<Client> client = cluster->createClient();
 
   LogAttributes::ExtrasMap extras;
   extras["testing_something"] = "1234";
@@ -851,7 +857,7 @@ TEST_F(LogsConfigIntegrationTest, SetAttributesLogGroupClash) {
                      .enableLogsConfigManager()
                      .create(node_count);
 
-  cluster->waitForRecovery();
+  cluster->waitUntilAllSequencersQuiescent();
 
   for (int node_index = 0; node_index < node_count; ++node_index) {
     IntegrationTestUtils::Node& node = cluster->getNode(node_index);
@@ -892,8 +898,8 @@ TEST_F(LogsConfigIntegrationTest, DisableEnableWorkflow) {
 
   std::unique_ptr<ClientSettings> client_settings(ClientSettings::create());
   client_settings->set("on-demand-logs-config", "false");
-  std::shared_ptr<Client> client = cluster->createIndependentClient(
-      DEFAULT_TEST_TIMEOUT, std::move(client_settings));
+  std::shared_ptr<Client> client =
+      cluster->createClient(DEFAULT_TEST_TIMEOUT, std::move(client_settings));
   ASSERT_NE(nullptr, client->makeDirectorySync("/my_logs1"));
 
   auto update_lcm_config = [&](bool value) {

@@ -16,6 +16,11 @@
 // when the client object is created.
 STAT_DEFINE(client_started, MAX)
 
+// Count the number of clients failing to initialize for whatever reason
+// e.g. failing to fetch the nodes configuration, failing to materialize
+// the logs config etc. Bumped when ClientFactory::create() returns a nullptr.
+STAT_DEFINE(client_init_failed, SUM)
+
 // Appends that came back with different common statuses.  These are
 // client-level statuses (which we pass to the client-provided callback), not
 // internal error codes that we pass over the wire in APPENDED messages.
@@ -85,7 +90,6 @@ STAT_DEFINE(logsconfig_start_timeout, SUM)
 STAT_DEFINE(shadow_client_init_failed, SUM)
 STAT_DEFINE(shadow_client_init_retry_failed, SUM)
 STAT_DEFINE(shadow_client_init_retry_success, SUM)
-STAT_DEFINE(shadow_payload_alloc_failed, SUM)
 STAT_DEFINE(shadow_append_attempt, SUM)
 STAT_DEFINE(shadow_append_success, SUM)
 STAT_DEFINE(shadow_append_failed, SUM)
@@ -102,6 +106,7 @@ STAT_DEFINE(findtime_PARTIAL, SUM)
 STAT_DEFINE(findtime_FAILED, SUM)
 STAT_DEFINE(findtime_SHUTDOWN, SUM)
 STAT_DEFINE(findtime_OTHER, SUM)
+STAT_DEFINE(findtime_NOTFOUND, SUM)
 //findkey
 STAT_DEFINE(findkey_OK, SUM)
 STAT_DEFINE(findkey_TIMEDOUT, SUM)
@@ -111,6 +116,7 @@ STAT_DEFINE(findkey_PARTIAL, SUM)
 STAT_DEFINE(findkey_FAILED, SUM)
 STAT_DEFINE(findkey_SHUTDOWN, SUM)
 STAT_DEFINE(findkey_OTHER, SUM)
+STAT_DEFINE(findkey_NOTFOUND, SUM)
 //get_tail_attributes
 STAT_DEFINE(get_tail_attributes_OK, SUM)
 STAT_DEFINE(get_tail_attributes_TIMEDOUT, SUM)
@@ -122,6 +128,7 @@ STAT_DEFINE(get_tail_attributes_SHUTDOWN, SUM)
 STAT_DEFINE(get_tail_attributes_INTERNAL, SUM)
 STAT_DEFINE(get_tail_attributes_AGAIN, SUM)
 STAT_DEFINE(get_tail_attributes_OTHER, SUM)
+STAT_DEFINE(get_tail_attributes_NOTFOUND, SUM)
 //get_head_attributes
 STAT_DEFINE(get_head_attributes_OK, SUM)
 STAT_DEFINE(get_head_attributes_TIMEDOUT, SUM)
@@ -130,6 +137,7 @@ STAT_DEFINE(get_head_attributes_INVALID_PARAM, SUM)
 STAT_DEFINE(get_head_attributes_SHUTDOWN, SUM)
 STAT_DEFINE(get_head_attributes_FAILED, SUM)
 STAT_DEFINE(get_head_attributes_OTHER, SUM)
+STAT_DEFINE(get_head_attributes_NOTFOUND, SUM)
 //get_tail_lsn
 STAT_DEFINE(get_tail_lsn_OK, SUM)
 STAT_DEFINE(get_tail_lsn_TIMEDOUT, SUM)
@@ -140,6 +148,8 @@ STAT_DEFINE(get_tail_lsn_NOBUFS, SUM)
 STAT_DEFINE(get_tail_lsn_SHUTDOWN, SUM)
 STAT_DEFINE(get_tail_lsn_INTERNAL, SUM)
 STAT_DEFINE(get_tail_lsn_OTHER, SUM)
+STAT_DEFINE(get_tail_lsn_NOTFOUND, SUM)
+
 //is_log_empty
 STAT_DEFINE(is_log_empty_OK, SUM)
 STAT_DEFINE(is_log_empty_TIMEDOUT, SUM)
@@ -166,6 +176,8 @@ STAT_DEFINE(data_size_NOBUFS, SUM)
 STAT_DEFINE(data_size_SHUTDOWN, SUM)
 STAT_DEFINE(data_size_INTERNAL, SUM)
 STAT_DEFINE(data_size_OTHER, SUM)
+STAT_DEFINE(data_size_NOTFOUND, SUM)
+
 //trim
 STAT_DEFINE(trim_OK, SUM)
 STAT_DEFINE(trim_TIMEDOUT, SUM)
@@ -192,4 +204,18 @@ STAT_DEFINE(metadata_api_total, SUM)
 STAT_DEFINE(append_requests, SUM)
 STAT_DEFINE(unexpected_append_failures, SUM)
 
+// Latency
+STAT_DEFINE(append_requests_over_2ms, SUM)
+STAT_DEFINE(append_requests_over_4ms, SUM)
+STAT_DEFINE(append_requests_over_8ms, SUM)
+STAT_DEFINE(append_requests_over_16ms, SUM)
+STAT_DEFINE(append_requests_over_32ms, SUM)
+STAT_DEFINE(append_requests_over_64ms, SUM)
+STAT_DEFINE(append_requests_over_128ms, SUM)
+STAT_DEFINE(append_requests_over_256ms, SUM)
+STAT_DEFINE(append_requests_over_512ms, SUM)
+STAT_DEFINE(append_requests_over_1024ms, SUM)
+STAT_DEFINE(append_requests_over_2048ms, SUM)
+STAT_DEFINE(append_requests_over_4096ms, SUM)
+STAT_DEFINE(append_requests_over_8192ms, SUM)
 #undef STAT_DEFINE

@@ -10,7 +10,6 @@
 
 #include "logdevice/common/ConfigurationFetchRequest.h"
 #include "logdevice/common/Processor.h"
-#include "logdevice/common/RandomNodeSelector.h"
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/configuration/nodes/NodesConfigurationCodec.h"
 #include "logdevice/common/stats/Stats.h"
@@ -22,12 +21,14 @@ NodesConfigurationPoller::NodesConfigurationPoller(
     Poller::Options options,
     VersionExtFn version_fn,
     Callback cb,
+    folly::Optional<u_int32_t> node_order_seed,
     folly::Optional<Version> conditional_base_version)
     : options_(std::move(options)),
       version_fn_(std::move(version_fn)),
       cb_(std::move(cb)),
       conditional_base_version_(std::move(conditional_base_version)),
-      callback_helper_(this) {
+      callback_helper_(this),
+      node_order_seed_(node_order_seed) {
   ld_check(version_fn_ != nullptr);
   ld_check(cb_ != nullptr);
 }
@@ -47,6 +48,38 @@ void NodesConfigurationPoller::stop() {
   }
 }
 
+RandomNodeSelector::NodeSourceSet
+NodesConfigurationPoller::buildPollingSet(const NodeSourceSet& candidates,
+                                          const NodeSourceSet& existing,
+                                          const NodeSourceSet& blacklist,
+                                          const NodeSourceSet& graylist,
+                                          size_t num_required,
+                                          size_t num_extras) {
+  // We can't use cluster state in bootstrapping processor because our address
+  // to NodeID mapping can be different from the actual one. So for
+  // example, Cluster state's N5, can be different from bootstrapping
+  // processor's N5.
+  ClusterState* cluster_state{nullptr};
+  if (!isBootstrapping()) {
+    cluster_state = getClusterState();
+  }
+
+  // If the cluster state contains no alive nodes, don't use it as a filter
+  // and let RandomNodeSelector pick any node.
+  if (cluster_state != nullptr && !cluster_state->isAnyNodeAlive()) {
+    cluster_state = nullptr;
+  }
+
+  return RandomNodeSelector::select(candidates,
+                                    existing,
+                                    blacklist,
+                                    graylist,
+                                    num_required,
+                                    num_extras,
+                                    node_order_seed_,
+                                    cluster_state);
+}
+
 std::unique_ptr<NodesConfigurationPoller::Poller>
 NodesConfigurationPoller::createPoller() {
   auto selection_fn = [this](const NodeSourceSet& candidates,
@@ -55,13 +88,8 @@ NodesConfigurationPoller::createPoller() {
                              const NodeSourceSet& graylist,
                              size_t num_required,
                              size_t num_extras) {
-    return RandomNodeSelector::select(candidates,
-                                      existing,
-                                      blacklist,
-                                      graylist,
-                                      num_required,
-                                      num_extras,
-                                      getClusterState());
+    return buildPollingSet(
+        candidates, existing, blacklist, graylist, num_required, num_extras);
   };
 
   auto req_fn = [this](Poller::RoundID round, node_index_t node) {
@@ -124,7 +152,7 @@ NodesConfigurationPoller::aggregateConfiguration(const std::string* config,
 
   if (config == nullptr) {
     const auto version = version_fn_(response.config_str);
-    if (!version.hasValue()) {
+    if (!version.has_value()) {
       RATELIMIT_ERROR(std::chrono::seconds(10),
                       10,
                       "Got a success reply for NodesConfiguration polling but "
@@ -139,8 +167,8 @@ NodesConfigurationPoller::aggregateConfiguration(const std::string* config,
   const auto response_version = version_fn_(response.config_str);
   // version_fn_ should be deterministic and existing config was picked by the
   // same function eariler
-  ld_check(existing_version.hasValue());
-  if (!response_version.hasValue() ||
+  ld_check(existing_version.has_value());
+  if (!response_version.has_value() ||
       response_version.value() < existing_version.value()) {
     // existing version is newer, no-op
     return folly::none;
@@ -190,7 +218,7 @@ NodesConfigurationPoller::getConditionalPollVersion() const {
     return folly::none;
   }
 
-  if (conditional_base_version_.hasValue()) {
+  if (conditional_base_version_.has_value()) {
     // if conditional_base_version_ is set, use the given
     // conditional_base_version_
     return conditional_base_version_.value();
@@ -209,18 +237,9 @@ ClusterState* NodesConfigurationPoller::getClusterState() {
 
 std::shared_ptr<const configuration::nodes::NodesConfiguration>
 NodesConfigurationPoller::getNodesConfiguration() const {
-  if (isBootstrapping()) {
-    // for bootstrapping environment, currently only server config
-    // based NC is available
-    // TODO T44484704: use NC for seed hosts in NodesConfigurationInit
-    // bootstrapping
-    return Worker::onThisThread()
-        ->getNodesConfigurationFromServerConfigSource();
-  }
-
-  // Otherwise, NodesConfigurationPoller is used by NCM so it must use
+  // NodesConfigurationPoller is used by NCM so it must use
   // NCM based NC for conditional polling
-  return Worker::onThisThread()->getNodesConfigurationFromNCMSource();
+  return Worker::onThisThread()->getNodesConfiguration();
 }
 
 folly::Optional<node_index_t> NodesConfigurationPoller::getMyNodeID() const {
@@ -241,7 +260,8 @@ NodesConfigurationPoller::sendRequestToNode(Poller::RoundID round,
   const auto& nodes_configuration = getNodesConfiguration();
   NodeID nid = nodes_configuration->getNodeID(node);
 
-  auto ticket = callback_helper_.ticket();
+  auto ticket = callback_helper_.ticket(
+      RequestType::NODES_CONFIGURATION_MANAGER, folly::Executor::HI_PRI);
   auto cb_wrapper = [ticket, round, node](Status status,
                                           CONFIG_CHANGED_Header /* header */,
                                           std::string config) {
@@ -255,17 +275,25 @@ NodesConfigurationPoller::sendRequestToNode(Poller::RoundID round,
 
   folly::Optional<uint64_t> conditional_poll_version_msg;
   auto conditional_poll_version = getConditionalPollVersion();
-  if (conditional_poll_version.hasValue()) {
+  if (conditional_poll_version.has_value()) {
     conditional_poll_version_msg.assign(conditional_poll_version.value().val());
   }
+
+  // it doesn't matter where ConfigurationFetchRequest will be executed
+  // as we always route the callback back to the poller context. However,
+  // due to the current connection and worker thread model,
+  // we have to ping the request to a particular worker to reduce
+  // the number of connections.
+  // TODO: remove the thread pinning once the new threading model lands
+  ld_check(Worker::settings().num_workers > 0);
+  worker_id_t polling_worker_id =
+      worker_id_t(Worker::settings().num_workers - 1);
 
   std::unique_ptr<Request> rq = std::make_unique<ConfigurationFetchRequest>(
       nid,
       ConfigurationFetchRequest::ConfigType::NODES_CONFIGURATION,
       std::move(cb_wrapper),
-      // it doesn't matter where ConfigurationFetchRequest will be executed
-      // as we always route the callback back to the poller context
-      WORKER_ID_INVALID,
+      polling_worker_id,
       // use the full round timeout as the RPC request timeout
       options_.round_timeout,
       conditional_poll_version_msg);
@@ -291,7 +319,7 @@ NodesConfigurationPoller::candidatesFromNodesConfiguration(
   for (const auto kv : *serv_disc) {
     result.insert(kv.first);
   }
-  if (my_node_id.hasValue()) {
+  if (my_node_id.has_value()) {
     result.erase(my_node_id.value());
   }
   return result;

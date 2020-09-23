@@ -18,7 +18,6 @@
 #include "logdevice/common/debug.h"
 #include "logdevice/lib/ClientImpl.h"
 
-using facebook::logdevice::ClientImpl;
 using folly::SocketAddress;
 using std::chrono::steady_clock;
 
@@ -48,7 +47,7 @@ bool AdminCommandTable::allowServerSideFiltering() const {
 AdminCommandTable::MatchResult
 AdminCommandTable::nodeMatchesConstraint(node_index_t nid,
                                          const Constraint& c) {
-  if (!c.expr.hasValue()) {
+  if (!c.expr.has_value()) {
     return MatchResult::UNUSED;
   }
   std::string expr = c.expr.value();
@@ -179,44 +178,19 @@ void AdminCommandTable::setCacheTTL(std::chrono::seconds ttl) {
   cache_ttl_ = ttl;
 }
 
-/*
- * Currently there is no easy way to figure out in which address each node is
- * listening for admin commands in a LogDevice cluster. Right now this is not an
- * issue because our clusters are set up so that each node listens to port 5440,
- * but this will be an issue when we start using different port. We will
- * probably need to add the port in the config of the cluster as well as SMC.
- */
-std::tuple<SocketAddress, AdminCommandClient::ConnectionType>
-AdminCommandTable::getAddrForNode(
+folly::Optional<SocketAddress> AdminCommandTable::getAddrForNode(
     node_index_t nid,
     const std::shared_ptr<const configuration::nodes::NodesConfiguration>&
         nodes_configuration) {
-  auto ld_client = ld_ctx_->getClient();
-  ld_check(ld_client);
-
   const auto* node_sd = nodes_configuration->getNodeServiceDiscovery(nid);
   ld_check(node_sd);
-
-  if (node_sd->address.isUnixAddress()) {
-    // The node is running locally and using a named socket. Expect another
-    // named socket named "socket_command" to exist in the same directory.
-    std::string path = node_sd->address.getPath();
-    path = path.substr(0, path.find_last_of("/\\")) + "/socket_command";
-    SocketAddress addr;
-    addr.setFromPath(path);
-    return std::make_tuple(addr, AdminCommandClient::ConnectionType::PLAIN);
+  // This assumes that we have an admin address for the node which is not really
+  // required in the config. In the case where we don't have the address in the
+  // config we should fail.
+  if (node_sd->admin_address) {
+    return node_sd->admin_address.value().getSocketAddress();
   } else {
-    // The node is using a TCP address. Use the same address but with port 5440
-    // to send admin commands.
-    // TODO: extract admin port from config
-    auto addr = node_sd->address.getSocketAddress();
-    addr.setPort(5440);
-    // Is encryption needed?
-    auto conntype = AdminCommandClient::ConnectionType::PLAIN;
-    if (ld_ctx_->use_ssl) {
-      conntype = AdminCommandClient::ConnectionType::ENCRYPTED;
-    }
-    return std::make_tuple(addr, conntype);
+    return folly::none;
   }
 }
 
@@ -287,13 +261,21 @@ void AdminCommandTable::refillCache(QueryContext& ctx) {
   for (node_index_t i : selected_nodes) {
     ld_check(nodes_configuration->isNodeInServiceDiscoveryConfig(i));
 
-    AdminCommandClient::ConnectionType conntype =
-        AdminCommandClient::ConnectionType::UNKNOWN;
-    SocketAddress addr;
-    std::tie(addr, conntype) = getAddrForNode(i, nodes_configuration);
-    addr_to_node_id[addr] = i;
-    requests.emplace_back(addr, cmd, conntype);
-    ld_ctx_->activeQueryMetadata.contacted_nodes++;
+    auto opt_addr = getAddrForNode(i, nodes_configuration);
+    if (opt_addr) {
+      addr_to_node_id[opt_addr.value()] = i;
+      auto conn_type = ld_ctx_->use_ssl
+          ? AdminCommandClient::Request::ConnectionType::SSL
+          : AdminCommandClient::Request::ConnectionType::PLAIN;
+      requests.emplace_back(opt_addr.value(), cmd, conn_type);
+      ld_ctx_->activeQueryMetadata.contacted_nodes++;
+    } else {
+      ld_warning("N%d does not have admin_address configured, cannot post the "
+                 "ldquery request.",
+                 i);
+      ld_ctx_->activeQueryMetadata.failures[i] =
+          FailedNodeDetails{"", "UNKNOWN_ADMIN_ADDRESS"};
+    }
   }
 
   ld_info("Sending '%s' admin command to %lu nodes...",
@@ -400,7 +382,7 @@ void AdminCommandTable::buildIndexForConstraint(Data& data,
     for (size_t i = 0; i < col_vec.size(); ++i) {
       const ColumnValue& v = col_vec[i];
       // We don't fill the index with null values.
-      if (v.hasValue()) {
+      if (v.has_value()) {
         data.indices[col][v.value()].push_back(i);
       }
     }
@@ -423,14 +405,14 @@ std::shared_ptr<TableData> AdminCommandTable::getData(QueryContext& ctx) {
 
   // Then, check if we can serve the data from an index.
   auto c = findIndexableConstraint(ctx);
-  if (!c.hasValue()) {
+  if (!c.has_value()) {
     // If we are here, we could not fetch data from an index. Return everything
     // we have, SQLite will filter it.
     return cached.data;
   }
 
   auto& expr = c.value().second->expr;
-  if (!expr.hasValue()) {
+  if (!expr.has_value()) {
     // TODO(#7646110): if the constraint compares a column with "null", we do
     // not check the index because the index currently does not support indexing
     // null values.

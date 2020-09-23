@@ -80,7 +80,7 @@ void GET_SEQ_STATE_Message::serialize(ProtocolWriter& writer) const {
   writer.write(calling_ctx_);
 
   if (flags_ & GET_SEQ_STATE_Message::MIN_EPOCH) {
-    ld_check(min_epoch_.hasValue());
+    ld_check(min_epoch_.has_value());
     writer.write(min_epoch_.value());
   }
 }
@@ -181,6 +181,9 @@ GET_SEQ_STATE_Message::checkSeals(Address src, std::shared_ptr<Sequencer> seq) {
     return Disposition::NORMAL;
   }
 
+  // CheckSealRequest will call either
+  // GET_SEQ_STATE_Message::continueExecution() or
+  // GET_SEQ_STATE_Message::sendReply() when done.
   auto rq = std::make_unique<CheckSealRequest>(
       std::unique_ptr<GET_SEQ_STATE_Message>(this),
       src,
@@ -211,7 +214,7 @@ GET_SEQ_STATE_Message::getSequencer(logid_t datalog_id,
     // 1) sequencer does not have a valid epoch; OR
     // 2) current epoch is less than min_epoch_
     return seq.getState() == Sequencer::State::UNAVAILABLE ||
-        (min_epoch_.hasValue() && seq.getCurrentEpoch() < min_epoch_.value());
+        (min_epoch_.has_value() && seq.getCurrentEpoch() < min_epoch_.value());
   };
 
   epoch_t cur_epoch =
@@ -232,8 +235,9 @@ GET_SEQ_STATE_Message::getSequencer(logid_t datalog_id,
         cur_epoch.val_,
         request_id_.val(),
         getContextString(calling_ctx_).c_str(),
-        min_epoch_.hasValue() ? std::to_string(min_epoch_.value().val()).c_str()
-                              : "none",
+        min_epoch_.has_value()
+            ? std::to_string(min_epoch_.value().val()).c_str()
+            : "none",
         Sender::describeConnection(from).c_str());
 
     if (!sequencer_out) {
@@ -440,6 +444,17 @@ Message::Disposition GET_SEQ_STATE_Message::onReceived(Address const& from) {
   return Disposition::KEEP;
 }
 
+bool GET_SEQ_STATE_Message::shouldPerformCheckSeals() const {
+  auto w = Worker::onThisThread();
+  auto failure_detector_running = w->processor_->isFailureDetectorRunning();
+
+  bool skip_check_seal_flag_is_set =
+      (flags_ & SKIP_REMOTE_PREEMPTION_CHECK) != 0;
+
+  return failure_detector_running && !Worker::settings().disable_check_seals &&
+      !skip_check_seal_flag_is_set;
+}
+
 void GET_SEQ_STATE_Message::onSequencerNodeFound(Status status,
                                                  logid_t datalog_id,
                                                  NodeID redirect,
@@ -461,9 +476,8 @@ void GET_SEQ_STATE_Message::onSequencerNodeFound(Status status,
     return;
   }
 
-  auto w = Worker::onThisThread();
-  auto failure_detector_running = w->processor_->isFailureDetectorRunning();
-  if (failure_detector_running && !Worker::settings().disable_check_seals) {
+  if (shouldPerformCheckSeals()) {
+    auto w = Worker::onThisThread();
     auto& seqmap = w->processor_->allSequencers();
     std::shared_ptr<Sequencer> sequencer = nullptr;
     sequencer = seqmap.findSequencer(datalog_id);
@@ -481,14 +495,14 @@ void GET_SEQ_STATE_Message::onSequencerNodeFound(Status status,
                 std::chrono::seconds(10),
                 5,
                 "Sequencer for log:%lu is in PREEMPTED state and cur_epoch is "
-                "INVALID, this means that the sequencer failed  epoch store "
+                "INVALID, this means that the sequencer failed epoch store "
                 "conditional update during first time activation. "
                 "(st:%s, preempted_by: %s)",
                 datalog_id.val_,
-                error_description(st),
+                error_name(st),
                 preempted_by.toString().c_str());
-            sendReply(from, reply_hdr, st, preempted_by);
-            return;
+            // Go to continueExecution(), which will handle the preemption.
+            break;
           }
 
           // In all other cases, we still perform check seals since the
@@ -792,11 +806,13 @@ bool GET_SEQ_STATE_Message::shouldRedirectOrFail(logid_t datalog_id,
   }
 
   if (status_out != E::OK) {
-    RATELIMIT_WARNING(std::chrono::seconds(5),
-                      5,
-                      "No sequencer node found for log:%lu, replying with "
-                      "E::NOSEQUENCER.",
-                      datalog_id.val_);
+    RATELIMIT_WARNING(
+        std::chrono::seconds(5),
+        5,
+        "No sequencer node found for log:%lu (status=%s), replying with "
+        "E::NOSEQUENCER.",
+        datalog_id.val_,
+        error_name(status_out));
     status_out = E::NOSEQUENCER;
     return true;
   }
@@ -903,10 +919,10 @@ void GET_SEQ_STATE_Message::sendReply(
   msg->request_id_ = request_id_;
   msg->status_ = status;
   msg->redirect_ = redirect;
-  if (tail_attributes.hasValue()) {
+  if (tail_attributes.has_value()) {
     msg->tail_attributes_ = tail_attributes.value();
   }
-  if (epoch_offsets.hasValue()) {
+  if (epoch_offsets.has_value()) {
     msg->epoch_offsets_ = std::move(epoch_offsets.value());
   }
   if (metadata_map) {
@@ -915,7 +931,7 @@ void GET_SEQ_STATE_Message::sendReply(
   if (tail_record) {
     msg->tail_record_ = std::move(tail_record);
   }
-  if (is_log_empty.hasValue()) {
+  if (is_log_empty.has_value()) {
     msg->is_log_empty_ = is_log_empty.value();
   }
 
@@ -984,7 +1000,7 @@ GET_SEQ_STATE_Message::getDebugInfo() const {
   add("rqid", request_id_.val());
   add("flags", flagsToString(flags_));
   add("calling_ctx", getContextString(calling_ctx_));
-  if (min_epoch_.hasValue()) {
+  if (min_epoch_.has_value()) {
     add("min_epoch", min_epoch_.value().val());
   }
   return res;

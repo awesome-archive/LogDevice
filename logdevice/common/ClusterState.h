@@ -14,10 +14,14 @@
 #include <memory>
 #include <numeric>
 #include <set>
+#include <utility>
 #include <vector>
 
+#include <folly/Optional.h>
 #include <folly/SharedMutex.h>
+#include <folly/container/F14Map.h>
 
+#include "logdevice/common/NodeHealthStatus.h"
 #include "logdevice/common/NodeID.h"
 #include "logdevice/common/UpdateableSharedPtr.h"
 #include "logdevice/common/configuration/Configuration.h"
@@ -41,6 +45,8 @@ enum ClusterStateNodeState : uint8_t {
   DEAD = 1,
   FAILING_OVER = 2,
   STARTING = 3,
+  // We don't know the state yet.
+  UNKNOWN = 99,
 };
 /* Type of callbacks used for node state changes subscriptions */
 struct ClusterStateSubscriptionList {
@@ -77,6 +83,8 @@ class ClusterState {
         return "FAILING_OVER";
       case STARTING:
         return "STARTING";
+      case UNKNOWN:
+        return "UNKNOWN";
     }
     return "UNKNOWN";
   }
@@ -97,46 +105,114 @@ class ClusterState {
     return nodes_in_config_.count(idx) > 0;
   }
 
+  // defaultState is used if the stat of the node is UNKNOWN.
   static inline bool isAliveState(NodeState state) {
     return state == NodeState::FULLY_STARTED || state == NodeState::STARTING;
   }
 
-  bool isNodeAlive(node_index_t idx) const {
-    return isAliveState(getNodeState(idx));
+  bool isAnyNodeAlive() const;
+
+  // defaultState is used if the stat of the node is UNKNOWN.
+  bool isNodeAlive(node_index_t idx,
+                   NodeState defaultState = NodeState::FULLY_STARTED) const {
+    return isAliveState(getNodeState(idx, defaultState));
   }
 
-  bool isNodeFullyStarted(node_index_t idx) const {
-    return getNodeState(idx) == NodeState::FULLY_STARTED;
+  // defaultState is used if the stat of the node is UNKNOWN.
+  bool
+  isNodeFullyStarted(node_index_t idx,
+                     NodeState defaultState = NodeState::FULLY_STARTED) const {
+    return getNodeState(idx, defaultState) == NodeState::FULLY_STARTED;
   }
 
-  bool isNodeStarting(node_index_t idx) const {
-    return getNodeState(idx) == NodeState::STARTING;
+  // defaultState is used if the stat of the node is UNKNOWN.
+  bool isNodeStarting(node_index_t idx,
+                      NodeState defaultState = NodeState::FULLY_STARTED) const {
+    return getNodeState(idx, defaultState) == NodeState::STARTING;
   }
 
-  NodeState getNodeState(node_index_t idx) const {
+  bool isNodeOverloaded(node_index_t idx) const {
+    return getNodeStatus(idx) == NodeHealthStatus::OVERLOADED;
+  }
+
+  bool isNodeUnhealthy(node_index_t idx) const {
+    return getNodeStatus(idx) == NodeHealthStatus::UNHEALTHY;
+  }
+
+  NodeState
+  getNodeState(node_index_t idx,
+               NodeState defaultState = NodeState::FULLY_STARTED) const {
     folly::SharedMutex::ReadHolder read_lock(mutex_);
     // check the node list if the index falls within what we know
-    // otherwise fall back to considering the node dead. if the index is beyond
+    // otherwise fall back to considering the node dead. If the index is beyond
     // the size of this list, it means this node is not yet in our configuration
     // anyway.
     ld_check(idx >= 0);
-    if (idx < cluster_size_) {
-      return node_state_list_[idx].load();
+    auto node_state = node_state_map_.find(idx);
+    auto state = node_state == node_state_map_.end()
+        ? NodeState::DEAD
+        : node_state->second->load();
+
+    // We return the default supplied state if we don't know what is the state
+    // yet.
+    if (state == NodeState::UNKNOWN) {
+      return defaultState;
     }
-    return NodeState::DEAD;
+    return state;
   }
+
+  NodeHealthStatus getNodeStatus(node_index_t idx) const {
+    folly::SharedMutex::ReadHolder read_lock(mutex_);
+    // check the node list if the index falls within what we know
+    // otherwise fall back to considering the node undefined. If the index is
+    // beyond the size of this list, it means this node is not yet in our
+    // configuration anyway.
+    ld_check(idx >= 0);
+    auto node_status = node_status_map_.find(idx);
+    return node_status == node_status_map_.end() ? NodeHealthStatus::UNDEFINED
+                                                 : node_status->second->load();
+  }
+
+  // Returns a vectorized representation of the hashmap containing the health
+  // statuses of the cluster as seen by this node. The vector is sorted by node
+  // ids.
+  std::vector<std::pair<node_index_t, uint16_t>> getWholeClusterStatus();
+
+  // Returns a vectorized representation of the hashmap containing the states
+  // of the cluster as seen by this node. The vector is sorted by node ids.
+  std::vector<std::pair<node_index_t, uint16_t>> getWholeClusterState();
+
+  // Verifies whether the percent of HEALTHY nodes in the cluster is above a
+  // certain threshold. If this is the case then it is acceptable to use the
+  // NodeHealthStatus for sequencer placement.
+  bool isClusterSeqHealthAboveThreshold();
 
   const char* getNodeStateAsStr(node_index_t idx) const {
     return getNodeStateString(getNodeState(idx));
   }
 
   /**
-   * @return Id of the first node seen as alive. Used to determine which node
-   * should perform some actions such as trim the event log.
+   * @return Id of the first node seen as alive or none if no node is alive.
    */
-  node_index_t getFirstNodeAlive() const;
+  folly::Optional<node_index_t> getFirstNodeAlive() const;
+
+  /**
+   * @return Id of the first node seen as fully started. Used to determine which
+   * node should perform some actions such as trim the event log. If no node is
+   * fully started, it returns none.
+   */
+  folly::Optional<node_index_t> getFirstNodeFullyStarted() const;
+
+  /**
+   * @return Id of the first node that matches predicate function. If no node
+   * satisfied the predicate funcion, it returns none.
+   */
+  folly::Optional<node_index_t>
+  getFirstNodeWithPred(folly::Function<bool(node_index_t)> pred) const;
 
   void setNodeState(node_index_t idx, NodeState state);
+
+  void setNodeStatus(node_index_t idx, NodeHealthStatus status);
 
   /**
    * Asynchronously updates this ClusterState object.
@@ -144,9 +220,11 @@ class ClusterState {
    */
   virtual void refreshClusterStateAsync();
 
-  void onGetClusterStateDone(Status status,
-                             const std::vector<uint8_t>& nodes_state,
-                             std::vector<node_index_t> boycotted_nodes);
+  void onGetClusterStateDone(
+      Status status,
+      const std::vector<std::pair<node_index_t, uint16_t>>& nodes_state,
+      std::vector<node_index_t> boycotted_nodes,
+      std::vector<std::pair<node_index_t, uint16_t>> nodes_status);
 
   void noteConfigurationChanged();
   void updateNodesInConfig(const configuration::nodes::ServiceDiscoveryConfig&);
@@ -188,9 +266,11 @@ class ClusterState {
   void notifyRefreshComplete();
 
   folly::SharedMutex mutex_;
-  std::unique_ptr<std::atomic<NodeState>[]> node_state_list_ { nullptr };
+  folly::F14FastMap<node_index_t, std::unique_ptr<std::atomic<NodeState>>>
+      node_state_map_{};
+
   std::unordered_set<node_index_t> nodes_in_config_;
-  size_t cluster_size_{0};
+  std::atomic<size_t> cluster_size_{0};
   std::atomic<std::chrono::steady_clock::duration> last_refresh_{
       std::chrono::steady_clock::duration::zero()};
   std::atomic<bool> refresh_in_progress_{false};
@@ -202,5 +282,8 @@ class ClusterState {
   folly::SharedMutex shutdown_mutex_;
   FastUpdateableSharedPtr<std::vector<node_index_t>> boycotted_nodes_{
       std::make_shared<std::vector<node_index_t>>()};
+  folly::F14FastMap<node_index_t,
+                    std::unique_ptr<std::atomic<NodeHealthStatus>>>
+      node_status_map_{};
 };
 }} // namespace facebook::logdevice

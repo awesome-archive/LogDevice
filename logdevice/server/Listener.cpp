@@ -14,7 +14,6 @@
 #include <folly/ScopeGuard.h>
 #include <folly/io/async/AsyncSocketException.h>
 
-#include "logdevice/common/ConstructorFailed.h"
 #include "logdevice/common/debug.h"
 
 namespace facebook { namespace logdevice {
@@ -23,8 +22,12 @@ bool Listener::isSSL() const {
   return iface_.isSSL();
 }
 
-Listener::Listener(const InterfaceDef& iface, KeepAlive loop)
-    : iface_(iface), loop_(loop) {
+Listener::Listener(const InterfaceDef& iface,
+                   KeepAlive loop,
+                   bool enable_dscp_reflection)
+    : iface_(iface),
+      loop_(loop),
+      enable_dscp_reflection_(enable_dscp_reflection) {
   ld_info("Created Listener: %s", iface.describe().c_str());
 }
 
@@ -63,9 +66,16 @@ bool Listener::setupAsyncSocket() {
 
   try {
     auto socket = folly::AsyncServerSocket::newSocket(base);
+
     iface_.bind(socket.get());
-    socket->addAcceptCallback(this, base);
+    socket->addAcceptCallback(this, nullptr);
     socket->listen(128);
+
+    if (enable_dscp_reflection_ &&
+        socket->getAddress().getFamily() != AF_UNIX) {
+      socket->setTosReflect(true);
+    }
+
     socket->startAccepting();
     socket_ = std::move(socket);
   } catch (const folly::AsyncSocketException& e) {
@@ -75,12 +85,6 @@ bool Listener::setupAsyncSocket() {
   }
 
   return true;
-}
-
-void Listener::connectionAccepted(
-    folly::NetworkSocket fd,
-    const folly::SocketAddress& clientAddr) noexcept {
-  acceptCallback(fd.toFd(), clientAddr);
 }
 
 void Listener::acceptError(const std::exception& ex) noexcept {

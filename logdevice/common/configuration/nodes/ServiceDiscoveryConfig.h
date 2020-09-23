@@ -8,6 +8,7 @@
 #pragma once
 
 #include <folly/Optional.h>
+#include <folly/container/F14Map.h>
 
 #include "logdevice/common/ShardID.h"
 #include "logdevice/common/Sockaddr.h"
@@ -15,12 +16,16 @@
 #include "logdevice/common/configuration/NodeLocation.h"
 #include "logdevice/common/configuration/nodes/NodeAttributesConfig.h"
 #include "logdevice/common/configuration/nodes/NodeRole.h"
+#include "logdevice/common/configuration/nodes/gen-cpp2/NodesConfiguration_types.h"
+#include "logdevice/common/toString.h"
 
-namespace facebook { namespace logdevice { namespace configuration {
-namespace nodes {
+namespace facebook::logdevice::configuration::nodes {
 
 struct NodeServiceDiscovery {
+  using ClientNetworkPriority =
+      facebook::logdevice::thrift::ClientNetworkPriority;
   using RoleSet = configuration::nodes::RoleSet;
+  using TagMap = std::unordered_map<std::string, std::string>;
 
   /*
    * This is a unique name for the node in the cluster. This is currently not a
@@ -28,10 +33,18 @@ struct NodeServiceDiscovery {
    */
   std::string name{};
 
+  /*
+   * The version provides better control over node self-registration logic.
+   * A node will be allowed to update its attributes on joining the cluster
+   * only if the proposed version is greater or equal than the current one.
+   * The node with the lower version will then be preempted.
+   */
+  uint64_t version{};
+
   /**
    * The IP (v4 or v6) address, including port number.
    */
-  Sockaddr address{};
+  Sockaddr default_client_data_address{};
 
   /**
    * The IP (v4 or v6) gossip address, including port number. Semantically, if
@@ -57,6 +70,32 @@ struct NodeServiceDiscovery {
   folly::Optional<Sockaddr> admin_address;
 
   /**
+   * The IP (v4 or v6) address, including port number, for server-to-server
+   * traffic. If it's folly::none, it means that server-to-server traffic
+   * doesn't have a dedicated address.
+   */
+  folly::Optional<Sockaddr> server_to_server_address;
+
+  /**
+   * The IP (v4 or v6) address, including port number, for server-to-server
+   * Thrift API request traffic. If it's folly::none, it means the node does not
+   * accept requests from other nodes over Thrift.
+   */
+  folly::Optional<Sockaddr> server_thrift_api_address;
+
+  /**
+   * The IP (v4 or v6) address, including port number, for server-facing
+   * Thrift API request traffic. If it's folly::none, it means the node does not
+   * accept requests from clients over Thrift.
+   */
+  folly::Optional<Sockaddr> client_thrift_api_address;
+
+  /**
+   * A mapping from network priority to IP (v4 or v6) address w/ port number.
+   */
+  folly::F14FastMap<ClientNetworkPriority, Sockaddr> addresses_per_priority;
+
+  /**
    * Location information of the node.
    */
   folly::Optional<NodeLocation> location{};
@@ -66,7 +105,15 @@ struct NodeServiceDiscovery {
    */
   RoleSet roles{};
 
+  /**
+   * Custom tags. LogDevice server doesn't use them but they're useful to
+   * companion services.
+   */
+  TagMap tags;
+
   const Sockaddr& getGossipAddress() const;
+
+  const Sockaddr& getServerToServerAddress() const;
 
   bool hasRole(NodeRole role) const {
     auto id = static_cast<size_t>(role);
@@ -74,16 +121,22 @@ struct NodeServiceDiscovery {
   }
 
   std::string locationStr() const {
-    if (!location.hasValue()) {
+    if (!location.has_value()) {
       return "";
     }
     return location.value().toString();
   }
 
   bool operator==(const NodeServiceDiscovery& rhs) const {
-    return address == rhs.address && gossip_address == rhs.gossip_address &&
+    return default_client_data_address == rhs.default_client_data_address &&
+        gossip_address == rhs.gossip_address &&
         ssl_address == rhs.ssl_address && admin_address == rhs.admin_address &&
-        location == rhs.location && roles == rhs.roles && name == rhs.name;
+        server_to_server_address == rhs.server_to_server_address &&
+        server_thrift_api_address == rhs.server_thrift_api_address &&
+        client_thrift_api_address == rhs.client_thrift_api_address &&
+        addresses_per_priority == rhs.addresses_per_priority &&
+        location == rhs.location && roles == rhs.roles && tags == rhs.tags &&
+        name == rhs.name && version == rhs.version;
   }
 
   bool operator!=(const NodeServiceDiscovery& rhs) const {
@@ -94,14 +147,13 @@ struct NodeServiceDiscovery {
   std::string toString() const;
   bool isValidForReset(const NodeServiceDiscovery& current) const;
 
-  // return the corresponding sockaddr for the given socket type
-  const Sockaddr& getSockaddr(SocketType type, ConnectionType conntype) const;
-
   const RoleSet& getRoles() const {
     return roles;
   }
+
+  static std::string networkPriorityToString(const ClientNetworkPriority&);
 };
 
 using ServiceDiscoveryConfig = NodeAttributesConfig<NodeServiceDiscovery>;
 
-}}}} // namespace facebook::logdevice::configuration::nodes
+} // namespace facebook::logdevice::configuration::nodes

@@ -1,9 +1,7 @@
-# Copyright (c) 2019-present, Facebook, Inc.
-# All rights reserved.
+# Copyright (c) Facebook, Inc. and its affiliates.
 #
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree. An additional grant
-# of patent rights can be found in the PATENTS file in the same directory.
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
 
 from __future__ import absolute_import, division, print_function, unicode_literals
 
@@ -136,6 +134,7 @@ class ManifestLoader(object):
         self._fetcher_overrides = {}
         self._build_dir_overrides = {}
         self._install_dir_overrides = {}
+        self._install_prefix_overrides = {}
 
     def load_manifest(self, name):
         manifest = self.manifests_by_name.get(name)
@@ -240,6 +239,9 @@ class ManifestLoader(object):
     def set_project_install_dir(self, project_name, path):
         self._install_dir_overrides[project_name] = path
 
+    def set_project_install_prefix(self, project_name, path):
+        self._install_prefix_overrides[project_name] = path
+
     def create_fetcher(self, manifest):
         override = self._fetcher_overrides.get(manifest.name)
         if override is not None:
@@ -262,11 +264,14 @@ class ManifestLoader(object):
         No caching of the computation is performed, which is theoretically
         wasteful but the computation is fast enough that it is not required
         to cache across multiple invocations. """
+        ctx = self.ctx_gen.get_context(manifest.name)
+
         hasher = hashlib.sha256()
         # Some environmental and configuration things matter
         env = {}
         env["install_dir"] = self.build_opts.install_dir
         env["scratch_dir"] = self.build_opts.scratch_dir
+        env["vcvars_path"] = self.build_opts.vcvars_path
         env["os"] = self.build_opts.host_type.ostype
         env["distro"] = self.build_opts.host_type.distro
         env["distro_vers"] = self.build_opts.host_type.distrovers
@@ -274,6 +279,8 @@ class ManifestLoader(object):
             env[name] = os.environ.get(name)
         for tool in ["cc", "c++", "gcc", "g++", "clang", "clang++"]:
             env["tool-%s" % tool] = path_search(os.environ, tool)
+        for name in manifest.get_section_as_args("depends.environment", ctx):
+            env[name] = os.environ.get(name)
 
         fetcher = self.create_fetcher(manifest)
         env["fetcher.hash"] = fetcher.hash()
@@ -282,9 +289,11 @@ class ManifestLoader(object):
             hasher.update(name.encode("utf-8"))
             value = env.get(name)
             if value is not None:
-                hasher.update(value.encode("utf-8"))
+                try:
+                    hasher.update(value.encode("utf-8"))
+                except AttributeError as exc:
+                    raise AttributeError("name=%r, value=%r: %s" % (name, value, exc))
 
-        ctx = self.ctx_gen.get_context(manifest.name)
         manifest.update_hash(hasher, ctx)
 
         dep_list = sorted(manifest.get_section_as_dict("dependencies", ctx).keys())
@@ -326,3 +335,13 @@ class ManifestLoader(object):
 
         project_dir_name = self._get_project_dir_name(manifest)
         return os.path.join(self.build_opts.scratch_dir, "build", project_dir_name)
+
+    def get_project_install_prefix(self, manifest):
+        return self._install_prefix_overrides.get(manifest.name)
+
+    def get_project_install_dir_respecting_install_prefix(self, manifest):
+        inst_dir = self.get_project_install_dir(manifest)
+        prefix = self.get_project_install_prefix(manifest)
+        if prefix:
+            return inst_dir + prefix
+        return inst_dir

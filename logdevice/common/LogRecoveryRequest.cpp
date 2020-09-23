@@ -31,6 +31,74 @@ const std::chrono::milliseconds LogRecoveryRequest::SEAL_RETRY_INITIAL_DELAY{
 const std::chrono::milliseconds LogRecoveryRequest::SEAL_RETRY_MAX_DELAY{5000};
 const std::chrono::milliseconds LogRecoveryRequest::SEAL_CHECK_INTERVAL{15000};
 
+/**
+ * @file ShardRetryHandler is a utility class used to perform an action on a
+ *       storage shard (e.g. sending a message), retrying later (with a backoff)
+ *       in case of a failure.
+ */
+class LogRecoveryRequest::ShardRetryHandler {
+ public:
+  typedef std::function<int(ShardID)> func_t;
+
+  explicit ShardRetryHandler(
+      func_t handler, // handler should return 0 on success
+      std::chrono::milliseconds retry_initial_delay =
+          std::chrono::milliseconds(5),
+      std::chrono::milliseconds retry_max_delay =
+          std::chrono::milliseconds(1000))
+      : handler_(handler),
+        retry_initial_delay_(retry_initial_delay),
+        retry_max_delay_(retry_max_delay) {
+    ld_check(handler);
+  }
+
+  /**
+   * Activate the timer that calls handler_.
+   *
+   * @param shard  shard to activate the timer for
+   * @param reset  if set, timeout will be reset to its initial value
+   */
+  void activateTimer(ShardID to, bool reset = false) {
+    std::unique_ptr<BackoffTimer>& timer = retry_timers_[to];
+
+    if (!timer) {
+      timer = createRetryTimer(to);
+    }
+
+    if (reset) {
+      timer->reset();
+    }
+
+    timer->activate();
+  }
+
+  // Call handler_ and activate the timer in case of failure
+  int execute(ShardID shard) {
+    int rv = handler_(shard);
+    if (rv != 0) {
+      activateTimer(shard);
+    }
+    return rv;
+  }
+
+ private:
+  std::unique_ptr<BackoffTimer> createRetryTimer(ShardID shard) {
+    return std::make_unique<ExponentialBackoffTimer>(
+
+        [this, shard] { this->execute(shard); },
+        retry_initial_delay_,
+        retry_max_delay_);
+  }
+
+  func_t handler_;
+  std::chrono::milliseconds retry_initial_delay_;
+  std::chrono::milliseconds retry_max_delay_;
+
+  // Retry timers for connection or transient errors
+  std::unordered_map<ShardID, std::unique_ptr<BackoffTimer>, ShardID::Hash>
+      retry_timers_;
+};
+
 RecoveredLSNs::~RecoveredLSNs() {}
 
 void RecoveredLSNs::noteMutationsCompleted(
@@ -84,7 +152,7 @@ RecoveredLSNs::RecoveryStatus RecoveredLSNs::recoveryStatus(lsn_t lsn) const {
 int LogRecoveryRequest::getThreadAffinity(int nthreads) {
   // If setTargetWorker() is called, pin the recovery request to the specified
   // worker thread
-  if (target_worker_.hasValue()) {
+  if (target_worker_.has_value()) {
     worker_id_t target = target_worker_.value();
     ld_check(target.val_ >= 0 && target.val_ < nthreads);
     return target.val_;
@@ -115,6 +183,10 @@ LogRecoveryRequest::LogRecoveryRequest(
   // refuse to activate
   ld_check(!seq_metadata_->disabled());
   ld_check(next_epoch == seq_metadata_->h.epoch);
+  ld_spew("[sequencer_activity_in_progress++] Created LogRecoveryRequest for "
+          "log %lu",
+          log_id.val());
+  WORKER_STAT_INCR(sequencer_activity_in_progress);
 }
 
 LogRecoveryRequest::~LogRecoveryRequest() {
@@ -125,6 +197,10 @@ LogRecoveryRequest::~LogRecoveryRequest() {
   if (meta_reader_) {
     Worker::onThisThread()->disposeOfMetaReader(std::move(meta_reader_));
   }
+  ld_spew("[sequencer_activity_in_progress--] Destroyed LogRecoveryRequest for "
+          "log %lu",
+          log_id_.val());
+  WORKER_STAT_DECR(sequencer_activity_in_progress);
 }
 
 Request::Execution LogRecoveryRequest::execute() {
@@ -232,7 +308,6 @@ Request::Execution LogRecoveryRequest::execute() {
     return Execution::CONTINUE;
   }
 
-  registerForShardAuthoritativeStatusUpdates();
   start();
   return Execution::CONTINUE;
 }
@@ -255,7 +330,7 @@ void LogRecoveryRequest::skipRecovery() {
        /*flags*/ 0,
        {}},
       OffsetMap(),
-      std::shared_ptr<PayloadHolder>());
+      PayloadHolder());
 
   ld_check(tail_record.isValid());
   ld_check(!tail_record.containOffsetWithinEpoch());
@@ -288,6 +363,13 @@ void LogRecoveryRequest::skipRecovery() {
 void LogRecoveryRequest::start() {
   start_delay_timer_.reset();
 
+  if (!Worker::onThisThread()->getLogsConfig()->logExists(log_id_)) {
+    completeSoon(E::NOTINCONFIG);
+    return;
+  }
+
+  registerForShardAuthoritativeStatusUpdates();
+
   // If the log is a data log, log recovery can only complete when epoch
   // metadata for next_epoch_ can be found in the metadata log. Therefore,
   // before starting the first step of the recovery, start a MetaDataLogReader
@@ -310,6 +392,10 @@ void LogRecoveryRequest::start() {
   // begin the first step of recovery: get last clean epoch of the log from the
   // epoch store.
   getLastCleanEpoch();
+}
+
+void LogRecoveryRequest::noteLogRemovedFromConfig() {
+  completeSoon(E::NOTINCONFIG);
 }
 
 void LogRecoveryRequest::getLastCleanEpoch() {
@@ -429,7 +515,7 @@ void LogRecoveryRequest::getLastCleanEpochCF(Status status,
 
 void LogRecoveryRequest::getEpochMetaData() {
   // must have fetched lce
-  ld_check(last_clean_epoch_.hasValue());
+  ld_check(last_clean_epoch_.has_value());
   const epoch_t last_clean_epoch = last_clean_epoch_.value();
 
   // There should be unclean epochs to recover otherwise the state machine would
@@ -489,7 +575,9 @@ int LogRecoveryRequest::createEpochRecoveryMachines(
   ld_check(start <= until);
   ld_check(metadata.isValid());
   auto config = Worker::onThisThread()->getConfig();
-  const auto& nc = Worker::onThisThread()->getNodesConfiguration();
+  const auto& nc = Worker::onThisThread()
+                       ->getUpdateableConfig()
+                       ->updateableNodesConfiguration();
   auto log = config->getLogGroupByIDShared(log_id_);
   if (!log) {
     // config has changed since the time this Sequencer was activated
@@ -523,7 +611,7 @@ int LogRecoveryRequest::createEpochRecoveryMachines(
 void LogRecoveryRequest::onEpochMetaData(Status st,
                                          MetaDataLogReader::Result result) {
   ld_check(result.log_id == log_id_);
-  ld_check(last_clean_epoch_.hasValue());
+  ld_check(last_clean_epoch_.has_value());
   const epoch_t last_clean_epoch = last_clean_epoch_.value();
   const epoch_t seq_metadata_effective_since = seq_metadata_->h.effective_since;
 
@@ -623,7 +711,7 @@ void LogRecoveryRequest::onEpochMetaData(Status st,
 void LogRecoveryRequest::finalizeEpochMetaData() {
   ld_check(!epoch_metadata_finalized_);
   ld_check(seq_metadata_);
-  ld_check(last_clean_epoch_.hasValue());
+  ld_check(last_clean_epoch_.has_value());
   const epoch_t last_clean_epoch = last_clean_epoch_.value();
   const epoch_t effective_since = seq_metadata_->h.effective_since;
 
@@ -825,7 +913,7 @@ void LogRecoveryRequest::informSequencerOfMetaDataRead(epoch_t effective_since,
 void LogRecoveryRequest::sealLog() {
   // must finished last step of getting epoch metadata
   ld_check(epoch_metadata_finalized_);
-  ld_check(last_clean_epoch_.hasValue());
+  ld_check(last_clean_epoch_.has_value());
   const epoch_t last_clean_epoch = last_clean_epoch_.value();
   ld_check(last_clean_epoch.val_ < next_epoch_.val_ - 1);
 
@@ -872,7 +960,7 @@ void LogRecoveryRequest::sealLog() {
   ld_check(nodeset_size_ > 0);
 
   // attempt to seal all the nodes in the recovery set
-  seal_retry_handler_.reset(new RetryHandler(
+  seal_retry_handler_.reset(new ShardRetryHandler(
       [this](ShardID shard) {
         ld_check(seal_header_ != nullptr);
         auto it = node_statuses_.find(shard);
@@ -920,7 +1008,7 @@ void LogRecoveryRequest::sealLog() {
 
   ld_check(epoch_recovery_machines_.size() > 0);
 
-  ld_check(tail_record_.hasValue());
+  ld_check(tail_record_.has_value());
   epoch_recovery_machines_.begin()->activate(tail_record_.value());
 }
 
@@ -986,7 +1074,7 @@ int LogRecoveryRequest::sendSeal(ShardID shard) {
 
 void LogRecoveryRequest::onSealReply(ShardID from,
                                      const SEALED_Message& reply) {
-  if (all_epochs_recovered_) {
+  if (all_epochs_recovered_ || deferredCompleteTimer_ != nullptr) {
     // Ignore this reply, we finished recovery without this node.
     return;
   }
@@ -1097,13 +1185,13 @@ void LogRecoveryRequest::onSealReply(ShardID from,
                                AuthoritativeSource::NODE);
   }
 
-  if (reply.header_.status == E::OK) {
-    // In case the sequencer metadata is already found in metadata log,
-    // as soon as the last epoch recovery machine is retired LogRecoveryRequest
-    // is destroyed. Therefore, if we are in a LogRecoveryRequest method,
-    // we must have at least one active epoch recovery machine.
-    ld_check(!seq_metadata_read_ || epoch_recovery_machines_.size() > 0);
+  // In case the sequencer metadata is already found in metadata log,
+  // as soon as the last epoch recovery machine is retired LogRecoveryRequest
+  // is destroyed. Therefore, if we are in a LogRecoveryRequest method,
+  // we must have at least one active epoch recovery machine.
+  ld_check(!seq_metadata_read_ || epoch_recovery_machines_.size() > 0);
 
+  if (reply.header_.status == E::OK) {
     ld_check(next_epoch_.val_ > 0);
     ld_check(seal_header_->last_clean_epoch.val_ < next_epoch_.val_ - 1);
 
@@ -1242,7 +1330,7 @@ void LogRecoveryRequest::onSealReply(ShardID from,
                TailRecordHeader::OFFSET_WITHIN_EPOCH,
                {}},
               offsets,
-              std::shared_ptr<PayloadHolder>());
+              PayloadHolder());
 
           ld_check(epoch_tail.value().isValid());
         }
@@ -1324,7 +1412,13 @@ void LogRecoveryRequest::allEpochsRecovered() {
 }
 
 void LogRecoveryRequest::completeSoon(Status status) {
+  if (deferredCompleteTimer_) {
+    return;
+  }
+
   epoch_recovery_machines_.clear();
+  start_delay_timer_.reset();
+
   deferredCompleteTimer_ =
       std::make_unique<Timer>([this, status] { complete(status); });
   deferredCompleteTimer_->activate(std::chrono::milliseconds(0));
@@ -1368,7 +1462,7 @@ void LogRecoveryRequest::complete(Status status) {
   }
 
   if (sequencer) {
-    if (!tail_record_.hasValue()) {
+    if (!tail_record_.has_value()) {
       ld_check(status != E::OK);
       tail_record_.assign(TailRecord());
     }
@@ -1424,8 +1518,8 @@ void LogRecoveryRequest::onConnectionClosed(ShardID shard, Status status) {
 
   // Re-register the callback.
   SocketClosedCallback& cb = node_status.socket_close_callback;
-  const int rv = Worker::onThisThread()->sender().registerOnSocketClosed(
-      Address(NodeID(shard.node())), cb);
+  const int rv = Worker::onThisThread()->sender().registerOnConnectionClosed(
+      Address(shard.node()), cb);
   if (rv != 0) {
     ld_check(err == E::NOTFOUND);
     // TODO (#4408213): handle cluster shrinking)
@@ -1489,7 +1583,7 @@ void LogRecoveryRequest::onEpochRecovered(epoch_t epoch,
   epoch_recovery_machines_.pop_front();
 
   if (epoch_recovery_machines_.begin() != epoch_recovery_machines_.end()) {
-    ld_check(tail_record_.hasValue());
+    ld_check(tail_record_.has_value());
     epoch_recovery_machines_.begin()->activate(tail_record_.value());
   } else {
     // finished recoverying all epochs in [lce+1, next_epoch-1]
@@ -1598,7 +1692,7 @@ void LogRecoveryRequest::getDebugInfo(InfoRecoveriesTable& table) const {
   auto started =
       creation_timestamp_.approximateSystemTimestamp().toMilliseconds();
 
-  if (!last_clean_epoch_.hasValue()) {
+  if (!last_clean_epoch_.has_value()) {
     // We still haven't fetched lce from the epoch store.
     table.next()
         .set<0>(log_id_)

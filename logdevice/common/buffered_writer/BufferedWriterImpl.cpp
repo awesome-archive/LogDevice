@@ -8,8 +8,10 @@
 #include "logdevice/common/buffered_writer/BufferedWriterImpl.h"
 
 #include <folly/Memory.h>
+#include <folly/Overload.h>
 #include <folly/hash/Hash.h>
 
+#include "logdevice/common/PayloadGroupCodec.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/Request.h"
 #include "logdevice/common/Semaphore.h"
@@ -27,34 +29,39 @@ int ProcessorProxy::postWithRetrying(std::unique_ptr<Request>& rq) {
 
 namespace {
 
+// All requests used by a single BufferedWriterImpl must have the same priority
+// to avoid reordering.
+static constexpr int8_t kBufferedWriterRequestsPriority =
+    folly::Executor::HI_PRI;
+
 // Instructs the Worker to create a BufferedWriterShard instance with the
 // specified ID.
 class CreateShardRequest : public Request {
  public:
   CreateShardRequest(worker_id_t worker,
-                     std::function<BufferedWriterShard*()> factory,
-                     Semaphore* sem)
+                     std::function<BufferedWriterShard*()> factory)
       : Request(RequestType::BUFFERED_WRITER_CREATE_SHARD),
         worker_(worker),
-        factory_(std::move(factory)),
-        sem_(sem) {}
+        factory_(std::move(factory)) {}
 
   int getThreadAffinity(int /*nthreads*/) override {
     return worker_.val_;
+  }
+
+  int8_t getExecutorPriority() const override {
+    return kBufferedWriterRequestsPriority;
   }
 
   Execution execute() override {
     BufferedWriterShard* instance = factory_();
     Worker::onThisThread()->active_buffered_writers_.insert(
         std::make_pair(instance->id_, instance));
-    sem_->post();
     return Execution::COMPLETE;
   }
 
  private:
   worker_id_t worker_;
   std::function<BufferedWriterShard*()> factory_;
-  Semaphore* sem_;
 };
 } // namespace
 
@@ -100,6 +107,42 @@ void WaitableCounter::waitForZeroAndDisallowMore() {
   }
 }
 
+size_t BufferedWriterPayloadMeter::encodedSize(const std::string& payload) {
+  return payload.size();
+}
+
+size_t
+BufferedWriterPayloadMeter::encodedSize(const PayloadGroup& payload_group) {
+  PayloadGroupCodec::Estimator estimator;
+  estimator.append(payload_group);
+  return estimator.calculateSize();
+}
+
+size_t BufferedWriterPayloadMeter::encodedSize(
+    const std::variant<std::string, PayloadGroup>& payload_variant) {
+  return std::visit([&](const auto& payload) { return encodedSize(payload); },
+                    payload_variant);
+}
+
+size_t BufferedWriterPayloadMeter::memorySize(const std::string& payload) {
+  return payload.size();
+}
+
+size_t
+BufferedWriterPayloadMeter::memorySize(const PayloadGroup& payload_group) {
+  size_t size = 0;
+  for (const auto& [key, iobuf] : payload_group) {
+    size += iobuf.computeChainDataLength();
+  }
+  return size + payload_group.size() * sizeof(PayloadKey);
+}
+
+size_t BufferedWriterPayloadMeter::memorySize(
+    const std::variant<std::string, PayloadGroup>& payload_variant) {
+  return std::visit([&](const auto& payload) { return memorySize(payload); },
+                    payload_variant);
+}
+
 using GetLogOptionsFunc = std::function<BufferedWriter::LogOptions(logid_t)>;
 
 BufferedWriterImpl::BufferedWriterImpl(ProcessorProxy* processor_proxy,
@@ -129,28 +172,23 @@ BufferedWriterImpl::BufferedWriterImpl(ProcessorProxy* processor_proxy,
   }
 
   const int nworkers = processor()->getWorkerCount(WorkerType::GENERAL);
-  Semaphore sem;
   for (worker_id_t widx(0); widx.val_ < nworkers; ++widx.val_) {
     // We generate the ID here but let the Worker actually create the
     // BufferedWriterShard instance so that it's collocated with other data
     // belonging to that Worker.
     buffered_writer_id_t id = processor()->issueBufferedWriterID();
-    auto factory = [id, &get_log_options, this]() {
+    auto factory = [id, get_log_options, this]() {
       return new BufferedWriterShard(id, get_log_options, this);
     };
     std::unique_ptr<Request> req =
-        std::make_unique<CreateShardRequest>(widx, factory, &sem);
+        std::make_unique<CreateShardRequest>(widx, factory);
     int rv = processor()->postWithRetrying(req);
     ld_check(rv == 0);
     shards_.push_back(id);
   }
 
-  // Wait until all CreateShardRequest's have been processed by Workers.
-  // After this it is surely safe to process append() calls and the
-  // constructor can return.
-  for (int i = 0; i < nworkers; ++i) {
-    sem.wait();
-  }
+  // No need to wait for the requests to complete because they can't fail and
+  // can't be reordered with future append requests.
 }
 
 namespace {
@@ -165,6 +203,10 @@ class PerShardRequest : public Request {
 
   int getThreadAffinity(int /*nthreads*/) override {
     return worker_.val_;
+  }
+
+  int8_t getExecutorPriority() const override {
+    return kBufferedWriterRequestsPriority;
   }
 
   Execution execute() override {
@@ -301,7 +343,7 @@ class BufferedAppendRequest : public Request {
   }
 
   int8_t getExecutorPriority() const override {
-    return folly::Executor::HI_PRI;
+    return kBufferedWriterRequestsPriority;
   }
 
   Execution execute() override {
@@ -351,6 +393,25 @@ int BufferedWriterImpl::append(logid_t log_id,
                                std::string&& payload,
                                AppendCallback::Context cb_context,
                                AppendAttributes&& attrs) {
+  return appendImpl(
+      log_id, std::move(payload), std::move(cb_context), std::move(attrs));
+}
+
+int BufferedWriterImpl::append(logid_t log_id,
+                               PayloadGroup&& payload_group,
+                               AppendCallback::Context cb_context,
+                               AppendAttributes&& attrs) {
+  return appendImpl(log_id,
+                    std::move(payload_group),
+                    std::move(cb_context),
+                    std::move(attrs));
+}
+
+template <typename T>
+int BufferedWriterImpl::appendImpl(logid_t log_id,
+                                   T&& payload,
+                                   AppendCallback::Context cb_context,
+                                   AppendAttributes&& attrs) {
   STAT_INCR(stats_, buffered_appends);
 
   if (shutting_down_.load()) {
@@ -359,7 +420,8 @@ int BufferedWriterImpl::append(logid_t log_id,
     return -1;
   }
 
-  if (!append_sink_->checkAppend(log_id, payload.size(), false)) {
+  if (!append_sink_->checkAppend(
+          log_id, BufferedWriterPayloadMeter::encodedSize(payload), false)) {
     STAT_INCR(stats_, buffered_append_failed_invalid_param);
     return -1;
   }
@@ -371,17 +433,18 @@ int BufferedWriterImpl::append(logid_t log_id,
     return -1;
   }
 
-  size_t payload_size = payload.size();
+  const size_t payload_mem_bytes =
+      BufferedWriterPayloadMeter::memorySize(payload);
 
-  if (acquireMemory(payload_size) != 0) {
+  if (acquireMemory(payload_mem_bytes) != 0) {
     log_memory_limit_exceeded(memory_limit_bytes_);
     err = E::NOBUFS;
     STAT_INCR(stats_, buffered_append_failed_memory_limit);
     return -1;
   }
 
-  auto release_memory_on_fail =
-      folly::makeGuard([this, payload_size] { releaseMemory(payload_size); });
+  auto release_memory_on_fail = folly::makeGuard(
+      [this, payload_mem_bytes] { releaseMemory(payload_mem_bytes); });
 
   // Post a BufferedAppendRequest to the appropriate Worker.
   int shard_idx = mapLogToShardIndex(log_id);
@@ -394,29 +457,23 @@ int BufferedWriterImpl::append(logid_t log_id,
                                               shards_[shard_idx],
                                               std::move(chunk),
                                               /* atomic */ false);
-  append_sink_->onBytesSentToWorker(payload_size);
+  append_sink_->onBytesSentToWorker(payload_mem_bytes);
   int rv = processor()->postRequest(req);
   if (rv == 0) {
     // BufferedWriterSingleLog will release memory budget after append is done.
     release_memory_on_fail.dismiss();
   } else {
     // Failed to queue the append.  Return the payload to the caller.
-    append_sink_->onBytesSentToWorker(-payload_size);
+    append_sink_->onBytesSentToWorker(-payload_mem_bytes);
     BufferedAppendRequest* rawreq =
         static_cast<BufferedAppendRequest*>(req.get());
     chunk = rawreq->releaseChunk();
     ld_check(chunk.size() == 1);
-    payload = std::move(chunk.front().payload);
+    payload = std::move(std::get<T>(chunk.front().payload));
     attrs = std::move(chunk.front().attrs);
     STAT_INCR(stats_, buffered_append_failed_post_request);
   }
   return rv;
-}
-
-std::vector<Status>
-BufferedWriterImpl::append(std::vector<Append>&& input_appends) {
-  STAT_ADD(stats_, buffered_appends, input_appends.size());
-  return appendImpl(std::move(input_appends), /* atomic */ false);
 }
 
 int BufferedWriterImpl::appendAtomic(logid_t log_id,
@@ -433,9 +490,9 @@ int BufferedWriterImpl::appendAtomic(logid_t log_id,
     return -1;
   }
 
-  int64_t payload_bytes = 0;
+  int64_t payload_mem_bytes = 0;
   for (const Append& append : input_appends) {
-    payload_bytes += append.payload.size();
+    payload_mem_bytes += BufferedWriterPayloadMeter::memorySize(append.payload);
     if (log_id != append.log_id) {
       ld_info("Input appends must all be for the same log "
               "but at least two logs passed (%lu and %lu)",
@@ -447,7 +504,10 @@ int BufferedWriterImpl::appendAtomic(logid_t log_id,
       return -1;
     }
 
-    if (!append_sink_->checkAppend(log_id, append.payload.size(), false)) {
+    if (!append_sink_->checkAppend(
+            log_id,
+            BufferedWriterPayloadMeter::encodedSize(append.payload),
+            false)) {
       err = E::TOOBIG;
       STAT_ADD(
           stats_, buffered_append_failed_invalid_param, input_appends.size());
@@ -463,32 +523,32 @@ int BufferedWriterImpl::appendAtomic(logid_t log_id,
   }
 
   // Check if we have enough memory for these writes
-  if (acquireMemory(payload_bytes) != 0) {
+  if (acquireMemory(payload_mem_bytes) != 0) {
     log_memory_limit_exceeded(memory_limit_bytes_);
     err = E::NOBUFS;
     STAT_ADD(stats_, buffered_append_failed_memory_limit, input_appends.size());
     return -1;
   }
 
-  auto release_memory_on_fail =
-      folly::makeGuard([this, payload_bytes] { releaseMemory(payload_bytes); });
+  auto release_memory_on_fail = folly::makeGuard(
+      [this, payload_mem_bytes] { releaseMemory(payload_mem_bytes); });
 
   BufferedWriterShard::AppendChunk chunks;
   int shard = mapLogToShardIndex(log_id);
-  size_t append_sizes = 0;
+  size_t append_mem_sizes = 0;
 
   for (Append& append : input_appends) {
-    append_sizes += append.payload.size();
+    append_mem_sizes += BufferedWriterPayloadMeter::memorySize(append.payload);
     chunks.emplace_back(std::move(append));
   }
 
   std::unique_ptr<Request> req = std::make_unique<BufferedAppendRequest>(
-      worker_id_t(shard), shards_[shard], std::move(chunks), true);
-  append_sink_->onBytesSentToWorker(append_sizes);
+      worker_id_t(shard), shards_[shard], std::move(chunks), /* atomic */ true);
+  append_sink_->onBytesSentToWorker(append_mem_sizes);
   int rv = processor()->postRequest(req);
   if (rv != 0) {
     // Failed to queue the append.  Return the payload to the caller.
-    append_sink_->onBytesSentToWorker(-append_sizes);
+    append_sink_->onBytesSentToWorker(-append_mem_sizes);
     BufferedAppendRequest* rawreq =
         static_cast<BufferedAppendRequest*>(req.get());
     chunks = rawreq->releaseChunk();
@@ -502,14 +562,15 @@ int BufferedWriterImpl::appendAtomic(logid_t log_id,
 }
 
 std::vector<Status>
-BufferedWriterImpl::appendImpl(std::vector<Append>&& input_appends,
-                               bool atomic) {
+BufferedWriterImpl::append(std::vector<Append>&& input_appends) {
   // This is the multi-write variant of append().  It groups appends into
   // chunks that map to the same target shard/worker.  A single `Request` is
   // used to pass an entire chunk to the right LogDevice worker, instead of
   // one `Request` per append.
   //
   // NOTE: this is O(shards_.size() + input_appends.size()).
+
+  STAT_ADD(stats_, buffered_appends, input_appends.size());
 
   if (shutting_down_.load()) {
     STAT_ADD(stats_, buffered_append_failed_shutdown, input_appends.size());
@@ -525,7 +586,10 @@ BufferedWriterImpl::appendImpl(std::vector<Append>&& input_appends,
   for (size_t i = 0; i < input_appends.size(); ++i) {
     auto& append = input_appends[i];
     logid_t log_id = append.log_id;
-    if (!append_sink_->checkAppend(log_id, append.payload.size(), false)) {
+    if (!append_sink_->checkAppend(
+            log_id,
+            BufferedWriterPayloadMeter::encodedSize(append.payload),
+            false)) {
       shard_idxs.push_back(-1);
       result[i] = E::TOOBIG;
       STAT_INCR(stats_, buffered_append_failed_invalid_param);
@@ -534,7 +598,7 @@ BufferedWriterImpl::appendImpl(std::vector<Append>&& input_appends,
     int shard_idx = mapLogToShardIndex(log_id);
 
     ld_check(shard_idx < shard_status.size());
-    if (!shard_status[shard_idx].hasValue()) {
+    if (!shard_status[shard_idx].has_value()) {
       shard_status[shard_idx].assign(append_sink_->canSendToWorker());
     }
     if (shard_status[shard_idx].value() != E::OK) {
@@ -543,7 +607,8 @@ BufferedWriterImpl::appendImpl(std::vector<Append>&& input_appends,
       STAT_INCR(stats_, buffered_append_failed_other);
       continue;
     }
-    shard_append_sizes[shard_idx] += append.payload.size();
+    shard_append_sizes[shard_idx] +=
+        BufferedWriterPayloadMeter::memorySize(append.payload);
 
     chunks[shard_idx].emplace_back(std::move(append));
     // Record the shard ID so we can match up return codes
@@ -572,7 +637,7 @@ BufferedWriterImpl::appendImpl(std::vector<Append>&& input_appends,
     // Post a BufferedAppendRequest to process this shard's chunk on the
     // appropriate Worker.
     std::unique_ptr<Request> req = std::make_unique<BufferedAppendRequest>(
-        worker_id_t(i), shards_[i], std::move(chunks[i]), atomic);
+        worker_id_t(i), shards_[i], std::move(chunks[i]), /* atomic */ false);
     append_sink_->onBytesSentToWorker(shard_bytes);
     int rv = processor()->postRequest(req);
     if (rv == 0) {
@@ -623,7 +688,7 @@ class FlushShardRequest : public Request {
   }
 
   int8_t getExecutorPriority() const override {
-    return folly::Executor::HI_PRI;
+    return kBufferedWriterRequestsPriority;
   }
 
   Execution execute() override {

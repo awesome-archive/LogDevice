@@ -79,7 +79,7 @@ Message::Disposition StoreStateMachine::onReceived(STORE_Message* msg,
     return Message::Disposition::ERROR;
   }
 
-  ssize_t payload_size = msg->payload_->size();
+  ssize_t payload_size = msg->payload_.size();
   if (msg->header_.flags & STORE_Header::CHECKSUM &&
       !(msg->header_.flags & STORE_Header::AMEND)) {
     payload_size -= (msg->header_.flags & STORE_Header::CHECKSUM_64BIT) ? 8 : 4;
@@ -262,7 +262,7 @@ Message::Disposition StoreStateMachine::onReceived(STORE_Message* msg,
       : Worker::settings().append_store_durability;
 
   if (rebuilding && default_durability <= Durability::MEMORY) {
-    if (msg->extra_.rebuilding_id == LOG_REBUILDING_ID_INVALID) {
+    if (msg->extra_.rebuilding_id == CHUNK_REBUILDING_ID_INVALID) {
       // rebuilding_id is used as proxy to determine if the node
       // where this STORE originated from can tolerate a record with
       // low durability.
@@ -430,8 +430,7 @@ void StoreStateMachine::execute() {
   auto& map = ServerWorker::onThisThread()->processor_->getLogStorageStateMap();
   LogStorageState* log_state =
       map.insertOrGet(message_->header_.rid.logid, shard_);
-  if (log_state == nullptr) {
-    // unlikely
+  if (log_state->hasPermanentError()) {
     message_->sendReply(E::DISABLED);
     return;
   }
@@ -445,10 +444,8 @@ void StoreStateMachine::execute() {
     // LCE and last_released_lsn
     auto last_clean_epoch = log_state->getLastCleanEpoch();
     auto last_released_lsn = log_state->getLastReleasedLSN();
-    if ((last_released_lsn.hasValue() &&
-         message_->header_.rid.lsn() <= last_released_lsn.value()) ||
-        (last_clean_epoch.hasValue() &&
-         message_->header_.rid.epoch <= last_clean_epoch.value())) {
+    if (message_->header_.rid.lsn() <= last_released_lsn.value() ||
+        message_->header_.rid.epoch <= last_clean_epoch) {
       deleter.dismiss();
       storeAndForward();
     } else {
@@ -477,15 +474,12 @@ void StoreStateMachine::execute() {
             "current last_released_lsn: %s, sequencer: %s",
             message_->header_.rid.logid.val(),
             lsn_to_string(message_->header_.rid.lsn()).c_str(),
-            last_clean_epoch.hasValue() ? last_clean_epoch.value().val_ : 0,
-            lsn_to_string(last_released_lsn.hasValue()
-                              ? last_released_lsn.value()
-                              : LSN_INVALID)
-                .c_str(),
+            last_clean_epoch.val_,
+            lsn_to_string(last_released_lsn.value()).c_str(),
             seq.toString().c_str());
 
         log_state->purge_coordinator_->onReleaseMessage(
-            message_->header_.rid.lsn(), seq, ReleaseType::GLOBAL, true);
+            message_->header_.rid.lsn(), seq, ReleaseType::GLOBAL);
         message_->sendReply(E::DISABLED);
       } else if (MetaDataLog::isMetaDataLog(message_->header_.rid.logid)) {
         RATELIMIT_INFO(
@@ -640,27 +634,15 @@ void StoreStateMachine::storeAndForward() {
 
   const auto& worker_settings = Worker::settings();
 
-  // Decide if we need to write a CSI entry.
-  // For internal logs, write CSI even if it's disabled in settings.
-  // This way if we want to enable CSI later we don't have to do any migration
-  // for internal logs.
-  folly::Optional<lsn_t> block_starting_lsn;
-  if ((worker_settings.write_copyset_index &&
-       worker_settings.write_sticky_copysets_deprecated) ||
-      MetaDataLog::isMetaDataLog(header.rid.logid) ||
-      configuration::InternalLogs::isInternal(header.rid.logid)) {
-    block_starting_lsn.assign(message_->block_starting_lsn_);
-  }
-
   // First create a storage task for the local log store.  The constructor
   // will copy any needed data from the parameters (as well as attach to the
-  // std::shared_ptr<PayloadHolder>), making the task self-sufficient.  We'll
+  // PayloadHolder), making the task self-sufficient.  We'll
   // send the task to a storage thread later (at the end of this method), to
   // avoid delaying forwarding.
   auto task = std::make_unique<StoreStorageTask>(
       header,
       message_->copyset_.begin(),
-      block_starting_lsn,
+      message_->block_starting_lsn_,
       message_->optional_keys_,
       message_->payload_,
       message_->extra_,

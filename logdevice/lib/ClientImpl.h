@@ -16,7 +16,6 @@
 #include <utility>
 
 #include <folly/SharedMutex.h>
-#include <opentracing/tracer.h>
 
 #include "logdevice/common/ClientBridge.h"
 #include "logdevice/common/buffered_writer/BufferedWriterImpl.h"
@@ -50,6 +49,7 @@ class ClientSettingsImpl;
 class ConfigSubscriptionHandle;
 class EpochMetaDataCache;
 class EpochMetaDataMap;
+class PayloadHolder;
 class PluginRegistry;
 class Processor;
 struct Settings;
@@ -100,6 +100,12 @@ class ClientImpl : public Client,
              AppendAttributes attrs = AppendAttributes(),
              std::chrono::milliseconds* timestamp = nullptr) noexcept override;
 
+  lsn_t
+  appendSync(logid_t logid,
+             PayloadGroup&& payload_group,
+             AppendAttributes attrs = AppendAttributes(),
+             std::chrono::milliseconds* timestamp = nullptr) noexcept override;
+
   int append(logid_t logid,
              std::string payload,
              append_callback_t cb,
@@ -107,6 +113,11 @@ class ClientImpl : public Client,
 
   int append(logid_t logid,
              const Payload& payload,
+             append_callback_t cb,
+             AppendAttributes attrs = AppendAttributes()) noexcept override;
+
+  int append(logid_t logid,
+             PayloadGroup&& payload_group,
              append_callback_t cb,
              AppendAttributes attrs = AppendAttributes()) noexcept override;
 
@@ -119,6 +130,13 @@ class ClientImpl : public Client,
 
   int append(logid_t logid,
              const Payload& payload,
+             append_callback_t cb,
+             AppendAttributes attrs,
+             worker_id_t target_worker,
+             std::unique_ptr<std::string> per_request_token);
+
+  int append(logid_t logid,
+             PayloadGroup&& payload_group,
              append_callback_t cb,
              AppendAttributes attrs,
              worker_id_t target_worker,
@@ -132,7 +150,7 @@ class ClientImpl : public Client,
   appendBuffered(logid_t logid,
                  const BufferedWriter::AppendCallback::ContextSet&,
                  AppendAttributes attrs,
-                 const Payload& payload,
+                 PayloadHolder&& payload,
                  BufferedWriterAppendSink::AppendRequestCallback cb,
                  worker_id_t target_worker,
                  int checksum_bits) override;
@@ -193,10 +211,6 @@ class ClientImpl : public Client,
   int isLogEmptySync(logid_t logid, bool* empty) noexcept override;
 
   int isLogEmpty(logid_t logid, is_empty_callback_t cb) noexcept override;
-
-  int isLogEmptyV2Sync(logid_t logid, bool* empty) noexcept override;
-
-  int isLogEmptyV2(logid_t logid, is_empty_callback_t cb) noexcept override;
 
   int dataSizeSync(logid_t logid,
                    std::chrono::milliseconds start,
@@ -443,24 +457,37 @@ class ClientImpl : public Client,
   const std::shared_ptr<TraceLogger> getTraceLogger() const {
     return trace_logger_;
   }
-  const std::shared_ptr<opentracing::Tracer> getOTTracer() const {
-    return ottracer_;
-  }
 
   void addServerConfigHookHandle(UpdateableServerConfig::HookHandle handle);
 
   void setAppendErrorInjector(folly::Optional<AppendErrorInjector> injector);
 
-  bool shouldE2ETrace();
-
-  template <typename T>
+  // Verifies payload and creates request for appending encoded payload.
+  // Returns nullptr in case of failure
   std::unique_ptr<AppendRequest>
   prepareRequest(logid_t logid,
-                 T payload,
+                 PayloadHolder&& payload,
                  append_callback_t cb,
                  AppendAttributes attrs,
                  worker_id_t target_worker,
                  std::unique_ptr<std::string> per_request_token);
+  std::unique_ptr<AppendRequest>
+  prepareRequest(logid_t logid,
+                 PayloadGroup&& payload_group,
+                 append_callback_t cb,
+                 AppendAttributes attrs,
+                 worker_id_t target_worker,
+                 std::unique_ptr<std::string> per_request_token);
+
+  // Creates append request with specified payload without performing payload
+  // validation
+  std::unique_ptr<AppendRequest>
+  createRequest(logid_t logid,
+                PayloadHolder&& payload,
+                append_callback_t cb,
+                AppendAttributes attrs,
+                worker_id_t target_worker,
+                std::unique_ptr<std::string> per_request_token);
 
   // Proxy for Processor::postRequest() with careful error handling
   int postAppend(std::unique_ptr<AppendRequest> req);
@@ -543,9 +570,6 @@ class ClientImpl : public Client,
       settings_subscription_handle_;
 
   folly::Optional<AppendErrorInjector> append_error_injector_;
-
-  // OpenTracing tracer for client operations (append)
-  std::shared_ptr<opentracing::Tracer> ottracer_;
 };
 
 class ClientBridgeImpl : public ClientBridge {
@@ -556,16 +580,8 @@ class ClientBridgeImpl : public ClientBridge {
     return parent_->getTraceLogger();
   }
 
-  const std::shared_ptr<opentracing::Tracer> getOTTracer() const override {
-    return parent_->getOTTracer();
-  }
-
   bool hasWriteToken(const std::string& required) const override {
     return parent_->hasWriteToken(required);
-  }
-
-  bool shouldE2ETrace() const override {
-    return parent_->shouldE2ETrace();
   }
 
  private:

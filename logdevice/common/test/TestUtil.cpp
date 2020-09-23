@@ -24,24 +24,27 @@
 #include <folly/dynamic.h>
 #include <folly/experimental/TestUtil.h>
 #include <folly/json.h>
+#include <gtest/gtest.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 
 #include "logdevice/common/NoopTraceLogger.h"
 #include "logdevice/common/PermissionChecker.h"
-#include "logdevice/common/PrincipalParser.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/ReaderImpl.h"
 #include "logdevice/common/SequencerLocator.h"
 #include "logdevice/common/Timer.h"
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/configuration/ConfigParser.h"
+#include "logdevice/common/configuration/nodes/NodesConfigurationCodec.h"
+#include "logdevice/common/configuration/nodes/NodesConfigurationManagerFactory.h"
 #include "logdevice/common/debug.h"
 #include "logdevice/common/plugin/CommonBuiltinPlugins.h"
 #include "logdevice/common/protocol/MessageTypeNames.h"
 #include "logdevice/common/request_util.h"
 #include "logdevice/common/settings/Settings.h"
+#include "logdevice/common/test/NodesConfigurationTestUtil.h"
 #include "logdevice/common/util.h"
 #include "logdevice/include/Reader.h"
 
@@ -94,76 +97,65 @@ int overwriteConfigFile(const char* path, const std::string& contents) {
 
 int overwriteConfig(const char* path,
                     const ServerConfig* server_cfg,
-                    const LogsConfig* logs_cfg,
-                    bool write_separately) {
-  if (!write_separately) {
-    ld_check(server_cfg);
-    return overwriteConfigFile(path, server_cfg->toString(logs_cfg));
-  }
-  ld_check(server_cfg || logs_cfg);
-  auto json_to_string = [](const folly::dynamic& json) {
-    folly::json::serialization_opts opts;
-    opts.pretty_formatting = true;
-    opts.sort_keys = true;
-    return folly::json::serialize(json, opts);
-  };
-  auto include_path =
-      boost::filesystem::path(path).parent_path() / "included_logs.conf";
-  if (logs_cfg) {
-    folly::dynamic logs_config_json =
-        folly::dynamic::object("logs", logs_cfg->toJson());
-    int rv = overwriteConfigFile(
-        include_path.string().c_str(), json_to_string(logs_config_json));
-    if (rv != 0) {
-      return rv;
-    }
-  }
-  if (server_cfg) {
-    auto json = server_cfg->toJson();
-    json["include_log_config"] = include_path.string();
-
-    return overwriteConfigFile(path, json_to_string(json));
-  }
-  return 0;
+                    const LogsConfig* logs_cfg) {
+  ld_check(server_cfg);
+  return overwriteConfigFile(path, server_cfg->toString(logs_cfg));
 }
 
-std::unique_ptr<folly::test::TemporaryDirectory>
-createTemporaryDir(const std::string& name_prefix, bool keep_data) {
-  using folly::test::TemporaryDirectory;
-
-  TemporaryDirectory::Scope scope = keep_data
-      ? TemporaryDirectory::Scope::PERMANENT
-      : TemporaryDirectory::Scope::DELETE_ON_DESTRUCTION;
-
-  using boost::filesystem::path;
-  std::vector<path> prefixes = {"/dev/shm/tmp/logdevice", "/tmp/logdevice"};
-  for (path prefix : prefixes) {
+TemporaryDirectory::TemporaryDirectory(const std::string& name_prefix) {
+  const static std::vector<fs::path> prefixes = {
+      "/dev/shm/tmp/logdevice", "/tmp/logdevice"};
+  for (fs::path prefix : prefixes) {
     try {
-      boost::filesystem::create_directories(prefix);
-      auto dir =
-          std::make_unique<TemporaryDirectory>(name_prefix, prefix, scope);
-      return dir;
-    } catch (const boost::filesystem::filesystem_error& e) {
-      // Failed.  Continue with next prefix.
+      fs::create_directories(prefix);
+      fs::path p =
+          prefix / fs::unique_path(name_prefix + ".%%%%-%%%%-%%%%-%%%%");
+      fs::create_directory(p);
+      path_ = p;
+      return;
+    } catch (const fs::filesystem_error& e) {
+      // Failed. Continue with next prefix.
     }
   }
-  ld_error("Failed to create root directory for test data");
+  ld_error("Failed to create directory for test data");
   ld_check(false);
-  return nullptr;
 }
 
-ServerConfig::NodesConfig createSimpleNodesConfig(size_t nnodes) {
-  ServerConfig::Nodes nodes;
-  for (size_t i = 0; i < nnodes; ++i) {
-    auto& node = nodes[i];
-    node.name = folly::sformat("server-{}", i);
-    node.address = Sockaddr("::1", folly::to<std::string>(4440 + i));
-    node.gossip_address = Sockaddr("::1", folly::to<std::string>(5440 + i));
-    node.generation = 1;
-    node.addSequencerRole();
-    node.addStorageRole(/*num_shards*/ 2);
+TemporaryDirectory::~TemporaryDirectory() {
+  if (!path_.has_value()) {
+    // Moved out.
+    return;
   }
-  return ServerConfig::NodesConfig(std::move(nodes));
+  if (getenv_switch("LOGDEVICE_TEST_LEAVE_DATA") ||
+      (getenv_switch("LOGDEVICE_TEST_LEAVE_DATA_IF_FAILED") &&
+       testing::Test::HasFailure())) {
+    ld_info("Leaving data in %s", path_.value().string().c_str());
+    return;
+  }
+  boost::system::error_code ec;
+  fs::remove_all(path_.value(), ec);
+  if (ec) {
+    ld_error("Failed to delete temporary directory at %s: %s",
+             path_.value().string().c_str(),
+             toString(ec).c_str());
+  }
+}
+
+std::shared_ptr<const NodesConfiguration>
+createSimpleNodesConfig(size_t nnodes,
+                        shard_size_t num_shards,
+                        bool all_metadata,
+                        int replication_factor) {
+  configuration::Nodes nodes;
+  for (size_t i = 0; i < nnodes; ++i) {
+    nodes[i] = configuration::Node::withTestDefaults(i)
+                   .addSequencerRole()
+                   .addStorageRole(num_shards)
+                   .setIsMetadataNode(all_metadata || i == 0);
+  }
+  return NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes),
+      ReplicationProperty{{NodeLocationScope::NODE, replication_factor}});
 }
 
 ServerConfig::MetaDataLogsConfig
@@ -189,7 +181,7 @@ createMetaDataLogsConfig(std::vector<node_index_t> positive_weight_nodes,
                       /* permissions */ false,
                       /* metadata_logs */ true);
 
-  ld_check(log_attrs.hasValue());
+  ld_check(log_attrs.has_value());
   cfg.setMetadataLogGroup(
       logsconfig::LogGroupNode("metadata logs",
                                log_attrs.value(),
@@ -198,61 +190,18 @@ createMetaDataLogsConfig(std::vector<node_index_t> positive_weight_nodes,
   return cfg;
 }
 
-ServerConfig::MetaDataLogsConfig
-createMetaDataLogsConfig(const ServerConfig::NodesConfig& nodes_config,
-                         size_t max_metadata_nodes,
-                         size_t max_replication,
-                         NodeLocationScope sync_replication_scope) {
-  // calculate a nodeset which has weights > 0 and resize with max_metadata
-  // accordingly
-  std::vector<node_index_t> positive_weight_nodes;
-  for (const auto& it : nodes_config.getNodes()) {
-    if (it.second.isWritableStorageNode()) {
-      positive_weight_nodes.push_back(it.first);
-    }
-  }
-  size_t meta_nodeset_size =
-      std::min(positive_weight_nodes.size(), max_metadata_nodes);
-  positive_weight_nodes.resize(meta_nodeset_size);
-
-  return createMetaDataLogsConfig(std::move(positive_weight_nodes),
-                                  max_replication,
-                                  sync_replication_scope);
-}
-
-std::shared_ptr<Configuration>
-createSimpleConfig(ServerConfig::NodesConfig nodes, size_t logs) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(1);
+std::shared_ptr<Configuration> createSimpleConfig(size_t nnodes, size_t logs) {
+  auto log_attrs = logsconfig::LogAttributes().with_replicationFactor(1);
   auto logs_config = std::make_shared<configuration::LocalLogsConfig>();
   logs_config->insert(
       boost::icl::right_open_interval<logid_t::raw_type>(1, logs + 1),
       "log1",
       log_attrs);
 
-  ServerConfig::MetaDataLogsConfig meta_config =
-      createMetaDataLogsConfig(nodes, 1, 1);
-
-  auto server_config = ServerConfig::fromDataTest(__FILE__, nodes, meta_config);
+  auto nodes = createSimpleNodesConfig(nnodes);
+  auto server_config = ServerConfig::fromDataTest(__FILE__);
   return std::make_shared<Configuration>(
-      std::move(server_config), std::move(logs_config));
-}
-
-std::shared_ptr<Configuration> createSimpleConfig(size_t nnodes, size_t logs) {
-  ServerConfig::Nodes nodes;
-  for (size_t i = 0; i < nnodes; ++i) {
-    Configuration::Node node;
-    node.name = folly::sformat("server-{}", i);
-    node.address = Sockaddr("::1", folly::to<std::string>(4440 + i));
-    node.gossip_address =
-        Sockaddr("::1", folly::to<std::string>(4440 + nnodes + i));
-    node.generation = 1;
-    node.addSequencerRole();
-    node.addStorageRole(/*num_shards*/ 2);
-    nodes[i] = std::move(node);
-  }
-  ServerConfig::NodesConfig nodes_config(nodes);
-  return createSimpleConfig(std::move(nodes_config), logs);
+      std::move(server_config), std::move(logs_config), std::move(nodes));
 }
 
 int wait_until(const char* reason,
@@ -318,7 +267,7 @@ int read_records_swallow_gaps(
   size_t total_read = 0;
   ld_info("Reading %zu records ...", nrecords);
   int ngaps = 0;
-  while (1) {
+  while (reader.isReadingAny()) {
     GapRecord gap;
     int nread = reader.read(nrecords - total_read, data_out, &gap);
     if (nread < 0) {
@@ -333,6 +282,7 @@ int read_records_swallow_gaps(
     ld_info("Read %zu of %zu records ...", total_read, nrecords);
   }
   ld_info("Finished reading");
+  ld_check_ge(total_read, nrecords);
   reader.setTimeout(timeout_stash);
   return ngaps;
 }
@@ -368,10 +318,6 @@ std::chrono::milliseconds getDefaultTestTimeout() {
   return getenv_switch("LOGDEVICE_TEST_NO_TIMEOUT")
       ? std::chrono::hours(24 * 365)
       : DEFAULT_TEST_TIMEOUT;
-}
-
-bool testsShouldLeaveData() {
-  return getenv_switch("LOGDEVICE_TEST_LEAVE_DATA");
 }
 
 std::shared_ptr<PluginRegistry> make_test_plugin_registry() {
@@ -412,7 +358,7 @@ void gracefully_shutdown_processor(Processor* processor) {
           /* with_retrying = */ true);
   ld_info("Waiting for workers to acknowledge.");
 
-  folly::collectAllSemiFuture(futures.begin(), futures.end()).get();
+  folly::collectAll(futures.begin(), futures.end()).get();
   ld_info("Workers acknowledged stopping accepting new work");
 
   ld_info("Finishing work and closing sockets on all workers.");
@@ -427,7 +373,7 @@ void gracefully_shutdown_processor(Processor* processor) {
       /* with_retrying = */ true);
   ld_info("Waiting for workers to acknowledge.");
 
-  folly::collectAllSemiFuture(futures.begin(), futures.end()).get();
+  folly::collectAll(futures.begin(), futures.end()).get();
   ld_info("Workers finished all works.");
 
   ld_info("Stopping Processor");
@@ -486,7 +432,7 @@ std::string get_localhost_address_str() {
   if (getifaddrs(&ifaddr) != 0) {
     throw std::runtime_error(
         "getifaddrs() failed. errno=" + folly::to<std::string>(errno) + " (" +
-        folly::errnoStr(errno).toStdString() + ")");
+        folly::errnoStr(errno) + ")");
   }
 
   SCOPE_EXIT {
@@ -514,6 +460,31 @@ std::string get_localhost_address_str() {
     }
   }
   throw std::runtime_error("couldn't find any loopback interfaces");
+}
+
+std::unique_ptr<folly::test::TemporaryDirectory>
+provisionTempNodesConfiguration(const NodesConfiguration& nodes_config) {
+  auto temp_dir = std::make_unique<folly::test::TemporaryDirectory>();
+
+  using namespace logdevice::configuration::nodes;
+  NodesConfigurationStoreFactory::Params params;
+  params.type = NodesConfigurationStoreFactory::NCSType::File;
+  params.file_store_root_dir = temp_dir->path().string();
+  params.path = NodesConfigurationStoreFactory::getDefaultConfigStorePath(
+      NodesConfigurationStoreFactory::NCSType::File, "");
+
+  auto store = NodesConfigurationStoreFactory::create(std::move(params));
+  if (store == nullptr) {
+    return nullptr;
+  }
+
+  auto serialized = NodesConfigurationCodec::serialize(nodes_config);
+  if (serialized.empty()) {
+    return nullptr;
+  }
+  store->updateConfigSync(
+      std::move(serialized), NodesConfigurationStore::Condition::overwrite());
+  return temp_dir;
 }
 
 }} // namespace facebook::logdevice

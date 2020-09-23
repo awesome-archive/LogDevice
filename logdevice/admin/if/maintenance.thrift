@@ -1,4 +1,4 @@
-/**
+/*
  * Copyright (c) 2018-present, Facebook, Inc. and its affiliates.
  * All rights reserved.
  *
@@ -6,11 +6,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-include "logdevice/admin/if/common.thrift"
+include "logdevice/common/if/common.thrift"
 include "logdevice/admin/if/nodes.thrift"
 include "logdevice/admin/if/safety.thrift"
 
 namespace cpp2 facebook.logdevice.thrift
+namespace go logdevice.admin.if.maintenance
 namespace py3 logdevice.admin
 namespace php LogDevice
 namespace wiki Thriftdoc.LogDevice.Maintenance
@@ -38,9 +39,40 @@ enum MaintenanceProgress {
   COMPLETED = 3,
 }
 
+/**
+ * Defines the scheduling priority of a given maintenance. Note that lower
+ * maintenance priorities might be associated with higher safety margin for
+ * availability loss.
+ */
+enum MaintenancePriority {
+  /**
+   * The maintenance MUST be executed before anything else, in this priority
+   * both capacity and safety checking will be ignored.
+   */
+  IMMINENT = 1,
+  /**
+   * The maintenance is of a high-priority and will be attempted to be scheduled
+   * before lower priority maintenances.
+   */
+  HIGH = 2,
+  /**
+   * The maintenance is of a medium-priority (default) and will be attempted
+   * to be scheduled before lower priority maintenances.
+   */
+  MEDIUM = 3,
+  /**
+   * Maintenances that are not critical to the system health. These can be used
+   * for a long-running rolling operation that sweeps the cluster (e.g., kernel
+   * upgrades). By default, these maintenances will have one extra scope of
+   * safety margin.
+   */
+  LOW = 4,
+}
+
 struct MaintenanceDefinition {
   /**
-   * if ShardID's shard_index == -1 this maintenance targets the entire node.
+   * if ShardID's shard_index == common.ALL_SHARDS this maintenance targets the
+   * entire node.
    * Accepted values are [MAY_DISAPPEAR, DRAINED]
    */
   1: common.ShardSet shards,
@@ -57,9 +89,6 @@ struct MaintenanceDefinition {
    * The user associated with this maintenance request. The same user cannot
    * request multiple maintenances with different targets for the same shards.
    * This will trigger MaintenanceClash exception (see exceptions.thrift)
-   *
-   * `user` cannot contain whitespaces. Otherwise, an InvalidRequest exception
-   * will be thrown.
    */
   5: string user,
   /**
@@ -76,11 +105,11 @@ struct MaintenanceDefinition {
   /**
    * Dangerous and should only be used for emergency situations.
    */
-  8: bool skip_safety_checks = false,
+  8: bool skip_safety_checks = false (deprecated), // use priority == IMMINENT
   /**
-   * Should NEVER be set by the user. Admin API will reject requests setting
-   * this to true. This can only be set by internal maintenances requested by
-   * the RebuildingSupervisor.
+   * Should not be set by the user unless there is a very good reason to.
+   * This is normally set by internal maintenances requested by the
+   * RebuildingSupervisor.
    *
    * If this is set to true, this means that we don't expect the shards to be
    * donors in the rebuilding process. aka. shards are inaccessible!
@@ -111,11 +140,12 @@ struct MaintenanceDefinition {
    * The Maintenance Manager starts a count down that the maintenance will
    * expire in (now + 3600 seconds).
    * If the user wishes to extend the TTL, they should call the same
-   * applyMaintenance() call with same arguments (user, shards, shard_target_state,
+   * applyMaintenance() call with same arguments
+   * (user, shards, shard_target_state,
    * sequencer_nodes, sequencer_target_state, are what matter). Or simply
    * filling the (user, group-id) field instead. If the request didn't match all
-   * the shards in the group, we will fail the request with MaintenanceMatchError
-   * exception.
+   * the shards in the group, we will fail the request with
+   * MaintenanceMatchError exception.
    *
    * The Maintenance Manager will add another ttl_seconds to the current time.
    *
@@ -171,6 +201,19 @@ struct MaintenanceDefinition {
    * used to know whether this particular maintenance has completed or not.
    */
   17: MaintenanceProgress progress,
+  /**
+   * The maintenance priority defined for this maintenance. By default if unset
+   * the priority will be treated as MEDIUM
+   */
+  18: optional MaintenancePriority priority,
+  /**
+   * This will ignore capacity checking during maintenance evaluation. This can
+   * be very useful if the operation is meant to (shrink) the cluster size.
+   * Default is "false".
+   *
+   * The rest of the safety checks will still be performed.
+   */
+  19: bool skip_capacity_checks = false,
 }
 
 /**

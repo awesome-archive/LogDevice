@@ -14,13 +14,10 @@
 
 #include <sys/socket.h>
 
-#include "event2/listener.h"
-#include "event2/util.h"
 #include "logdevice/common/ClientID.h"
 #include "logdevice/common/Request.h"
 #include "logdevice/common/Sockaddr.h"
 #include "logdevice/common/debug.h"
-#include "logdevice/common/libevent/compat.h"
 #include "logdevice/common/stats/Stats.h"
 #include "logdevice/include/Err.h"
 #include "logdevice/server/FailureDetector.h"
@@ -31,26 +28,37 @@ ConnectionListener::ConnectionListener(
     Listener::InterfaceDef iface,
     KeepAlive loop,
     std::shared_ptr<SharedState> shared_state,
-    ListenerType listener_type,
-    ResourceBudget& connection_backlog_budget)
-    : Listener(std::move(iface), loop),
+    ConnectionKind connection_kind,
+    ResourceBudget& connection_backlog_budget,
+    bool enable_dscp_reflection)
+    : Listener(std::move(iface), loop, enable_dscp_reflection),
       loop_(loop),
       connection_backlog_budget_(connection_backlog_budget),
       shared_state_(shared_state),
-      listener_type_(listener_type) {
+      connection_kind_(connection_kind) {
   ld_check(shared_state);
 }
 
-const SimpleEnumMap<ConnectionListener::ListenerType, std::string>&
-ConnectionListener::listenerTypeNames() {
+const char*
+ConnectionListener::connectionKindToThreadName(ConnectionKind connection_kind) {
   // Note that thread names are limited to 16 characters. Use them wisely.
-  static SimpleEnumMap<ConnectionListener::ListenerType, std::string>
-      listener_names({
-          {ConnectionListener::ListenerType::DATA, "ld:conn-listen"},
-          {ConnectionListener::ListenerType::DATA_SSL, "ld:sconn-listen"},
-          {ConnectionListener::ListenerType::GOSSIP, "ld:gossip"},
-      });
-  return listener_names;
+  switch (connection_kind) {
+    case ConnectionKind::DATA:
+      return "ld:conn-listen";
+    case ConnectionKind::DATA_LOW_PRIORITY:
+      return "ld:lo-pri-listen";
+    case ConnectionKind::DATA_HIGH_PRIORITY:
+      return "ld:hi-pri-listen";
+    case ConnectionKind::DATA_SSL:
+      return "ld:sconn-listen";
+    case ConnectionKind::GOSSIP:
+      return "ld:gossip";
+    case ConnectionKind::SERVER_TO_SERVER:
+      return "ld:s2s-listen";
+    case ConnectionKind::MAX:
+      ld_check(false);
+      return "ld:conn-max";
+  }
 }
 
 ConnectionType
@@ -88,7 +96,7 @@ void ConnectionListener::ReadEventHandler::handlerReady(
           1,
           "Error passing accepted connection to %s thread. "
           "postRequest() reported %s.",
-          listenerTypeNames()[connection_listener_->listener_type_].c_str(),
+          connectionKindToThreadName(connection_listener_->connection_kind_),
           error_description(err));
       folly::netops::close(sock_);
       // ~NewConnectionRequest() will also destroy the token, thus releasing the
@@ -131,6 +139,9 @@ void ConnectionListener::connectionAccepted(
                       "has been reached.",
                       sockaddr.toString().c_str());
     folly::netops::close(fd);
+    if (conn_limit_reached_cb_) {
+      conn_limit_reached_cb_();
+    }
     return;
   }
   auto conn_backlog_token = connection_backlog_budget_.acquireToken();
@@ -150,7 +161,7 @@ void ConnectionListener::connectionAccepted(
   SocketType sock_type;
   WorkerType target_worker_type = WorkerType::GENERAL;
 
-  if (listener_type_ == ListenerType::GOSSIP) {
+  if (connection_kind_ == ConnectionKind::GOSSIP) {
     ld_check(processor->failure_detector_);
     sock_type = SocketType::GOSSIP;
     target_worker_type = WorkerType::FAILURE_DETECTOR;
@@ -172,6 +183,7 @@ void ConnectionListener::connectionAccepted(
                                                   std::move(conn_backlog_token),
                                                   sock_type,
                                                   ConnectionType::NONE,
+                                                  connection_kind_,
                                                   target_worker_type),
            this)});
   auto& ret = read_event_handlers_.at(fd);
@@ -204,4 +216,11 @@ folly::SemiFuture<folly::Unit> ConnectionListener::stopAcceptingConnections() {
       });
   return res;
 }
+
+void ConnectionListener::setConnectionLimitReachedCallback(
+    ConnectionLimitReachedCallback cb) {
+  ld_check(!conn_limit_reached_cb_);
+  conn_limit_reached_cb_ = cb;
+}
+
 }} // namespace facebook::logdevice

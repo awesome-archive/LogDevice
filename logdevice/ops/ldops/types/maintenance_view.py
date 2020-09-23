@@ -12,13 +12,12 @@ import operator
 from datetime import datetime, timedelta
 from typing import Any, Collection, Dict, Optional, Tuple
 
+from ldops.const import INTERNAL_USER
 from ldops.exceptions import NodeIsNotASequencerError
-from ldops.types.maintenance_overall_status import MaintenanceOverallStatus
 from ldops.types.node_view import NodeView
 from ldops.types.sequencer_maintenance_progress import SequencerMaintenanceProgress
 from ldops.types.shard_maintenance_progress import ShardMaintenanceProgress
-from logdevice.admin.common.types import NodeID, ShardID
-from logdevice.admin.maintenance.types import MaintenanceDefinition
+from logdevice.admin.maintenance.types import MaintenanceDefinition, MaintenanceProgress
 from logdevice.admin.nodes.types import (
     MaintenanceStatus,
     SequencerState,
@@ -26,6 +25,7 @@ from logdevice.admin.nodes.types import (
     ShardOperationalState,
     ShardState,
 )
+from logdevice.common.types import NodeID, ShardID
 
 
 class MaintenanceView:
@@ -49,7 +49,6 @@ class MaintenanceView:
 
     @property
     def affected_sequencer_node_indexes(self) -> Tuple[int, ...]:
-        # pyre-fixme[7]: Expected `Tuple[int, ...]` but got `Tuple[Optional[int], ...]`.
         return tuple(
             n.node_index
             for n in self.affected_sequencer_node_ids
@@ -64,7 +63,6 @@ class MaintenanceView:
 
     @property
     def affected_storage_node_indexes(self) -> Tuple[int, ...]:
-        # pyre-fixme[7]: Expected `Tuple[int, ...]` but got `Tuple[Optional[int], ...]`.
         return tuple(
             n.node_index
             for n in self.affected_storage_node_ids
@@ -82,7 +80,6 @@ class MaintenanceView:
 
     @property
     def affected_node_indexes(self) -> Tuple[int, ...]:
-        # pyre-fixme[7]: Expected `Tuple[int, ...]` but got `Tuple[Optional[int], ...]`.
         return tuple(
             n.node_index for n in self.affected_node_ids if n.node_index is not None
         )
@@ -117,7 +114,7 @@ class MaintenanceView:
         if self._maintenance.created_on is None:
             return None
         else:
-            # pyre-fixme[16]: `Optional` has no attribute `__floordiv__`.
+            # pyre-fixme[6]: Expected `int` for 1st param but got `Optional[int]`.
             return datetime.fromtimestamp(self._maintenance.created_on // 1000)
 
     @property
@@ -125,7 +122,7 @@ class MaintenanceView:
         if self._maintenance.expires_on is None:
             return None
         else:
-            # pyre-fixme[16]: `Optional` has no attribute `__floordiv__`.
+            # pyre-fixme[6]: Expected `int` for 1st param but got `Optional[int]`.
             return datetime.fromtimestamp(self._maintenance.expires_on // 1000)
 
     @property
@@ -133,7 +130,8 @@ class MaintenanceView:
         if self.expires_on is None:
             return None
         else:
-            # pyre-fixme[16]: `Optional` has no attribute `__sub__`.
+            # pyre-fixme[6]: `-` is not supported for operand types
+            #  `Optional[datetime]` and `datetime`.
             return self.expires_on - datetime.now()
 
     @property
@@ -180,52 +178,36 @@ class MaintenanceView:
 
     @property
     def is_everything_done(self) -> bool:
-        return self.are_all_sequencers_done and self.are_all_shards_done
+        return self._maintenance.progress == MaintenanceProgress.COMPLETED
 
     @property
     def is_blocked(self) -> bool:
-        for s in self.shards:
-            if self.get_shard_maintenance_status(s) in {
-                MaintenanceStatus.BLOCKED_UNTIL_SAFE,
-                MaintenanceStatus.REBUILDING_IS_BLOCKED,
-            }:
-                return True
-
-        for n in self.sequencer_nodes:
-            if self.get_sequencer_maintenance_status(n) in {
-                MaintenanceStatus.BLOCKED_UNTIL_SAFE,
-                MaintenanceStatus.REBUILDING_IS_BLOCKED,
-            }:
-                return True
-
-        return False
+        return self._maintenance.progress in [
+            MaintenanceProgress.BLOCKED_UNTIL_SAFE,
+            MaintenanceProgress.UNKNOWN,
+        ]
 
     @property
     def is_completed(self) -> bool:
-        for s in self.shards:
-            if self.get_shard_maintenance_status(s) != MaintenanceStatus.COMPLETED:
-                return False
-
-        for n in self.sequencer_nodes:
-            if self.get_sequencer_maintenance_status(n) != MaintenanceStatus.COMPLETED:
-                return False
-
-        return True
+        return self._maintenance.progress == MaintenanceProgress.COMPLETED
 
     @property
     def is_in_progress(self) -> bool:
-        return not self.is_blocked and not self.is_completed
+        return self._maintenance.progress == MaintenanceProgress.IN_PROGRESS
 
-    def get_shard_state(self, shard: ShardID) -> ShardState:
+    @property
+    def is_internal(self) -> bool:
+        return self.user == INTERNAL_USER
+
+    def get_shard_state(self, shard: ShardID) -> Optional[ShardState]:
         assert shard.node.node_index is not None
-        # pyre-fixme[6]: Expected `int` for 1st param but got `Optional[int]`.
-        return self._node_index_to_node_view[shard.node.node_index].shard_states[
-            shard.shard_index
-        ]
+        node = self._node_index_to_node_view[shard.node.node_index]
+        if node.is_storage:
+            return node.shard_states[shard.shard_index]
+        return None
 
     def get_sequencer_state(self, sequencer: NodeID) -> Optional[SequencerState]:
         assert sequencer.node_index is not None
-        # pyre-fixme[6]: Expected `int` for 1st param but got `Optional[int]`.
         return self._node_index_to_node_view[sequencer.node_index].sequencer_state
 
     def get_shards_by_node_index(self, node_index: int) -> Tuple[ShardID, ...]:
@@ -242,6 +224,10 @@ class MaintenanceView:
 
     def get_shard_maintenance_status(self, shard: ShardID) -> MaintenanceStatus:
         shard_state = self.get_shard_state(shard)
+        if shard_state is None:
+            # This is not a storage node, we assume that these shards are
+            # COMPLETED already since there is nothing to be done.
+            return MaintenanceStatus.COMPLETED
         if self.shard_target_state == ShardOperationalState.MAY_DISAPPEAR:
             if shard_state.current_operational_state in {
                 ShardOperationalState.DRAINED,
@@ -256,17 +242,16 @@ class MaintenanceView:
                 return MaintenanceStatus.COMPLETED
 
         if shard_state.maintenance is not None:
-            # pyre-fixme[16]: `Optional` has no attribute `status`.
             return shard_state.maintenance.status
 
         return MaintenanceStatus.NOT_STARTED
 
     def get_shard_last_updated_at(self, shard: ShardID) -> Optional[datetime]:
         shard_state = self.get_shard_state(shard)
+        if shard_state is None:
+            return None
         if shard_state.maintenance is not None:
             return ShardMaintenanceProgress.from_thrift(
-                # pyre-fixme[6]: Expected `ShardMaintenanceProgress` for 1st param
-                #  but got `Optional[ShardMaintenanceProgress]`.
                 shard_state.maintenance
             ).last_updated_at
         else:
@@ -279,7 +264,6 @@ class MaintenanceView:
         if self.sequencer_target_state == sequencer_state.state:
             return MaintenanceStatus.COMPLETED
         elif sequencer_state.maintenance is not None:
-            # pyre-fixme[16]: `Optional` has no attribute `status`.
             return sequencer_state.maintenance.status
         else:
             return MaintenanceStatus.NOT_STARTED
@@ -290,18 +274,11 @@ class MaintenanceView:
             raise NodeIsNotASequencerError(f"{sequencer}")
         elif sequencer_state.maintenance is not None:
             return SequencerMaintenanceProgress.from_thrift(
-                # pyre-fixme[6]: Expected `SequencerMaintenanceProgress` for 1st
-                #  param but got `Optional[SequencerMaintenanceProgress]`.
                 sequencer_state.maintenance
             ).last_updated_at
         else:
             return None
 
     @property
-    def overall_status(self) -> MaintenanceOverallStatus:
-        if self.is_completed:
-            return MaintenanceOverallStatus.COMPLETED
-        elif self.is_blocked:
-            return MaintenanceOverallStatus.BLOCKED
-        else:
-            return MaintenanceOverallStatus.IN_PROGRESS
+    def overall_status(self) -> MaintenanceProgress:
+        return self._maintenance.progress

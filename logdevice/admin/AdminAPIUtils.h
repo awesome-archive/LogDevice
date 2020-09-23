@@ -9,6 +9,9 @@
 #pragma once
 
 #include <folly/Optional.h>
+#include <folly/Random.h>
+#include <folly/futures/Future.h>
+#include <folly/futures/Retrying.h>
 
 #include "logdevice/admin/if/gen-cpp2/admin_types.h"
 #include "logdevice/common/Sockaddr.h"
@@ -29,6 +32,21 @@ std::string toString(const thrift::SocketAddressFamily& address);
 std::string toString(const thrift::SocketAddress& address);
 
 using NodeFunctor = std::function<void(node_index_t)>;
+
+/**
+ * Returns a retrying policy used by folly::futures::retrying. The policy
+ * VERSION_MISMATCH errors 5 times.
+ */
+std::function<folly::Future<bool>(size_t, const folly::exception_wrapper&)>
+get_ncm_retrying_policy();
+
+/**
+ * Given a list of NodesFilter, return a list of node indicies which is the
+ * union of the matches of each filter.
+ */
+std::vector<node_index_t> allMatchingNodesFromFilters(
+    const configuration::nodes::NodesConfiguration& nodes_configuration,
+    const std::vector<thrift::NodesFilter>& filters);
 
 void forFilteredNodes(
     const configuration::nodes::NodesConfiguration& nodes_configuration,

@@ -93,27 +93,26 @@ bool WaitForPurgesRequest::checkShardHasPurged(shard_index_t shard_idx) const {
   LogStorageState* log_state =
       processor->getLogStorageStateMap().insertOrGet(logid_, shard_idx);
 
-  if (log_state == nullptr) {
-    RATELIMIT_CRITICAL(
-        std::chrono::seconds(10),
-        10,
-        "Failed to insert LogStorageState for log %lu, shard %u: %s",
-        logid_.val_,
-        shard_idx,
-        error_description(err));
+  if (log_state->hasPermanentError()) {
+    RATELIMIT_WARNING(std::chrono::seconds(10),
+                      10,
+                      "LogStorageState for log %lu, shard %u is marked with "
+                      "permanent error. Skipping.",
+                      logid_.val_,
+                      shard_idx);
     return false;
   }
 
   const auto last_released = log_state->getLastReleasedLSN();
 
-  if (last_released.hasValue() && last_released.value() >= upTo_) {
+  if (last_released.value() >= upTo_) {
     return true;
   }
 
   // Make sure purging is triggered by simulating the sequencer sending a
   // RELEASE.
   log_state->purge_coordinator_->onReleaseMessage(
-      upTo_, seq_, ReleaseType::GLOBAL, true /* do_release */);
+      upTo_, seq_, ReleaseType::GLOBAL);
   return false;
 }
 

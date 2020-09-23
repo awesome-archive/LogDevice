@@ -34,15 +34,13 @@ namespace facebook { namespace logdevice { namespace RocksDBKeyFormat {
  */
 enum class KeyPrefix : char {
   LogSnapshotBlob = ']',
-  // TODO: (T30250351) clean-up that deprecated metadata everywhere so we can
-  // remove this from the enum.
-  Deprecated_1 = 'a',
   StoreMeta_RebuildingComplete = 'b',
   CopySetIndex = 'C',
   LogMeta_LastClean = 'c',
   PartitionMeta_Dirty = 'D',
   DataKey = 'd',
   LogMeta_LogRemovalTime = 'e',
+  LogMeta_RsmSnapshot = 'E',
   Index = 'I',
   LogMeta_SoftSeal = 'i',
   StoreMeta_ClusterMarker = 'i',
@@ -52,20 +50,25 @@ enum class KeyPrefix : char {
   // NOTE 'o' is deprecated and removed from shards on startup from now on
   PartitionDirectory = 'p',
   StoreMeta_RebuildingRanges = 'q',
-  LogMeta_RebuildingCheckpoint = 'R',
-  Deprecated_2 = 'r',
   LogMeta_Seal = 's',
   LogMeta_TrimPoint = 't',
-  Deprecated_3 = 'u',
   PerEpochLogMeta_Recovery = 'V',
   PartitionMeta_StartingTimestamp = 'v',
   PerEpochLogMeta_Mutable = 'W',
   PartitionMeta_CompactedRetention = 'w',
   PartitionMeta_MinTimestamp = 'x',
   PartitionMeta_MaxTimestamp = 'y',
+  PartitionMeta_CsiEnabled = 'Z',
   PartitionMeta_LastCompaction = 'z',
   // Reserved for identifying the version of DB format, see checkSchemaVersion()
-  Reserved_SchemaVersion = '.'
+  Reserved_SchemaVersion = '.',
+
+  // TODO: (T30250351) clean-up that deprecated metadata everywhere so we can
+  // remove this from the enum.
+  Deprecated_1 = 'a',
+  Deprecated_2 = 'r',
+  Deprecated_3 = 'u',
+  Deprecated_4 = 'R',
 };
 
 constexpr char prefix(KeyPrefix prefix) {
@@ -211,6 +214,7 @@ class LogMetaKey {
       case LogMetadataType::DEPRECATED_1:
       case LogMetadataType::DEPRECATED_2:
       case LogMetadataType::DEPRECATED_3:
+      case LogMetadataType::DEPRECATED_4:
         assert(false);
         std::abort();
         return 0;
@@ -222,12 +226,12 @@ class LogMetaKey {
         return prefix(KeyPrefix::LogMeta_Seal);
       case LogMetadataType::LAST_CLEAN:
         return prefix(KeyPrefix::LogMeta_LastClean);
-      case LogMetadataType::REBUILDING_CHECKPOINT:
-        return prefix(KeyPrefix::LogMeta_RebuildingCheckpoint);
       case LogMetadataType::SOFT_SEAL:
         return prefix(KeyPrefix::LogMeta_SoftSeal);
       case LogMetadataType::LOG_REMOVAL_TIME:
         return prefix(KeyPrefix::LogMeta_LogRemovalTime);
+      case LogMetadataType::RSM_SNAPSHOT:
+        return prefix(KeyPrefix::LogMeta_RsmSnapshot);
       // Before adding a new character type, search in the
       // file(this is not the only place where these characters are
       // defined)
@@ -474,6 +478,8 @@ class PartitionMetaKey {
         return prefix(KeyPrefix::PartitionMeta_CompactedRetention);
       case PartitionMetadataType::DIRTY:
         return prefix(KeyPrefix::PartitionMeta_Dirty);
+      case PartitionMetadataType::CSI_ENABLED:
+        return prefix(KeyPrefix::PartitionMeta_CsiEnabled);
       case PartitionMetadataType::MAX:
         break;
     }

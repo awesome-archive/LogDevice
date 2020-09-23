@@ -9,10 +9,32 @@
 
 #include "logdevice/common/AdminCommandTable-fwd.h"
 #include "logdevice/common/PayloadHolder.h"
-#include "logdevice/server/RecordRebuildingStore.h"
 #include "logdevice/server/locallogstore/LocalLogStore.h"
+#include "logdevice/server/rebuilding/RecordRebuildingStore.h"
 
 namespace facebook { namespace logdevice {
+
+/**
+ * @file ChunkRebuilding is responsible for re-replicating a "chunk" of records.
+ *       It runs on rebuilding storage node. Chunk is a sequence of records
+ *       with the same log ID, consecutive LSNs, and the same copyset.
+ *       Most of rebuilding operates on chunks rather than individual records
+ *       for efficiency.
+ *
+ *       Currently ChunkRebuilding is implemented as a collection of
+ *       RecordRebuildingStore and RecordRebuildingAmend state machines for
+ *       individual records, which defeats some of the purpose of having chunks
+ *       in the first place. (The separation between Store and Amend part of
+ *       RecordRebuilding is a leftover from rebuilding without WAL feature,
+ *       which was removed and needs to be reimplemented; without it the
+ *       separation serves no purpose.) Would be good to refactor it to do the
+ *       actual re-replication work (picking copyset, sending out stores and
+ *       amends, dealing with timeouts, etc) in ChunkRebuilding directly -
+ *       perhaps by moving most of the code from RecordRebuilding* into
+ *       ChunkRebuilding, and perhaps adding a multi-STORE message to send the
+ *       whole chunk at once (which may also simplify handling of timeouts and
+ *       other errors).
+ */
 
 struct ChunkAddress {
   logid_t log;
@@ -33,32 +55,46 @@ struct ChunkData {
     // Note that this can't be a pointer because `buffer`'s data can be
     // reallocated when new records are appended to it.
     size_t offset;
-
-    // This is needed to be able to pass individual records as
-    // shared_ptr<PayloadHolder> sharing ownership of the whole chunk.
-    PayloadHolder payloadHolder;
   };
 
   ChunkAddress address;
   // Used for seeding the rng for the copyset selector.
   size_t blockID;
   // Timestamp of the first record in the chunk.
+  // (Rebuilding expects that each chunk is not very spread out in time, so
+  //  it's not important that this timestamp is oldest instead of e.g. newest or
+  //  average or something.)
   RecordTimestamp oldestTimestamp;
   // Information about records' epoch.
   std::shared_ptr<ReplicationScheme> replication;
 
   // All records concatenated together.
-  std::string buffer;
+  folly::IOBuf buffer;
   // Offset of end of each record in `buffer`.
   std::vector<RecordInfo> records;
 
   void addRecord(lsn_t lsn, Slice blob) {
-    // Check that LSNs are consecutive.
-    ld_check_eq(
-        lsn, records.empty() ? address.min_lsn : records.back().lsn + 1);
+    if (records.empty()) {
+      // Adding the first record. Create the buffer.
+      // We have to do this because reserve() doesn't work on
+      // default-initialized IOBuf.
+      buffer = folly::IOBuf(folly::IOBuf::CREATE, blob.size);
+      ld_check_eq(lsn, address.min_lsn);
+    } else {
+      // Check that LSNs are consecutive.
+      ld_check_eq(lsn, records.back().lsn + 1);
 
-    buffer.append(blob.ptr(), blob.size);
-    records.push_back({lsn, buffer.size(), PayloadHolder()});
+      if (blob.size > buffer.tailroom()) {
+        // Grow exponentially with factor 2.
+        buffer.reserve(/* minHeadroom */ 0,
+                       /* minTailroom */ std::max(blob.size, buffer.length()));
+      }
+    }
+
+    ld_check_ge(buffer.tailroom(), blob.size);
+    memcpy(buffer.writableTail(), blob.ptr(), blob.size);
+    buffer.append(blob.size);
+    records.push_back({lsn, buffer.length()});
   }
 
   size_t numRecords() const {
@@ -67,7 +103,7 @@ struct ChunkData {
 
   // Size of all records, including header.
   size_t totalBytes() const {
-    return buffer.size();
+    return buffer.length();
   }
 
   lsn_t getLSN(size_t idx) const {
@@ -76,13 +112,13 @@ struct ChunkData {
 
   // Serialized header+value combo, to be parsed
   // by LocalLogStoreRecordFormat::parse().
-  Slice getRecordBlob(size_t idx) const {
+  folly::IOBuf getRecordBlob(size_t idx) const {
     size_t off = idx ? records[idx - 1].offset : 0ul;
-    return Slice(buffer.data() + off, records[idx].offset - off);
-  }
-
-  PayloadHolder* getUninitializedPayloadHolder(size_t idx) {
-    return &records[idx].payloadHolder;
+    // Clone buffer and trim it to include just one record.
+    folly::IOBuf b = buffer;
+    b.trimEnd(b.length() - records[idx].offset);
+    b.trimStart(off);
+    return b;
   }
 
   ssize_t findLSN(lsn_t lsn) const {
@@ -101,13 +137,13 @@ class ChunkRebuilding : public RecordRebuildingOwner {
   // Constructor can be called from any thread but start() needs to be called
   // from the worker thread on which this ChunkRebuilding will live.
   ChunkRebuilding(std::unique_ptr<ChunkData> data,
-                  log_rebuilding_id_t chunk_id,
+                  chunk_rebuilding_id_t chunk_id,
                   std::shared_ptr<const RebuildingSet> rebuilding_set,
                   UpdateableSettings<RebuildingSettings> rebuilding_settings,
                   lsn_t rebuilding_version,
                   lsn_t restart_version,
                   uint32_t shard,
-                  ShardRebuildingV2Ref owner);
+                  ShardRebuildingRef owner);
 
   // If the chunk rebuilding is still running, aborts it.
   ~ChunkRebuilding();
@@ -119,7 +155,7 @@ class ChunkRebuilding : public RecordRebuildingOwner {
   logid_t getLogID() const override;
   lsn_t getRebuildingVersion() const override;
   lsn_t getRestartVersion() const override;
-  log_rebuilding_id_t getLogRebuildingId() const override;
+  chunk_rebuilding_id_t getChunkRebuildingId() const override;
   ServerInstanceId getServerInstanceId() const override;
   UpdateableSettings<RebuildingSettings> getRebuildingSettings() const override;
 
@@ -135,7 +171,7 @@ class ChunkRebuilding : public RecordRebuildingOwner {
                 ShardID from,
                 lsn_t rebuilding_version,
                 uint32_t rebuilding_wave,
-                log_rebuilding_id_t rebuilding_id,
+                chunk_rebuilding_id_t rebuilding_id,
                 ServerInstanceId server_instance_id,
                 FlushToken flush_token);
 
@@ -154,11 +190,11 @@ class ChunkRebuilding : public RecordRebuildingOwner {
   void getDebugInfo(InfoRebuildingChunksTable& table) const;
 
  private:
-  ShardRebuildingV2Ref owner_;
+  ShardRebuildingRef owner_;
   // This needs to be a shared_ptr to allow STORE_Message to keep the payload
   // alive until it's passed to TCP.
   std::shared_ptr<ChunkData> data_;
-  log_rebuilding_id_t chunkID_;
+  chunk_rebuilding_id_t chunkID_;
   std::shared_ptr<const RebuildingSet> rebuildingSet_;
   UpdateableSettings<RebuildingSettings> rebuildingSettings_;
   lsn_t rebuildingVersion_;
@@ -195,7 +231,7 @@ class StartChunkRebuildingRequest : public Request {
 
 class AbortChunkRebuildingRequest : public Request {
  public:
-  AbortChunkRebuildingRequest(worker_id_t worker_id, log_rebuilding_id_t id);
+  AbortChunkRebuildingRequest(worker_id_t worker_id, chunk_rebuilding_id_t id);
 
   int getThreadAffinity(int) override;
   WorkerType getWorkerTypeAffinity() override;
@@ -204,11 +240,12 @@ class AbortChunkRebuildingRequest : public Request {
 
  private:
   worker_id_t workerID_;
-  log_rebuilding_id_t id_;
+  chunk_rebuilding_id_t id_;
 };
 
 struct ChunkRebuildingMap {
-  std::unordered_map<log_rebuilding_id_t, std::unique_ptr<ChunkRebuilding>> map;
+  std::unordered_map<chunk_rebuilding_id_t, std::unique_ptr<ChunkRebuilding>>
+      map;
 };
 
 }} // namespace facebook::logdevice

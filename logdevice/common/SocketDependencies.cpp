@@ -5,16 +5,17 @@
 #include <folly/io/async/SSLContext.h>
 
 #include "logdevice/common/BuildInfo.h"
-#include "logdevice/common/PrincipalParser.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/SSLFetcher.h"
+#include "logdevice/common/SSLPrincipalParser.h"
 #include "logdevice/common/Sender.h"
 #include "logdevice/common/Sockaddr.h"
 #include "logdevice/common/Timestamp.h"
 #include "logdevice/common/UpdateableSecurityInfo.h"
 #include "logdevice/common/Worker.h"
 #include "logdevice/common/configuration/Configuration.h"
-#include "logdevice/common/libevent/compat.h"
+#include "logdevice/common/configuration/nodes/ServerAddressRouter.h"
+#include "logdevice/common/libevent/LibEventCompatibility.h"
 #include "logdevice/common/plugin/PluginRegistry.h"
 #include "logdevice/common/protocol/ACK_Message.h"
 #include "logdevice/common/protocol/HELLO_Message.h"
@@ -58,29 +59,35 @@ SocketDependencies::getNodesConfiguration() const {
 
 void SocketDependencies::noteBytesQueued(
     size_t nbytes,
+    PeerType peer_type,
     folly::Optional<MessageType> message_type) {
-  sender_->noteBytesQueued(nbytes, message_type);
+  sender_->noteBytesQueued(nbytes, peer_type, message_type);
 }
 
 void SocketDependencies::noteBytesDrained(
     size_t nbytes,
+    PeerType peer_type,
     folly::Optional<MessageType> message_type) {
-  sender_->noteBytesDrained(nbytes, message_type);
+  sender_->noteBytesDrained(nbytes, peer_type, message_type);
 }
 
 size_t SocketDependencies::getBytesPending() const {
   return sender_->getBytesPending();
 }
 
-std::shared_ptr<SSLContext>
-SocketDependencies::getSSLContext(bool accepting) const {
-  // Servers are required to have a certificate so that the client can verify
-  // them. If clients specify that they want to include their certificate, then
-  // the server will also authenticate the client certificates.
-  bool loadCert = getSettings().server || getSettings().ssl_load_client_cert;
+std::shared_ptr<SSLContext> SocketDependencies::getSSLContext() const {
+  return Worker::onThisThread()->sslFetcher().getSSLContext();
+}
 
-  return Worker::onThisThread()->sslFetcher().getSSLContext(
-      loadCert, accepting);
+SSLSessionCache& SocketDependencies::getSSLSessionCache() const {
+  return Worker::onThisThread()->processor_->sslSessionCache();
+}
+
+std::shared_ptr<SSLPrincipalParser>
+SocketDependencies::getPrincipalParser() const {
+  return Worker::onThisThread()
+      ->processor_->security_info_->get()
+      ->principal_parser;
 }
 
 bool SocketDependencies::shuttingDown() const {
@@ -91,23 +98,25 @@ std::string SocketDependencies::dumpQueuedMessages(Address addr) const {
   return sender_->dumpQueuedMessages(addr);
 }
 
-const Sockaddr& SocketDependencies::getNodeSockaddr(NodeID nid,
-                                                    SocketType type,
-                                                    ConnectionType conntype) {
+const Sockaddr&
+SocketDependencies::getNodeSockaddr(NodeID node_id,
+                                    SocketType socket_type,
+                                    ConnectionType connection_type) {
   auto nodes_configuration = getNodesConfiguration();
   ld_check(nodes_configuration != nullptr);
 
   // note: we don't check for generation here, if the generation has changed in
   // the future, Sender will reset the connection
   const auto* node_service_discovery =
-      nodes_configuration->getNodeServiceDiscovery(nid.index());
+      nodes_configuration->getNodeServiceDiscovery(node_id.index());
 
   if (node_service_discovery) {
-    if (type == SocketType::GOSSIP && !getSettings().send_to_gossip_port) {
-      return node_service_discovery->getSockaddr(SocketType::DATA, conntype);
-    } else {
-      return node_service_discovery->getSockaddr(type, conntype);
-    }
+    return configuration::nodes::ServerAddressRouter().getAddress(
+        node_id.index(),
+        *node_service_discovery,
+        socket_type,
+        connection_type,
+        getSettings());
   }
 
   return Sockaddr::INVALID;
@@ -115,132 +124,6 @@ const Sockaddr& SocketDependencies::getNodeSockaddr(NodeID nid,
 
 EvBase* SocketDependencies::getEvBase() {
   return &EventLoop::onThisThread()->getEvBase();
-}
-
-const struct timeval*
-SocketDependencies::getCommonTimeout(std::chrono::milliseconds timeout) {
-  return EventLoop::onThisThread()->getCommonTimeout(timeout);
-}
-const timeval*
-SocketDependencies::getTimevalFromMilliseconds(std::chrono::milliseconds t) {
-  static thread_local timeval tv_buf{0, 0};
-  tv_buf.tv_sec = t.count() / 1000000;
-  tv_buf.tv_usec = t.count() % 1000000;
-  return &tv_buf;
-}
-
-const struct timeval* SocketDependencies::getZeroTimeout() {
-  return EventLoop::onThisThread()->getZeroTimeout();
-}
-
-struct bufferevent* FOLLY_NULLABLE
-SocketDependencies::buffereventSocketNew(int sfd,
-                                         int opts,
-                                         bool secure,
-                                         bufferevent_ssl_state ssl_state,
-                                         SSLContext* ssl_ctx) {
-  if (secure) {
-    if (!ssl_ctx) {
-      ld_error("Invalid SSLContext, can't create SSL socket");
-      return nullptr;
-    }
-
-    SSL* ssl = ssl_ctx->createSSL();
-    if (!ssl) {
-      ld_error("Null SSL* returned, can't create SSL socket");
-      return nullptr;
-    }
-
-    struct bufferevent* bev = bufferevent_openssl_socket_new(
-        EventLoop::onThisThread()->getEventBase(), sfd, ssl, ssl_state, opts);
-    if (!bev) {
-      return nullptr;
-    }
-
-    ld_check(bufferevent_get_openssl_error(bev) == 0);
-#if LIBEVENT_VERSION_NUMBER >= 0x02010100
-    bufferevent_openssl_set_allow_dirty_shutdown(bev, 1);
-#endif
-    return bev;
-
-  } else {
-    return LD_EV(bufferevent_socket_new)(
-        EventLoop::onThisThread()->getEventBase(), sfd, opts);
-  }
-}
-
-struct evbuffer* SocketDependencies::getOutput(struct bufferevent* bev) {
-  return LD_EV(bufferevent_get_output)(bev);
-}
-
-struct evbuffer* SocketDependencies::getInput(struct bufferevent* bev) {
-  return LD_EV(bufferevent_get_input)(bev);
-}
-
-int SocketDependencies::buffereventSocketConnect(struct bufferevent* bev,
-                                                 struct sockaddr* ss,
-                                                 int len) {
-  return LD_EV(bufferevent_socket_connect)(bev, ss, len);
-}
-
-void SocketDependencies::buffereventSetWatermark(struct bufferevent* bev,
-                                                 short events,
-                                                 size_t lowmark,
-                                                 size_t highmark) {
-  LD_EV(bufferevent_setwatermark)(bev, events, lowmark, highmark);
-}
-
-void SocketDependencies::buffereventSetCb(struct bufferevent* bev,
-                                          bufferevent_data_cb readcb,
-                                          bufferevent_data_cb writecb,
-                                          bufferevent_event_cb eventcb,
-                                          void* cbarg) {
-  LD_EV(bufferevent_setcb)(bev, readcb, writecb, eventcb, cbarg);
-}
-
-void SocketDependencies::buffereventShutDownSSL(struct bufferevent* bev) {
-  SSL* ctx = bufferevent_openssl_get_ssl(bev);
-  ld_check(ctx);
-  SSL_set_shutdown(ctx, SSL_RECEIVED_SHUTDOWN);
-  SSL_shutdown(ctx);
-  while (ERR_get_error()) {
-    // flushing all SSL errors so they don't get misattributed to another
-    // socket.
-  }
-}
-
-void SocketDependencies::buffereventFree(struct bufferevent* bev) {
-  LD_EV(bufferevent_free)(bev);
-}
-
-int SocketDependencies::evUtilMakeSocketNonBlocking(int sfd) {
-  return LD_EV(evutil_make_socket_nonblocking)(sfd);
-}
-
-int SocketDependencies::buffereventSetMaxSingleWrite(struct bufferevent* bev,
-                                                     size_t size) {
-#if LIBEVENT_VERSION_NUMBER >= 0x02010000
-  // In libevent >= 2.1 we can tweak the amount of data libevent sends to
-  // the TCP stack at once
-  return LD_EV(bufferevent_set_max_single_write)(bev, size);
-#else
-  // Let older libevent decide for itself.
-  return 0;
-#endif
-}
-
-int SocketDependencies::buffereventSetMaxSingleRead(struct bufferevent* bev,
-                                                    size_t size) {
-#if LIBEVENT_VERSION_NUMBER >= 0x02010000
-  return LD_EV(bufferevent_set_max_single_read)(bev, size);
-#else
-  return 0;
-#endif
-}
-
-int SocketDependencies::buffereventEnable(struct bufferevent* bev,
-                                          short event) {
-  return LD_EV(bufferevent_enable)(bev, event);
 }
 
 void SocketDependencies::onSent(std::unique_ptr<Message> msg,
@@ -296,7 +179,7 @@ void executeOnWorker(Worker* worker,
         auto rv = cb(msg.get(), from, *identity);
         switch (rv) {
           case Message::Disposition::ERROR:
-            worker->sender().closeSocket(from, err);
+            worker->sender().closeConnection(from, err);
             break;
           case Message::Disposition::KEEP:
             // Ownership transferred.
@@ -343,158 +226,6 @@ void SocketDependencies::processDeferredMessageCompletions() {
 
 NodeID SocketDependencies::getMyNodeID() {
   return processor_->getMyNodeID();
-}
-
-/**
- * Attempt to set SO_SNDBUF, SO_RCVBUF, TCP_NODELAY, SO_KEEP_ALIVE,
- * TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT, TCP_USER_TIMEOUT options of
- * socket fd to values in getSettings().
- *
- * @param is_tcp If set to false, do not set TCP_NODELAY because this socket is
- * not a tcp socket.
- * @param snd_out  if non-nullptr, report the value of SO_SNDBUF through this.
- *                 Set value to -1 if getsockopt() fails.
- * @param rcv_out  same as snd_out, but for SO_RCVBUF.
- *
- * NOTE that the values reported by getsockopt() for buffer sizes are 2X what
- * is passed in through setsockopt() because that's how Linux does it. See
- * socket(7).
- * NOTE that KEEP_ALIVE options are used only for tcp sockets (when is_tcp is
- * true).
- */
-void SocketDependencies::configureSocket(bool is_tcp,
-                                         int fd,
-                                         int* snd_out,
-                                         int* rcv_out,
-                                         sa_family_t sa_family,
-                                         const uint8_t default_dscp) {
-  int sndbuf_size, rcvbuf_size;
-  int rv;
-  socklen_t optlen;
-
-  sndbuf_size = getSettings().tcp_sendbuf_kb * 1024;
-  if (sndbuf_size >= 0) {
-    rv = setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(int));
-    if (rv != 0) {
-      ld_error("Failed to set sndbuf size for TCP socket %d to %d: %s",
-               fd,
-               sndbuf_size,
-               strerror(errno));
-    }
-  }
-
-  if (snd_out) {
-    optlen = sizeof(int);
-    rv = getsockopt(fd, SOL_SOCKET, SO_SNDBUF, snd_out, &optlen);
-    if (rv == 0) {
-      *snd_out /= 2; // account for Linux doubling the value
-    } else {
-      ld_error("Failed to get sndbuf size for TCP socket %d: %s",
-               fd,
-               strerror(errno));
-      *snd_out = -1;
-    }
-  }
-
-  rcvbuf_size = getSettings().tcp_rcvbuf_kb * 1024;
-  if (rcvbuf_size >= 0) {
-    rv = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(int));
-    if (rv != 0) {
-      ld_error("Failed to set rcvbuf size for TCP socket %d to %d: %s",
-               fd,
-               rcvbuf_size,
-               strerror(errno));
-    }
-  }
-
-  if (rcv_out) {
-    optlen = sizeof(int);
-    rv = getsockopt(fd, SOL_SOCKET, SO_RCVBUF, rcv_out, &optlen);
-    if (rv == 0) {
-      *rcv_out /= 2; // account for Linux doubling the value
-    } else {
-      ld_error("Failed to get rcvbuf size for TCP socket %d: %s",
-               fd,
-               strerror(errno));
-      *rcv_out = -1;
-    }
-  }
-
-  if (is_tcp) {
-    if (!getSettings().nagle) {
-      int one = 1;
-      rv = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-      if (rv != 0) {
-        ld_error("Failed to set TCP_NODELAY for TCP socket %d: %s",
-                 fd,
-                 strerror(errno));
-      }
-    }
-  }
-
-  bool keep_alive = getSettings().use_tcp_keep_alive;
-  if (is_tcp && keep_alive) {
-    int keep_alive_time = getSettings().tcp_keep_alive_time;
-    int keep_alive_intvl = getSettings().tcp_keep_alive_intvl;
-    int keep_alive_probes = getSettings().tcp_keep_alive_probes;
-
-    rv = setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keep_alive, sizeof(int));
-    if (rv != 0) {
-      ld_error("Failed to set SO_KEEPIDLE for TCP socket %d: %s",
-               fd,
-               strerror(errno));
-    }
-
-    if (keep_alive_time > 0) {
-      rv = setsockopt(fd, SOL_TCP, TCP_KEEPIDLE, &keep_alive_time, sizeof(int));
-      if (rv != 0) {
-        ld_error("Failed to set TCP_KEEPIDLE for TCP socket %d: %s",
-                 fd,
-                 strerror(errno));
-      }
-    }
-
-    if (keep_alive_intvl > 0) {
-      rv = setsockopt(
-          fd, SOL_TCP, TCP_KEEPINTVL, &keep_alive_intvl, sizeof(int));
-      if (rv != 0) {
-        ld_error("Failed to set TCP_KEEPINTVL for TCP socket %d: %s",
-                 fd,
-                 strerror(errno));
-      }
-    }
-
-    if (keep_alive_probes > 0) {
-      rv =
-          setsockopt(fd, SOL_TCP, TCP_KEEPCNT, &keep_alive_probes, sizeof(int));
-      if (rv != 0) {
-        ld_error("Failed to set TCP_KEEPCNT for TCP socket %d: %s",
-                 fd,
-                 strerror(errno));
-      }
-    }
-  }
-
-#ifdef __linux__
-  if (is_tcp) {
-    int tcp_user_timeout = getSettings().tcp_user_timeout;
-
-    if (tcp_user_timeout >= 0) {
-      rv = setsockopt(
-          fd, SOL_TCP, TCP_USER_TIMEOUT, &tcp_user_timeout, sizeof(int));
-      if (rv != 0) {
-        ld_error("Failed to set TCP_USER_TIMEOUT for TCP socket %d: %s",
-                 fd,
-                 strerror(errno));
-      }
-    }
-  }
-#endif
-  rv = setDSCP(fd, sa_family, default_dscp);
-  if (rv != 0) {
-    ld_error(
-        "DSCP(%x) configuration failed: %s", default_dscp, strerror(errno));
-  }
 }
 
 int SocketDependencies::setDSCP(int fd,
@@ -550,13 +281,13 @@ std::string SocketDependencies::getClientBuildInfo() {
   return build_info->getBuildInfoJson();
 }
 
+SteadyTimestamp SocketDependencies::getCurrentTimestamp() {
+  return SteadyTimestamp::now();
+}
+
 bool SocketDependencies::authenticationEnabled() {
-  if (processor_->security_info_) {
-    auto principal_parser = processor_->security_info_->getPrincipalParser();
-    return principal_parser != nullptr;
-  } else {
-    return false;
-  }
+  return processor_->security_info_ &&
+      processor_->security_info_->get()->isAuthenticationEnabled();
 }
 
 bool SocketDependencies::allowUnauthenticated() {
@@ -566,10 +297,8 @@ bool SocketDependencies::allowUnauthenticated() {
 bool SocketDependencies::includeHELLOCredentials() {
   // Only include HELLOCredentials in HELLO_Message when the PrincipalParser
   // will use the data.
-  auto principal_parser = processor_->security_info_->getPrincipalParser();
-  return principal_parser != nullptr &&
-      (principal_parser->getAuthenticationType() ==
-       AuthenticationType::SELF_IDENTIFICATION);
+  const auto auth_type = processor_->security_info_->get()->auth_type;
+  return auth_type == AuthenticationType::SELF_IDENTIFICATION;
 }
 
 void SocketDependencies::onStartedRunning(RunContext context) {
@@ -651,7 +380,7 @@ SocketDependencies::createHelloMessage(NodeID destNodeID) {
   // If the client location is specified in settings, include it in the HELLOv2
   // message.
   auto& client_location_opt = getSettings().client_location;
-  if (client_location_opt.hasValue()) {
+  if (client_location_opt.has_value()) {
     client_location = client_location_opt.value().toString();
     hdr.flags |= HELLO_Header::CLIENT_LOCATION;
   }
@@ -680,17 +409,17 @@ SocketDependencies::createShutdownMessage(uint32_t serverInstanceId) {
   return std::make_unique<SHUTDOWN_Message>(hdr);
 }
 
-uint16_t SocketDependencies::processHelloMessage(const Message* msg) {
-  return std::min(static_cast<const HELLO_Message*>(msg)->header_.proto_max,
-                  getSettings().max_protocol);
+void SocketDependencies::processHelloMessage(const Message& msg,
+                                             ConnectionInfo& info) {
+  const auto& hello = dynamic_cast<const HELLO_Message&>(msg);
+  info.protocol = std::min(hello.header_.proto_max, getSettings().max_protocol);
 }
 
-void SocketDependencies::processACKMessage(const Message* msg,
-                                           ClientID* our_name_at_peer,
-                                           uint16_t* destProto) {
-  const ACK_Message* ack = static_cast<const ACK_Message*>(msg);
-  *our_name_at_peer = ClientID(ack->getHeader().client_idx);
-  *destProto = ack->getHeader().proto;
+void SocketDependencies::processACKMessage(const Message& msg,
+                                           ConnectionInfo& info) {
+  const auto& ack = static_cast<const ACK_Message&>(msg);
+  info.our_name_at_peer = ClientID(ack.getHeader().client_idx);
+  info.protocol = ack.getHeader().proto;
 }
 
 std::unique_ptr<Message>
@@ -727,5 +456,14 @@ folly::Func SocketDependencies::setupContextGuard() {
       Worker::onUnset();
     }
   };
+}
+
+folly::Executor* SocketDependencies::getExecutor() const {
+  return worker_->getExecutor();
+}
+
+int SocketDependencies::getTCPInfo(TCPInfo* info, int fd) {
+  LinuxNetUtils util;
+  return util.getTCPInfo(info, fd);
 }
 }} // namespace facebook::logdevice

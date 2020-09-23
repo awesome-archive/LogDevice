@@ -46,20 +46,26 @@ int LogsConfigManager::getLogsConfigManagerWorkerIdx(int nthreads) {
   return configuration::InternalLogs::CONFIG_LOG_DELTAS.val_ % nthreads;
 }
 
-bool LogsConfigManager::createAndAttach(Processor& processor,
-                                        bool is_writable) {
+bool LogsConfigManager::createAndAttach(
+    Processor& processor,
+    std::unique_ptr<RSMSnapshotStore> snapshot_store,
+    bool is_writable) {
   std::unique_ptr<LogsConfigManager> manager;
   ld_debug("Creating LogsConfigManager");
 
   manager = std::make_unique<LogsConfigManager>(
       processor.updateableSettings(),
       processor.config_,
+      std::move(snapshot_store),
       LogsConfigManager::workerType(&processor),
       is_writable);
   std::unique_ptr<Request> req =
       std::make_unique<StartLogsConfigManagerRequest>(std::move(manager));
 
-  const int rv = processor.postRequest(req);
+  // We want to make sure that LCM has called start() (if needed) before the
+  // rest of the components execute their work, this ensures that the empty
+  // LogsConfig is published before the rest of dependencies.
+  const int rv = processor.blockingRequest(req);
   if (rv != 0) {
     ld_error("Cannot post request to start logs config manager: %s (%s)",
              error_name(err),
@@ -74,10 +80,12 @@ bool LogsConfigManager::createAndAttach(Processor& processor,
 LogsConfigManager::LogsConfigManager(
     UpdateableSettings<Settings> updateable_settings,
     std::shared_ptr<UpdateableConfig> updateable_config,
+    std::unique_ptr<RSMSnapshotStore> snapshot_store,
     WorkerType lcm_worker_type,
     bool is_writable)
     : settings_(std::move(updateable_settings)),
       updateable_config_(std::move(updateable_config)),
+      snapshot_store_(std::move(snapshot_store)),
       lcm_worker_type_(lcm_worker_type),
       is_writable_(is_writable) {}
 
@@ -87,6 +95,15 @@ void LogsConfigManager::onSettingsUpdated() {
       Worker::onThisThread(true)->settings().logsconfig_manager_grace_period;
 
   if (isEnabledInSettings()) {
+    if (is_running_) {
+      ld_assert(state_machine_);
+      // Only update the blocking status, we are not calling
+      // state_machine_->start() so we need to manually control the blocking
+      // state from here.
+      bool is_delivery_blocked =
+          Worker::onThisThread(true)->settings().block_logsconfig_rsm;
+      state_machine_->blockStateDelivery(is_delivery_blocked);
+    }
     if (publish_timer_.isActive()) {
       // LCM is already running and we have an active publish timer.
       ld_check(is_running_);
@@ -101,11 +118,43 @@ void LogsConfigManager::onSettingsUpdated() {
         cancelPublishTimer();
         activatePublishTimer();
       }
-    } else if (!testRequestsHoldInStartingState()) {
+    } else {
       start();
     }
   } else {
     stop();
+  }
+}
+
+void LogsConfigManager::onServerConfigUpdated() {
+  // Check for updates only if LCM is running
+  if (isEnabledInSettings() && is_running_) {
+    auto server_config = updateable_config_->getServerConfig();
+    const auto& server_config_internal_log =
+        server_config->getInternalLogsConfig();
+    auto logs_config = updateable_config_->getLocalLogsConfig();
+    const auto& logs_config_internal_log = logs_config->getInternalLogs();
+
+    if (server_config_internal_log != logs_config_internal_log) {
+      // Make a new copy of the existing config
+      std::shared_ptr<LocalLogsConfig> new_logs_config =
+          std::make_shared<LocalLogsConfig>(
+              *updateable_config_->getLocalLogsConfig());
+      // Setting the InternalLogs from ServerConfig
+      new_logs_config->setInternalLogsConfig(server_config_internal_log);
+      // We want the latest namespace delimiter to be set for this config.
+      new_logs_config->setNamespaceDelimiter(
+          server_config->getNamespaceDelimiter());
+      updateable_config_->updateableLogsConfig()->update(new_logs_config);
+      ld_info(
+          "Published new LogsConfig (fully loaded? %s) version (%lu) from "
+          "LogsConfigManager because ServerConfig was updated to version:%s",
+          new_logs_config->isFullyLoaded() ? "yes" : "no",
+          new_logs_config->getVersion(),
+          toString(server_config->getVersion()).c_str());
+      // increment the counter of number of published updates
+      STAT_INCR(getStats(), logsconfig_manager_published_server_config_update);
+    }
   }
 }
 
@@ -146,8 +195,11 @@ void LogsConfigManager::start() {
     activatePublishTimer();
   };
   auto updateable_server_config = updateable_config_->updateableServerConfig();
-  state_machine_ = std::make_unique<LogsConfigStateMachine>(
-      settings_, updateable_server_config, is_writable_);
+  state_machine_ =
+      std::make_unique<LogsConfigStateMachine>(settings_,
+                                               updateable_server_config,
+                                               std::move(snapshot_store_),
+                                               is_writable_);
 
   config_updates_handle_ = state_machine_->subscribe(cb);
   // Used to know whether the LogsConfig Manager is STARTED or not.
@@ -411,7 +463,7 @@ Request::Execution LogsConfigManagerRequest::executeGetDirectoryOrLogGroup(
       break;
     }
     case LOGS_CONFIG_API_Header::Type::GET_LOG_GROUP_BY_NAME: {
-      std::shared_ptr<LogGroupNode> lg = tree.findLogGroup(blob_);
+      const auto lg = tree.findLogGroup(blob_);
       if (lg == nullptr) {
         st = E::NOTFOUND;
       } else {
@@ -491,7 +543,7 @@ std::string LogsConfigManagerRequest::calculateResponsePayload(
   } else if (delta.type() == DeltaOpType::MK_LOG_GROUP) {
     const MkLogGroupDelta& mk_log_group =
         checked_downcast<const MkLogGroupDelta&>(delta);
-    std::shared_ptr<LogGroupNode> lg = tree.findLogGroup(mk_log_group.path);
+    auto lg = tree.findLogGroup(mk_log_group.path);
     return LogsConfigStateMachine::serializeLogGroup(*lg);
   } else {
     // We don't need a payload in response of any other delta type.
@@ -556,7 +608,7 @@ LogsConfigManagerReply::sendChunks(Worker* w) {
 
     if (rv != 0) {
       if (err == E::NOBUFS) {
-        ld_debug("Socket buffer full");
+        ld_debug("Connection buffer full");
 
         // we should continue later
         return sent == 0 ? LogsConfigManagerReply::SendResult::SENT_NONE

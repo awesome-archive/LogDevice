@@ -26,6 +26,7 @@
 #include "logdevice/common/CheckNodeHealthRequest.h"
 #include "logdevice/common/CheckSealRequest.h"
 #include "logdevice/common/ClientIdxAllocator.h"
+#include "logdevice/common/ClientReadStreamDebugInfoHandler.h"
 #include "logdevice/common/ClusterState.h"
 #include "logdevice/common/ConfigurationFetchRequest.h"
 #include "logdevice/common/CopySetManager.h"
@@ -39,9 +40,9 @@
 #include "logdevice/common/GetEpochRecoveryMetadataRequest.h"
 #include "logdevice/common/GetHeadAttributesRequest.h"
 #include "logdevice/common/GetLogInfoRequest.h"
+#include "logdevice/common/GetRsmSnapshotRequest.h"
 #include "logdevice/common/GetTrimPointRequest.h"
 #include "logdevice/common/GraylistingTracker.h"
-#include "logdevice/common/IsLogEmptyRequest.h"
 #include "logdevice/common/LogIDUniqueQueue.h"
 #include "logdevice/common/LogRecoveryRequest.h"
 #include "logdevice/common/LogsConfigApiRequest.h"
@@ -49,29 +50,28 @@
 #include "logdevice/common/MetaDataLogWriter.h"
 #include "logdevice/common/NodesConfigurationUpdatedRequest.h"
 #include "logdevice/common/PermissionChecker.h"
-#include "logdevice/common/PrincipalParser.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/SSLFetcher.h"
 #include "logdevice/common/SequencerBackgroundActivator.h"
 #include "logdevice/common/ServerConfigUpdatedRequest.h"
 #include "logdevice/common/ShapingContainer.h"
 #include "logdevice/common/SyncSequencerRequest.h"
-#include "logdevice/common/TimeoutMap.h"
 #include "logdevice/common/TraceLogger.h"
 #include "logdevice/common/TrimRequest.h"
 #include "logdevice/common/WorkerTimeoutStats.h"
 #include "logdevice/common/WriteMetaDataRecord.h"
-#include "logdevice/common/client_read_stream/AllClientReadStreams.h"
 #include "logdevice/common/configuration/ServerConfig.h"
 #include "logdevice/common/configuration/UpdateableConfig.h"
 #include "logdevice/common/configuration/logs/LogsConfigManager.h"
 #include "logdevice/common/event_log/EventLogStateMachine.h"
+#include "logdevice/common/network/AsyncSocketConnectionFactory.h"
 #include "logdevice/common/network/OverloadDetector.h"
 #include "logdevice/common/protocol/APPENDED_Message.h"
 #include "logdevice/common/protocol/MessageDispatch.h"
 #include "logdevice/common/protocol/MessageTracer.h"
 #include "logdevice/common/stats/ServerHistograms.h"
 #include "logdevice/common/stats/Stats.h"
+#include "logdevice/common/thrift/ThriftRouter.h"
 #include "logdevice/include/Err.h"
 
 namespace facebook { namespace logdevice {
@@ -116,15 +116,19 @@ class WorkerImpl {
   WorkerImpl(Worker* w,
              const std::shared_ptr<UpdateableConfig>& config,
              StatsHolder* stats)
-      : sender_(w->immutable_settings_,
+      : sender_(w,
+                w->processor_,
+                w->immutable_settings_,
                 w->getEventBase(),
                 config->get()->serverConfig()->getTrafficShapingConfig(),
                 &w->processor_->clientIdxAllocator(),
                 w->worker_type_ == WorkerType::FAILURE_DETECTOR,
-                config->getServerConfig()
-                    ->getNodesConfigurationFromServerConfigSource(),
+                config->getNodesConfiguration(),
                 getMyNodeIndex(w),
                 getMyLocation(config, w),
+                std::unique_ptr<IConnectionFactory>(
+                    new AsyncSocketConnectionFactory(
+                        w->getEvBase().getEventBase())),
                 stats),
         activeAppenders_(w->immutable_settings_->server ? N_APPENDER_MAP_BUCKETS
                                                         : 1),
@@ -134,14 +138,15 @@ class WorkerImpl {
                         w->immutable_settings_->num_workers),
         // TODO: Make this configurable
         previously_redirected_appends_(1024),
-        sslFetcher_(w->immutable_settings_->ssl_cert_path,
-                    w->immutable_settings_->ssl_key_path,
-                    w->immutable_settings_->ssl_ca_path,
-                    w->immutable_settings_->ssl_cert_refresh_interval),
-
-        graylistingTracker_(std::make_unique<GraylistingTracker>())
-
-  {
+        graylistingTracker_(std::make_unique<GraylistingTracker>()),
+        clientReadStreamDebugHandler_{
+            w->processor_->csid_,
+            w->getEvBase().getEventBase(),
+            w->immutable_settings_->all_read_streams_sampling_rate,
+            w->processor_->getPluginRegistry(),
+            w->processor_->updateableSettings()
+                ->all_read_streams_debug_config_path,
+            clientReadStreams_} {
     const auto& read_shaping_cfg =
         config->get()->serverConfig()->getReadIOShapingConfig();
     read_shaping_container_ = std::make_unique<ShapingContainer>(
@@ -155,12 +160,11 @@ class WorkerImpl {
 
   ShardAuthoritativeStatusManager shardStatusManager_;
   Sender sender_;
-  LogRebuildingMap runningLogRebuildings_;
   FindKeyRequestMap runningFindKey_;
   FireAndForgetRequestMap runningFireAndForgets_;
   TrimRequestMap runningTrimRequests_;
+  GetRsmSnapshotRequestMap runningGetRsmSnapshotRequests_;
   GetTrimPointRequestMap runningGetTrimPoint_;
-  IsLogEmptyRequestMap runningIsLogEmpty_;
   DataSizeRequestMap runningDataSize_;
   GetHeadAttributesRequestMap runningGetHeadAttributes_;
   GetClusterStateRequestMap runningGetClusterState_;
@@ -168,6 +172,7 @@ class WorkerImpl {
   LogsConfigApiRequestMap runningLogManagementReqs_;
   LogsConfigManagerRequestMap runningLogsConfigManagerReqs_;
   LogsConfigManagerReplyMap runningLogsConfigManagerReplies_;
+  SettingOverrideTTLRequestMap activeSettingOverrides_;
   AppendRequestMap runningAppends_;
   CheckSealRequestMap runningCheckSeals_;
   ConfigurationFetchRequestMap runningConfigurationFetches_;
@@ -181,14 +186,14 @@ class WorkerImpl {
   AppenderBuffer previously_redirected_appends_;
   LogIDUniqueQueue recoveryQueueDataLog_;
   LogIDUniqueQueue recoveryQueueMetaDataLog_;
-  AllClientReadStreams clientReadStreams_;
   WriteMetaDataRecordMap runningWriteMetaDataRecords_;
   AppendRequestEpochMap appendRequestEpochMap_;
   CheckNodeHealthRequestSet pendingHealthChecks_;
-  SSLFetcher sslFetcher_;
   std::unique_ptr<SequencerBackgroundActivator> sequencerBackgroundActivator_;
   std::unique_ptr<GraylistingTracker> graylistingTracker_;
   std::unique_ptr<ShapingContainer> read_shaping_container_;
+  AllClientReadStreams clientReadStreams_;
+  ClientReadStreamDebugInfoHandler clientReadStreamDebugHandler_;
 };
 
 std::string Worker::makeThreadName(Processor* processor,
@@ -224,7 +229,16 @@ Worker::Worker(WorkContext::KeepAlive event_loop,
       accepting_work_(true),
       worker_timeout_stats_(std::make_unique<WorkerTimeoutStats>()),
       overload_detector_(std::make_unique<OverloadDetector>(
-          std::make_unique<OverloadDetectorDependencies>())) {}
+          std::make_unique<OverloadDetectorDependencies>())),
+      worker_stall_error_injection_chance_(
+          processor->updateableSettings()->worker_stall_error_injection_chance),
+      worker_queue_stall_error_injection_chance_(
+          processor->updateableSettings()
+              ->worker_queue_stall_error_injection_chance),
+      worker_stall_inj_ms_(
+          processor->updateableSettings()->health_monitor_max_stalls_avg_ms),
+      worker_queue_inj_ms_(processor->updateableSettings()
+                               ->health_monitor_max_queue_stalls_avg_ms) {}
 
 Worker::~Worker() {
   shutting_down_ = true;
@@ -293,16 +307,6 @@ Worker::getNodesConfiguration() const {
   return config_->getNodesConfiguration();
 }
 
-std::shared_ptr<const configuration::nodes::NodesConfiguration>
-Worker::getNodesConfigurationFromNCMSource() const {
-  return config_->getNodesConfigurationFromNCMSource();
-}
-
-std::shared_ptr<const configuration::nodes::NodesConfiguration>
-Worker::getNodesConfigurationFromServerConfigSource() const {
-  return config_->getNodesConfigurationFromServerConfigSource();
-}
-
 std::shared_ptr<LogsConfig> Worker::getLogsConfig() const {
   ld_check((bool)config_);
   return config_->getLogsConfig();
@@ -324,6 +328,17 @@ void Worker::onLogsConfigUpdated() {
   if (rebuilding_coordinator_) {
     rebuilding_coordinator_->noteConfigurationChanged();
   }
+
+  // Abort recoveries for removed logs.
+  auto cfg = config_->updateableLogsConfig()->get();
+  for (auto& r : runningLogRecoveries().map) {
+    if (!cfg->logExists(r.first)) {
+      ld_info("Aborting recovery of log %lu because the log was removed from "
+              "config.",
+              r.first.val());
+      r.second->noteLogRemovedFromConfig();
+    }
+  }
 }
 
 void Worker::onServerConfigUpdated() {
@@ -333,6 +348,10 @@ void Worker::onServerConfigUpdated() {
       config_->get()->serverConfig()->getClusterName();
 
   sender().noteConfigurationChanged(getNodesConfiguration());
+
+  if (logsconfig_manager_) {
+    logsconfig_manager_->onServerConfigUpdated();
+  }
 
   clientReadStreams().noteConfigurationChanged();
   // propagate the config change to metadata sequencer
@@ -520,6 +539,15 @@ void Worker::initializeSubscriptions() {
   onSettingsUpdated();
 }
 
+void Worker::initSSLFetcher() {
+  auto& setting = settings();
+  ssl_fetcher_ = SSLFetcher::create(setting.ssl_cert_path,
+                                    setting.ssl_key_path,
+                                    setting.ssl_ca_path,
+                                    setting.ssl_load_client_cert,
+                                    stats());
+}
+
 void Worker::setupWorker() {
   requests_stuck_timer_ = std::make_unique<Timer>(
       std::bind(&Worker::reportOldestRecoveryRequest, this));
@@ -554,6 +582,8 @@ void Worker::setupWorker() {
   // Initialize load reporting and start timer
   reportLoad();
   reportOldestRecoveryRequest();
+
+  initSSLFetcher();
 }
 
 const std::shared_ptr<TraceLogger> Worker::getTraceLogger() const {
@@ -579,17 +609,6 @@ void Worker::finishWorkAndCloseSockets() {
     ld_info("Aborted %lu sync sequencer requests", c);
   }
 
-  // Abort all LogRebuilding state machines.
-  std::vector<LogRebuildingInterface*> to_abort;
-  for (auto& it : runningLogRebuildings().map) {
-    to_abort.push_back(it.second.get());
-  }
-  if (!to_abort.empty()) {
-    for (auto l : to_abort) {
-      l->abort(false /* notify_complete */);
-    }
-    ld_info("Aborted %lu log rebuildings", to_abort.size());
-  }
   if (rebuilding_coordinator_) {
     rebuilding_coordinator_->shutdown();
   }
@@ -618,11 +637,25 @@ void Worker::finishWorkAndCloseSockets() {
     ld_info("Aborted %lu get-trim-point requests", c);
   }
 
+  // abort get-rsm-snapshot requests
+  if (!runningGetRsmSnapshotRequests().map.empty()) {
+    c = runningGetRsmSnapshotRequests().map.size();
+    runningGetRsmSnapshotRequests().map.clear();
+    ld_info("Aborted %lu get-rsm-snapshot requests", c);
+  }
+
   // abort configuration-fetch requests
   if (!runningConfigurationFetches().map.empty()) {
     c = runningConfigurationFetches().map.size();
     runningConfigurationFetches().map.clear();
     ld_info("Aborted %lu configuration-fetch requests", c);
+  }
+
+  // abort all running trim requests
+  if (!runningTrimRequests().map.empty()) {
+    c = runningTrimRequests().map.size();
+    runningTrimRequests().map.clear();
+    ld_info("Aborted %lu trim requests", c);
   }
 
   // Kick off the following async sequence:
@@ -643,10 +676,10 @@ void Worker::finishWorkAndCloseSockets() {
     sender().beginShutdown();
     waiting_for_sockets_to_close_ = true;
     // Initialize timer to force close sockets.
-    force_close_sockets_counter_ = settings().time_delay_before_force_abort;
+    force_close_conns_counter_ = settings().time_delay_before_force_abort;
   }
 
-  if (requestsPending() == 0 && sender().isClosed()) {
+  if (!requestsPending() && sender().isShutdownCompleted()) {
     // already done
     ld_info("Worker finished closing sockets");
     processor_->noteWorkerQuiescent(idx_, worker_type_);
@@ -671,10 +704,10 @@ void Worker::finishWorkAndCloseSockets() {
           }
         }
 
-        if (force_close_sockets_counter_ > 0) {
-          --force_close_sockets_counter_;
-          if (force_close_sockets_counter_ == 0) {
-            forceCloseSockets();
+        if (force_close_conns_counter_ > 0) {
+          --force_close_conns_counter_;
+          if (force_close_conns_counter_ == 0) {
+            sender().forceShutdown();
           }
         }
       }));
@@ -697,21 +730,20 @@ void Worker::forceAbortPendingWork() {
   }
 }
 
-void Worker::forceCloseSockets() {
-  {
-    // Close all sockets irrespective of pending work on them.
-    auto sockets_closed = sender().closeAllSockets();
-
-    ld_info("Num server sockets closed: %u, Num clients sockets closed: %u",
-            sockets_closed.first,
-            sockets_closed.second);
-  }
-}
-
 void Worker::disableSequencersDueIsolationTimeout() {
   Worker::onThisThread(false)
       ->processor_->allSequencers()
       .disableAllSequencersDueToIsolation();
+}
+
+folly::SemiFuture<folly::Unit> Worker::shutdownSender() {
+  folly::Promise<folly::Unit> promise;
+  auto future = promise.getSemiFuture();
+  add([this, p = std::move(promise)]() mutable {
+    sender().forceShutdown();
+    p.setValue(folly::unit);
+  });
+  return future;
 }
 
 void Worker::reportOldestRecoveryRequest() {
@@ -781,7 +813,6 @@ bool Worker::requestsPending() const {
   PROCESS(runningGetLogInfo().per_node_map, "per-node get log infos");
   PROCESS(runningGetTrimPoint().map, "get log trim points");
   PROCESS(runningTrimRequests().map, "trim requests");
-  PROCESS(runningLogRebuildings().map, "log rebuildings");
   PROCESS(runningSyncSequencerRequests().getList(), "sync sequencer requests");
   PROCESS(runningConfigurationFetches().map, "configuration fetch requests");
 #undef PROCESS
@@ -921,7 +952,6 @@ EventLogStateMachine* Worker::getEventLogStateMachine() {
 void Worker::setEventLogStateMachine(EventLogStateMachine* event_log) {
   ld_check(event_log_ == nullptr);
   event_log_ = event_log;
-  event_log_->setWorkerId(idx_);
 }
 
 void Worker::setLogsConfigManager(std::unique_ptr<LogsConfigManager> manager) {
@@ -950,7 +980,8 @@ ClusterState* Worker::getClusterState() {
 void Worker::onStoppedRunning(RunContext prev_context) {
   std::chrono::steady_clock::time_point start_time;
   start_time = currentlyRunningStart_;
-
+  generateErrorInjection(
+      worker_stall_error_injection_chance_, worker_stall_inj_ms_);
   setCurrentlyRunningContext(RunContext(), prev_context);
 
   auto end_time = currentlyRunningStart_;
@@ -966,9 +997,11 @@ void Worker::onStoppedRunning(RunContext prev_context) {
                       prev_context.describe().c_str());
     WORKER_STAT_INCR(worker_slow_requests);
     if (worker_type_ == WorkerType::GENERAL) {
-      processor_->getHealthMonitor().reportWorkerStall(
-          idx_.val_,
-          std::chrono::duration_cast<std::chrono::milliseconds>(duration));
+      if (long_execution_cb_) {
+        long_execution_cb_(
+            idx_.val_,
+            std::chrono::duration_cast<std::chrono::milliseconds>(duration));
+      }
     }
   }
 
@@ -1084,8 +1117,8 @@ Sender& Worker::sender() const {
   return impl_->sender_;
 }
 
-LogRebuildingMap& Worker::runningLogRebuildings() const {
-  return impl_->runningLogRebuildings_;
+ThriftRouter* Worker::getThriftRouter() const {
+  return processor_->getThriftRouter();
 }
 
 FindKeyRequestMap& Worker::runningFindKey() const {
@@ -1104,8 +1137,8 @@ GetTrimPointRequestMap& Worker::runningGetTrimPoint() const {
   return impl_->runningGetTrimPoint_;
 }
 
-IsLogEmptyRequestMap& Worker::runningIsLogEmpty() const {
-  return impl_->runningIsLogEmpty_;
+GetRsmSnapshotRequestMap& Worker::runningGetRsmSnapshotRequests() const {
+  return impl_->runningGetRsmSnapshotRequests_;
 }
 
 DataSizeRequestMap& Worker::runningDataSize() const {
@@ -1130,6 +1163,10 @@ LogsConfigManagerRequestMap& Worker::runningLogsConfigManagerRequests() const {
 
 LogsConfigManagerReplyMap& Worker::runningLogsConfigManagerReplies() const {
   return impl_->runningLogsConfigManagerReplies_;
+}
+
+SettingOverrideTTLRequestMap& Worker::activeSettingOverrides() const {
+  return impl_->activeSettingOverrides_;
 }
 
 AppenderMap& Worker::activeAppenders() const {
@@ -1214,7 +1251,7 @@ Worker::runningGetEpochRecoveryMetadata() const {
 }
 
 SSLFetcher& Worker::sslFetcher() const {
-  return impl_->sslFetcher_;
+  return *ssl_fetcher_;
 }
 
 std::unique_ptr<SequencerBackgroundActivator>&
@@ -1248,9 +1285,11 @@ void Worker::processRequest(std::unique_ptr<Request> rq) {
         1s, 1, "INTERNAL ERROR: got a NULL request pointer from RequestPump");
     return;
   }
-
+  if (rq->getExecutorPriority() == folly::Executor::HI_PRI) {
+    generateErrorInjection(
+        worker_queue_stall_error_injection_chance_, worker_queue_inj_ms_);
+  }
   RunContext run_context = rq->getRunContext();
-
   auto priority = rq->getExecutorPriority();
   auto queue_period = steady_clock::now() - rq->enqueue_time_;
   auto queue_time{duration_cast<milliseconds>(queue_period)};
@@ -1266,6 +1305,7 @@ void Worker::processRequest(std::unique_ptr<Request> rq) {
       }
       return "";
     };
+    WORKER_STAT_INCR(worker_long_queued_requests);
     RATELIMIT_WARNING(5s,
                       10,
                       "Request queued for %g msec: %s (id: %lu), p :%s",
@@ -1275,8 +1315,10 @@ void Worker::processRequest(std::unique_ptr<Request> rq) {
                       priority_to_str(priority));
     if (worker_type_ == WorkerType::GENERAL &&
         priority == folly::Executor::HI_PRI) {
-      processor_->getHealthMonitor().reportWorkerQueueStall(
-          idx_.val_, queue_time);
+      if (long_queued_cb_) {
+        long_queued_cb_(idx_.val_, queue_time);
+      }
+      WORKER_STAT_INCR(worker_hi_pri_long_queued_requests);
     }
   }
 
@@ -1391,4 +1433,22 @@ int Worker::forcePost(std::unique_ptr<Request>& req) {
 
   return 0;
 }
+
+void Worker::generateErrorInjection(double error_chance,
+                                    std::chrono::milliseconds sleep_duration) {
+  if (UNLIKELY(worker_type_ == WorkerType::GENERAL && error_chance > 0 &&
+               folly::Random::randDouble(0, 100.0) <= error_chance)) {
+    std::this_thread::sleep_for(sleep_duration);
+  }
+}
+void Worker::setLongExecutionCallback(SlowRequestCallback cb) {
+  ld_check(!long_execution_cb_);
+  long_execution_cb_ = cb;
+}
+
+void Worker::setLongQueuedCallback(SlowRequestCallback cb) {
+  ld_check(!long_queued_cb_);
+  long_queued_cb_ = cb;
+}
+
 }} // namespace facebook::logdevice

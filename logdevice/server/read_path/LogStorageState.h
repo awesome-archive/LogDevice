@@ -11,7 +11,7 @@
 #include <memory>
 #include <string>
 
-#include <folly/AtomicBitSet.h>
+#include <folly/ConcurrentBitSet.h>
 #include <folly/Optional.h>
 #include <folly/Portability.h>
 #include <folly/SharedMutex.h>
@@ -44,8 +44,8 @@ class LogStorageState {
   // Used by updateLastReleasedLSN() to indicate where the last released LSN
   // came from (for callers that care, such as rebuilding)
   enum class LastReleasedSource : uint8_t {
-    LOCAL_LOG_STORE = 1 << 0, // LSN was read from the local log store
-    RELEASE = 1 << 1          // got it from the sequencer (through a RELEASE)
+    LOCAL_LOG_STORE = 0, // LSN was read from the local log store
+    RELEASE              // got it from the sequencer (through a RELEASE)
   };
 
   enum class RecoverContext : uint8_t {
@@ -62,32 +62,29 @@ class LogStorageState {
     // NOTE: Make corresponding changes in GetSeqStateRequest.h
   };
 
-  // Wrapper around lsn_t representing the last released LSN, containing its
-  // initialization status and source from which it was initialized.
+  // Wrapper around lsn_t representing the last released LSN and
+  // source from which it was initialized.
   class LastReleasedLSN {
    public:
-    LastReleasedLSN() : lsn_(LSN_INVALID), state_(0) {}
-    LastReleasedLSN(lsn_t lsn, uint8_t state) : lsn_(lsn), state_(state) {}
-
-    bool hasValue() const {
-      return state_;
-    }
+    LastReleasedLSN()
+        : lsn_(LSN_INVALID), source_(LastReleasedSource::LOCAL_LOG_STORE) {}
 
     lsn_t value() const {
-      ld_check(hasValue());
       return lsn_;
     }
 
     LastReleasedSource source() const {
-      ld_check(hasValue());
-      return (state_ & (int)LastReleasedSource::RELEASE)
-          ? LastReleasedSource::RELEASE
-          : LastReleasedSource::LOCAL_LOG_STORE;
+      return source_;
+    }
+
+    void update(lsn_t lsn, LastReleasedSource source) {
+      lsn_ = lsn;
+      source_ = source;
     }
 
    private:
     lsn_t lsn_;
-    uint8_t state_;
+    LastReleasedSource source_;
   };
 
   /**
@@ -143,29 +140,11 @@ class LogStorageState {
   /**
    * Finds the last released LSN for the log.
    *
-   * @return Returns the requested LSN, or an empty Optional if the log was
-   *         not found in the map.
+   * @return Returns the requested LSN
    */
-  LastReleasedLSN getLastReleasedLSN(
-      std::memory_order mem_order = std::memory_order_seq_cst) const {
-    LastReleasedLSN result; // initially empty
-    uint8_t released_state = last_released_lsn_state_.load(mem_order);
-    if (released_state) {
-      result =
-          LastReleasedLSN(last_released_lsn_.load(mem_order), released_state);
-    }
-    return result;
-  }
-
-  /**
-   * Finds the last released LSN for the log.
-   *
-   * @return Returns the requested LSN, without information about the source of
-   *         initialization.
-   */
-  lsn_t getLastReleasedLSNWithoutSource(
-      std::memory_order mem_order = std::memory_order_seq_cst) const {
-    return last_released_lsn_.load(mem_order);
+  LastReleasedLSN getLastReleasedLSN() const {
+    folly::SharedMutex::ReadHolder rd_lock(lsn_mutex_);
+    return last_released_lsn_;
   }
 
   /**
@@ -179,7 +158,7 @@ class LogStorageState {
   /**
    * Gets the trim point, if initialized.
    */
-  folly::Optional<lsn_t> getTrimPoint() const;
+  lsn_t getTrimPoint() const;
 
   /**
    * Gets the per-epoch log metadata trim point, if initialized.
@@ -191,10 +170,9 @@ class LogStorageState {
    */
   folly::Optional<Seal> getSeal(SealType type) const;
 
-  folly::Optional<epoch_t> getLastCleanEpoch() const;
+  epoch_t getLastCleanEpoch() const;
 
-  const folly::Optional<std::pair<epoch_t, OffsetMap>>&
-  getEpochOffsetMap() const;
+  folly::Optional<std::pair<epoch_t, OffsetMap>> getEpochOffsetMap() const;
 
   std::chrono::seconds getLogRemovalTime() const {
     return log_removal_time_.load();
@@ -277,10 +255,6 @@ class LogStorageState {
     subscribed_workers_.reset(id.val_);
   }
 
-  void noteLogStateRecovered() {
-    recover_log_state_task_in_flight_.store(false);
-  }
-
   /**
    * Implementation of LogStorageStateMap::recoverLogState().
    */
@@ -354,14 +328,13 @@ class LogStorageState {
   // is received from the log's sequencer. Read by CatchupQueue when reading
   // from the local log store. Anything up to the last released LSN can be
   // safely read.
-  std::atomic<lsn_t> last_released_lsn_{LSN_INVALID};
+  LastReleasedLSN last_released_lsn_{};
 
   // Set to true if a permanent error was encountered and this LogStorageState
   // likely will never be fully up-to-date. If true, we should avoid creating
   // ServerReadStreams for this log because they are likely to get stuck waiting
   // for this LogStorageState to be updated. In particular this flag is set if:
-  //  * RecoverLogStateTask failed for this log. Things like trim_point_ will
-  //    most likely never be populated.
+  //  * Things like trim_point_ most likely will never be populated.
   //  * Purging was unable to complete due to a permanent error in the local
   //    log store. If a read stream is blocked on last_released_lsn_ being
   //    advanced and this flag is set, it knows it will be permanently stalled
@@ -381,27 +354,18 @@ class LogStorageState {
   // (LNG) of its epoch.
   std::atomic<lsn_t> last_per_epoch_released_lsn_{LSN_INVALID};
 
-  // Initialization state of last_released_lsn. Zero if uninitialized,
-  // otherwise bitwise-or of values from LastReleasedSource
-  std::atomic<uint8_t> last_released_lsn_state_{0};
-
   // Is there a GetSeqStateRequest inflight for this log?  If so, we avoid
   // creating new ones until it comes back.
   std::atomic<bool> get_seq_state_inflight_{false};
 
-  std::atomic<bool> recover_log_state_task_in_flight_{false};
-
   // Trim point of log.  Allows the local log store to delete trimmed
-  // records and read paths to recognize that records are missing because of
-  // trimming.  All records up to (and including) this LSN are scheduled for
-  // deletion and should not be exposed to clients.
-  // If uninitialized, the current thread may try to schedule recovery.
-  //
-  // Initialized by one of:
-  // (1) A TRIM message received by this process
-  // (2) A saved trim point lazily read from the local log store metadata
-  //     section
-  AtomicOptional<lsn_t> trim_point_{LSN_INVALID, EMPTY_OPTIONAL};
+  // records and read paths to recognize that records are missing
+  // because of trimming. All records up to (and including) this LSN
+  // are scheduled for deletion and should not be exposed to clients.
+  // The trim point is kept in-sync with TrimMetadata of the local log
+  // store.
+
+  std::atomic<lsn_t> trim_point_{LSN_INVALID};
 
   // Trim point of per-epoch log metadata. This is of type epoch_t instead
   // of lsn_t since these metadata are stored per-epoch. PerEpochLogMetadata
@@ -422,13 +386,11 @@ class LogStorageState {
   // atomic so that on incoming RELEASE messages we can decide without locking
   // if purging is necessary (most often it is not).
   // Initialized by reading the value from the local log store.
-  // If uninitialized, we kick off PurgeUncleanEpochs which reads the last clean
-  // epoch as its first step and reports back.
-  AtomicOptional<epoch_t::raw_type> last_clean_epoch_{0, EMPTY_OPTIONAL};
+  std::atomic<epoch_t::raw_type> last_clean_epoch_{EPOCH_INVALID.val_};
 
   // subscribed to broadcasts of RELEASE messages.  These workers are
   // notified, for example, when a new record is released for delivery.
-  folly::AtomicBitSet<MAX_WORKERS> subscribed_workers_;
+  folly::ConcurrentBitSet<MAX_WORKERS> subscribed_workers_;
 
   // Latest time (number of microseconds since steady_clock's epoch) when
   // some storage node tried to recover the state.
@@ -464,6 +426,8 @@ class LogStorageState {
     std::bitset<MAX_WORKERS> failed_workers_;
   } retry_release_;
 
+  // Lock to protect `last_released_lsn_`
+  mutable folly::SharedMutex lsn_mutex_;
   /**
    * Callback for timer to retry sending a ReleaseRequest to workers that we
    * failed to post to because their Request pipes were full.

@@ -7,6 +7,8 @@
  */
 #include "logdevice/common/event_log/EventLogStateMachine.h"
 
+#include <folly/Optional.h>
+
 #include "logdevice/common/ShardAuthoritativeStatusMap.h"
 #include "logdevice/common/TrimRequest.h"
 
@@ -15,13 +17,19 @@ namespace facebook { namespace logdevice {
 template class ReplicatedStateMachine<EventLogRebuildingSet, EventLogRecord>;
 
 EventLogStateMachine::EventLogStateMachine(
-    UpdateableSettings<Settings> settings)
+    UpdateableSettings<Settings> settings,
+    std::unique_ptr<RSMSnapshotStore> snapshot_store,
+    worker_id_t worker,
+    WorkerType worker_type)
     : Parent(RSMType::EVENT_LOG_STATE_MACHINE,
+             std::move(snapshot_store),
              configuration::InternalLogs::EVENT_LOG_DELTAS,
              settings->event_log_snapshotting
                  ? configuration::InternalLogs::EVENT_LOG_SNAPSHOTS
                  : LOGID_INVALID),
-      settings_(settings) {
+      settings_(settings),
+      worker_(worker),
+      worker_type_(worker_type) {
   auto cb = [&](const EventLogRebuildingSet& set,
                 const EventLogRecord* delta,
                 lsn_t version) { onUpdate(set, delta, version); };
@@ -31,13 +39,24 @@ EventLogStateMachine::EventLogStateMachine(
 }
 
 bool EventLogStateMachine::thisNodeCanTrimAndSnapshot() const {
-  if (!myNodeId_.hasValue()) {
+  if (!myNodeId_.has_value()) {
     return false;
   }
+
+  if (snapshot_store_) {
+    auto trimmable = Parent::canTrim();
+    auto snapshottable = snapshot_store_->isWritable();
+    return trimmable && snapshottable;
+  }
+
+  // TODO: Remove this after deprecating SnapshotStoreType::LEGACY
   auto w = Worker::onThisThread();
   auto cs = w->getClusterState();
   ld_check(cs != nullptr);
-  return cs->getFirstNodeAlive() == myNodeId_->index();
+  folly::Optional<node_index_t> first_alive_node_index =
+      cs->getFirstNodeAlive();
+  return first_alive_node_index.has_value() &&
+      first_alive_node_index.value() == myNodeId_->index();
 }
 
 void EventLogStateMachine::start() {
@@ -53,6 +72,7 @@ void EventLogStateMachine::start() {
     gracePeriodTimer_.assign([this] { updateWorkerShardStatusMap(); });
   }
 
+  blockStateDelivery(settings_->block_eventlog_rsm);
   Parent::start();
 }
 
@@ -60,19 +80,17 @@ void EventLogStateMachine::stop() {
   ld_info("Stopping EventLogStateMachine");
   gracePeriodTimer_.cancel();
   handle_.reset();
-  trim_retry_handler_.reset();
   Parent::stop();
 }
 
-void EventLogStateMachine::trim() {
-  if (!trim_retry_handler_) {
-    trim_retry_handler_ = std::make_unique<TrimRSMRetryHandler>(
-        delta_log_id_, snapshot_log_id_, rsm_type_);
-  }
-  trim_retry_handler_->trim(settings_->event_log_retention);
+void EventLogStateMachine::trim(trim_cb_t cb) {
+  Parent::trim(std::move(cb), settings_->event_log_retention);
 }
 
 void EventLogStateMachine::publishRebuildingSet() {
+  rsm_info(rsm_type_,
+           "Published new EventLogRebuildingSet version (%lu)",
+           getVersion());
   Worker::onThisThread()->processor_->rebuilding_set_.update(
       std::make_shared<EventLogRebuildingSet>(getState()));
 }
@@ -98,13 +116,15 @@ std::unique_ptr<EventLogRebuildingSet> EventLogStateMachine::deserializeState(
     Payload payload,
     lsn_t version,
     std::chrono::milliseconds timestamp) const {
-  auto verifier =
-      flatbuffers::Verifier(static_cast<const uint8_t*>(payload.data()),
-                            payload.size(),
-                            128, /* max verification depth */
-                            10000000 /* max number of tables to be verified */);
+  auto verifier = flatbuffers::Verifier(
+      static_cast<const uint8_t*>(payload.data()),
+      payload.size(),
+      512, /* max verification depth */
+      100000000 /* max number of tables to be verified */);
 
   if (!event_log_rebuilding_set::VerifySetBuffer(verifier)) {
+    ld_critical("Cannot deserialize the eventlog snapshot as fbuffers failed "
+                "to verify the payload");
     err = E::BADMSG;
     return nullptr;
   }
@@ -197,6 +217,7 @@ void EventLogStateMachine::postWriteDeltaRequest(
     folly::Optional<lsn_t> base_version) {
   std::unique_ptr<Request> req =
       std::make_unique<EventLogWriteDeltaRequest>(getWorkerId().val(),
+                                                  getWorkerType(),
                                                   std::move(delta),
                                                   std::move(cb),
                                                   mode,
@@ -232,7 +253,10 @@ void EventLogStateMachine::onSnapshotCreated(Status st, size_t snapshotSize) {
     ld_info("Successfully created a snapshot");
     WORKER_STAT_SET(eventlog_snapshot_size, snapshotSize);
     if (shouldTrim()) {
-      trim();
+      auto trim_cb = [this](Status st) {
+        rsm_info(rsm_type_, "Trimming finished with status:%s", error_name(st));
+      };
+      trim(std::move(trim_cb));
     }
   } else {
     ld_error("Could not create a snapshot: %s", error_name(st));
@@ -247,13 +271,17 @@ bool EventLogStateMachine::shouldTrim() const {
   // 2. This node is the first node alive according to the FD.
   // 3. We use a snapshot log (otherwise trimming of delta log is done by
   //    noteConfigurationChanged());
-  return !settings_->disable_event_log_trimming &&
-      thisNodeCanTrimAndSnapshot() && snapshot_log_id_ != LOGID_INVALID;
+  bool cantrim =
+      snapshot_store_ ? Parent::canTrim() : thisNodeCanTrimAndSnapshot();
+  return !settings_->disable_event_log_trimming && cantrim &&
+      snapshot_log_id_ != LOGID_INVALID;
 }
 
 bool EventLogStateMachine::canSnapshot() const {
+  bool cansnapshot = snapshot_store_ ? snapshot_store_->isWritable()
+                                     : thisNodeCanTrimAndSnapshot();
   return !snapshot_in_flight_ && settings_->event_log_snapshotting &&
-      thisNodeCanTrimAndSnapshot() && snapshot_log_id_ != LOGID_INVALID;
+      cansnapshot && snapshot_log_id_ != LOGID_INVALID;
 }
 
 bool EventLogStateMachine::shouldCreateSnapshot() const {
@@ -370,6 +398,7 @@ void EventLogStateMachine::noteConfigurationChanged() {
 }
 
 void EventLogStateMachine::onSettingsUpdated() {
+  blockStateDelivery(settings_->block_eventlog_rsm);
   // In case shard status overrides have changed.
   updateWorkerShardStatusMap();
 }

@@ -12,21 +12,22 @@
 
 #include <folly/futures/Future.h>
 
-#include "logdevice/admin/SimpleAdminServer.h"
+#include "logdevice/admin/AdminAPIHandler.h"
 #include "logdevice/admin/maintenance/ClusterMaintenanceStateMachine.h"
-#include "logdevice/admin/maintenance/MaintenanceManager.h"
 #include "logdevice/common/ConfigInit.h"
 #include "logdevice/common/NodesConfigurationInit.h"
-#include "logdevice/common/NodesConfigurationPublisher.h"
 #include "logdevice/common/NoopTraceLogger.h"
 #include "logdevice/common/WheelTimer.h"
 #include "logdevice/common/ZookeeperClient.h"
 #include "logdevice/common/configuration/logs/LogsConfigManager.h"
+#include "logdevice/common/configuration/nodes/NodesConfigurationCodec.h"
 #include "logdevice/common/configuration/nodes/NodesConfigurationManagerFactory.h"
-#include "logdevice/common/plugin/AdminServerFactory.h"
 #include "logdevice/common/plugin/LocationProvider.h"
+#include "logdevice/common/plugin/ThriftServerFactory.h"
 #include "logdevice/common/plugin/TraceLoggerFactory.h"
 #include "logdevice/common/request_util.h"
+#include "logdevice/server/RsmServerSnapshotStoreFactory.h"
+#include "logdevice/server/thrift/SimpleThriftServer.h"
 
 namespace facebook { namespace logdevice { namespace admin {
 StandaloneAdminServer::StandaloneAdminServer(
@@ -49,7 +50,7 @@ StandaloneAdminServer::StandaloneAdminServer(
 
 void StandaloneAdminServer::start() {
   // ASCII ART
-  std::cout <<
+  ld_info(
       R"(
    __                ___           _
   / /  ___   __ _   /   \_____   _(_) ___ ___
@@ -58,7 +59,7 @@ void StandaloneAdminServer::start() {
 \____/\___/ \__, /___,' \___| \_/ |_|\___\___|   Admin Server!
             |___/
 
-)" << std::endl;
+  )");
   ld_info("Starting Standalone Admin Server");
 
   if (!folly::kIsDebug) {
@@ -85,7 +86,7 @@ void StandaloneAdminServer::start() {
   std::string plugin_location =
       location_plugin ? location_plugin->getMyLocation() : "";
   auto location = settings_->client_location;
-  if (!location.hasValue() && !plugin_location.empty()) {
+  if (!location.has_value() && !plugin_location.empty()) {
     // if my-location was not specified, set the value to what the plugin
     // provides.
     folly::Optional<NodeLocation> res;
@@ -115,20 +116,6 @@ void StandaloneAdminServer::start() {
 
   initServerConfig();
   initNodesConfiguration();
-
-  {
-    // publish the NodesConfiguration for the first time. Later a
-    // long-living subscribing NodesConfigurationPublisher will be created again
-    // in Processor
-    // TODO(T43023435): use an actual TraceLogger to log this initial update.
-    NodesConfigurationPublisher publisher(
-        updateable_config_,
-        settings_,
-        std::make_shared<NoopTraceLogger>(updateable_config_),
-        /*subscribe*/ false);
-    ld_check(updateable_config_->getNodesConfiguration() != nullptr);
-  }
-
   initStatsCollection();
   initProcessor();
   initNodesConfigurationManager();
@@ -157,7 +144,6 @@ void StandaloneAdminServer::initServerConfig() {
 
 void StandaloneAdminServer::initNodesConfiguration() {
   using namespace facebook::logdevice::configuration::nodes;
-
   ld_check(updateable_config_);
   ld_check(plugin_registry_);
 
@@ -167,16 +153,23 @@ void StandaloneAdminServer::initNodesConfiguration() {
     return;
   }
 
-  NodesConfigurationInit config_init(buildNodesConfigurationStore(), settings_);
+  auto store = buildNodesConfigurationStore();
+  // Create an empty NC in the NCS if it doesn't exist already. Most of the
+  // time, this is a single read RTT (because the NC will be there), so it
+  // should be fine to always do it.
+  store->updateConfigSync(
+      NodesConfigurationCodec::serialize(NodesConfiguration()),
+      NodesConfigurationStore::Condition::createIfNotExists());
+  NodesConfigurationInit config_init(std::move(store), settings_);
   // The store used by the standalone admin server shouldn't require a
   // procoessor. It's either a ZK NCS or a FileBasedNCS.
   auto success = config_init.initWithoutProcessor(
-      updateable_config_->updateableNCMNodesConfiguration());
+      updateable_config_->updateableNodesConfiguration());
   if (!success) {
     ld_critical("Failed to load the initial NodesConfiguration.");
     throw StandaloneAdminServerFailed();
   }
-  ld_check(updateable_config_->getNodesConfigurationFromNCMSource() != nullptr);
+  ld_check(updateable_config_->getNodesConfiguration() != nullptr);
 }
 
 void StandaloneAdminServer::initProcessor() {
@@ -213,7 +206,7 @@ void StandaloneAdminServer::initNodesConfigurationManager() {
     return;
   }
 
-  auto initial_nc = updateable_config_->getNodesConfigurationFromNCMSource();
+  auto initial_nc = updateable_config_->getNodesConfiguration();
   ld_check(initial_nc);
 
   auto ncm = NodesConfigurationManagerFactory::create(
@@ -237,8 +230,13 @@ void StandaloneAdminServer::initNodesConfigurationManager() {
 
 void StandaloneAdminServer::initLogsConfigManager() {
   ld_check(processor_);
+  auto snapshot_store = RsmServerSnapshotStoreFactory::create(
+      processor_.get(),
+      settings_->rsm_snapshot_store_type,
+      false, /* is_storage_node */
+      std::to_string(configuration::InternalLogs::CONFIG_LOG_DELTAS.val_));
   if (!LogsConfigManager::createAndAttach(
-          *processor_, false /* is_writable */)) {
+          *processor_, std::move(snapshot_store), false /* is_writable */)) {
     err = E::INVALID_CONFIG;
     ld_critical("Internal LogsConfig Manager could not be started in Client. "
                 "LogsConfig will not be available!");
@@ -263,26 +261,27 @@ void StandaloneAdminServer::initAdminServer() {
     listen_addr = Sockaddr("::", admin_settings_->admin_port);
   }
 
-  auto adm_plugin = plugin_registry_->getSinglePlugin<AdminServerFactory>(
-      PluginType::ADMIN_SERVER_FACTORY);
-  if (adm_plugin) {
-    admin_server_ = (*adm_plugin)(listen_addr,
-                                  processor_.get(),
-                                  settings_updater_,
-                                  server_settings_,
-                                  admin_settings_,
-                                  stats_.get());
+  std::string name = "LogDevice Admin API Service";
+  api_handler_ = std::make_shared<AdminAPIHandler>(name,
+                                                   processor_.get(),
+                                                   settings_updater_,
+                                                   server_settings_,
+                                                   admin_settings_,
+                                                   stats_.get());
+
+  auto factory_plugin = plugin_registry_->getSinglePlugin<ThriftServerFactory>(
+      PluginType::THRIFT_SERVER_FACTORY);
+
+  if (factory_plugin) {
+    admin_server_ = (*factory_plugin)(name, listen_addr, api_handler_);
   } else {
-    // Use built-in SimpleAdminServer
-    admin_server_ = std::make_unique<SimpleAdminServer>(listen_addr,
-                                                        processor_.get(),
-                                                        settings_updater_,
-                                                        server_settings_,
-                                                        admin_settings_,
-                                                        stats_.get());
+    // Fallback to built-in SimpleThriftApiServer
+    admin_server_ =
+        std::make_unique<SimpleThriftServer>(name, listen_addr, api_handler_);
   }
+
   ld_check(admin_server_);
-  createAndAttachMaintenanceManager(admin_server_.get());
+  createAndAttachMaintenanceManager(api_handler_.get());
   admin_server_->start();
 }
 
@@ -312,11 +311,20 @@ void StandaloneAdminServer::initStatsCollection() {
 }
 
 void StandaloneAdminServer::initEventLog() {
-  event_log_ = std::make_unique<EventLogStateMachine>(settings_);
+  auto snapshot_store = RsmServerSnapshotStoreFactory::create(
+      processor_.get(),
+      settings_->rsm_snapshot_store_type,
+      false, /* is_storage_node */
+      std::to_string(configuration::InternalLogs::EVENT_LOG_DELTAS.val_));
+  auto workerType = EventLogStateMachine::workerType(processor_.get());
+  auto workerId = worker_id_t(EventLogStateMachine::getWorkerIdx(
+      processor_->getWorkerCount(workerType)));
+  event_log_ = std::make_unique<EventLogStateMachine>(
+      settings_, std::move(snapshot_store), workerId, workerType);
   event_log_->enableSendingUpdatesToWorkers();
 
   std::unique_ptr<Request> req =
-      std::make_unique<StartEventLogStateMachineRequest>(event_log_.get(), 0);
+      std::make_unique<StartEventLogStateMachineRequest>(event_log_.get());
 
   const int rv = processor_->postRequest(req);
   if (rv != 0) {
@@ -332,7 +340,7 @@ void StandaloneAdminServer::initClusterMaintenanceStateMachine() {
       admin_settings_->enable_maintenance_manager) {
     cluster_maintenance_state_machine_ =
         std::make_unique<maintenance::ClusterMaintenanceStateMachine>(
-            admin_settings_);
+            admin_settings_, nullptr /* snapshot store */);
 
     std::unique_ptr<Request> req = std::make_unique<
         maintenance::StartClusterMaintenanceStateMachineRequest>(
@@ -352,8 +360,8 @@ void StandaloneAdminServer::initClusterMaintenanceStateMachine() {
 }
 
 void StandaloneAdminServer::createAndAttachMaintenanceManager(
-    AdminServer* admin_server) {
-  ld_check(admin_server);
+    AdminAPIHandler* handler) {
+  ld_check(handler);
   ld_check(event_log_);
 
   if (admin_settings_->enable_maintenance_manager) {
@@ -361,12 +369,14 @@ void StandaloneAdminServer::createAndAttachMaintenanceManager(
     auto deps = std::make_unique<maintenance::MaintenanceManagerDependencies>(
         processor_.get(),
         admin_settings_,
+        rebuilding_settings_,
         cluster_maintenance_state_machine_.get(),
         event_log_.get(),
         std::make_unique<maintenance::SafetyCheckScheduler>(
-            processor_.get(),
-            admin_settings_,
-            admin_server->getSafetyChecker()));
+            processor_.get(), admin_settings_, handler->getSafetyChecker()),
+        std::make_unique<maintenance::MaintenanceLogWriter>(processor_.get()),
+        std::make_unique<maintenance::MaintenanceManagerTracer>(
+            processor_->getTraceLogger()));
     auto worker_idx = processor_->selectWorkerRandomly(
         configuration::InternalLogs::MAINTENANCE_LOG_DELTAS.val_ /*seed*/,
         maintenance::MaintenanceManager::workerType(processor_.get()));
@@ -375,7 +385,7 @@ void StandaloneAdminServer::createAndAttachMaintenanceManager(
         maintenance::MaintenanceManager::workerType(processor_.get()));
     maintenance_manager_ =
         std::make_unique<maintenance::MaintenanceManager>(&w, std::move(deps));
-    admin_server->setMaintenanceManager(maintenance_manager_.get());
+    handler->setMaintenanceManager(maintenance_manager_.get());
     maintenance_manager_->start();
   } else {
     ld_info(
@@ -412,7 +422,7 @@ void StandaloneAdminServer::shutdown() {
             /* with_retrying = */ true);
     ld_info("Waiting for workers to acknowledge.");
 
-    folly::collectAllSemiFuture(futures.begin(), futures.end()).get();
+    folly::collectAll(futures.begin(), futures.end()).get();
     ld_info("Workers acknowledged stopping accepting new work");
 
     ld_info("Finishing work and closing sockets on all workers.");
@@ -427,7 +437,7 @@ void StandaloneAdminServer::shutdown() {
         /* with_retrying = */ true);
     ld_info("Waiting for workers to acknowledge.");
 
-    folly::collectAllSemiFuture(futures.begin(), futures.end()).get();
+    folly::collectAll(futures.begin(), futures.end()).get();
     ld_info("Workers finished all works.");
 
     if (stats_thread_) {
@@ -439,7 +449,7 @@ void StandaloneAdminServer::shutdown() {
 
     // Prevent the admin server from holding a dangling pointer to the
     // maintenance manager
-    admin_server_->setMaintenanceManager(nullptr);
+    api_handler_->setMaintenanceManager(nullptr);
 
     maintenance_manager_.reset();
     cluster_maintenance_state_machine_.reset();
@@ -457,12 +467,45 @@ void StandaloneAdminServer::shutdown() {
   main_thread_sem_.post();
 }
 
+static void set_admin_server_log_file(
+    const UpdateableSettings<ServerSettings>& server_settings) {
+  static std::string prev;
+  if (prev == server_settings->log_file) {
+    // This setting did not change.
+    return;
+  }
+
+  ld_info("Logging to %s",
+          server_settings->log_file.empty()
+              ? "stderr"
+              : server_settings->log_file.c_str());
+
+  if (!server_settings->log_file.empty()) {
+    int log_file_fd = open(
+        server_settings->log_file.c_str(), O_APPEND | O_CREAT | O_WRONLY, 0666);
+    if (log_file_fd >= 0) {
+      dbg::useFD(log_file_fd);
+    } else {
+      ld_error("Failed to open error log file %s. Will keep logging to %s",
+               server_settings->log_file.c_str(),
+               prev.empty() ? "stderr" : prev.c_str());
+    }
+  } else {
+    dbg::useFD(STDERR_FILENO);
+  }
+
+  dbg::enableNonblockingPipe();
+
+  prev = server_settings->log_file;
+}
+
 void StandaloneAdminServer::onSettingsUpdate() {
   dbg::assertOnData = server_settings_->assert_on_data;
   dbg::currentLevel = server_settings_->loglevel;
-  dbg::externalLoggerLogLevel = server_settings_->external_loglevel;
   ZookeeperClient::setDebugLevel(server_settings_->loglevel);
   dbg::setLogLevelOverrides(server_settings_->loglevel_overrides);
+
+  set_admin_server_log_file(server_settings_);
 }
 
 bool StandaloneAdminServer::onConfigUpdate(ServerConfig& config) {
@@ -476,8 +519,7 @@ bool StandaloneAdminServer::onConfigUpdate(ServerConfig& config) {
     // Ensure that settings are updated when we receive new config.
     settings_updater_->setFromConfig(settings);
   }
-  return allNodesHaveName(
-      *config.getNodesConfigurationFromServerConfigSource());
+  return true;
 }
 
 bool StandaloneAdminServer::onNodesConfigurationUpdate(

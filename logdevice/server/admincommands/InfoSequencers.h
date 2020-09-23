@@ -41,7 +41,8 @@ typedef AdminCommandTable<logid_t,                  // data log id
                           std::string,              // last byte offset
                           double,                   // bytes per second
                           double, // throughput window (seconds)
-                          double  // seconds until nodeset adjustment
+                          double, // seconds until nodeset adjustment
+                          admin_command_table::LSN // metadata trim point
                           >
     InfoSequencersTable;
 
@@ -158,7 +159,7 @@ class InfoSequencers : public AdminCommand {
     table.set<14>(seq.getDrainingEpoch());
     auto metadata = seq.getCurrentMetaData();
     table.set<15>(metadata ? metadata->writtenInMetaDataLog() : false);
-    table.set<16>(seq.getTrimPoint().value_or(LSN_INVALID));
+    table.set<16>(seq.getTrimPoint());
 
     auto tailRecord = seq.getTailRecord();
     OffsetMap bo;
@@ -181,6 +182,10 @@ class InfoSequencers : public AdminCommand {
                         bg_activator_info->next_nodeset_adjustment_time -
                         std::chrono::steady_clock::now())
                         .count());
+    }
+    auto metadataTrimPoint = seq.getLatestMetaDataTrimPoint();
+    if (metadataTrimPoint.has_value()) {
+      table.set<21>(metadataTrimPoint.value());
     }
   }
 
@@ -206,7 +211,8 @@ class InfoSequencers : public AdminCommand {
                               "Last Byte Offset",
                               "Bytes per second",
                               "Throughput window (seconds)",
-                              "Seconds until nodeset adjustment");
+                              "Seconds until nodeset adjustment",
+                              "Metadata trim point");
 
     std::vector<std::shared_ptr<Sequencer>> sequencers;
 

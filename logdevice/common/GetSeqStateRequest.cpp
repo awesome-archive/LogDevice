@@ -61,12 +61,17 @@ GetSeqStateRequest::getContextString(GetSeqStateRequest::Context ctx) {
       return "reader-monitoring";
     case GetSeqStateRequest::Context::IS_LOG_EMPTY_V2:
       return "is-log-empty-v2";
-    default:
-      break;
+    case GetSeqStateRequest::Context::RSM:
+      return "rsm";
+
+    case GetSeqStateRequest::Context::UNKNOWN:
+      return "unknown";
+    case GetSeqStateRequest::Context::MAX:
+      return "max";
   }
 
   static_assert(
-      static_cast<int>(GetSeqStateRequest::Context::MAX) == 20,
+      static_cast<int>(GetSeqStateRequest::Context::MAX) == 21,
       "Not in sync with GetSeqStateRequest::Context, and fix switch case "
       "above.");
 
@@ -133,6 +138,9 @@ void GetSeqStateRequest::bumpContextStatsAllAttempts(
     case GetSeqStateRequest::Context::IS_LOG_EMPTY_V2:
       WORKER_STAT_INCR(get_seq_state_attempts_context_is_log_empty_v2);
       break;
+    case GetSeqStateRequest::Context::RSM:
+      WORKER_STAT_INCR(get_seq_state_attempts_context_rsm);
+      break;
     case GetSeqStateRequest::Context::UNKNOWN:
     default:
       WORKER_STAT_INCR(get_seq_state_attempts_context_unknown);
@@ -140,7 +148,7 @@ void GetSeqStateRequest::bumpContextStatsAllAttempts(
   }
 
   static_assert(
-      static_cast<int>(GetSeqStateRequest::Context::MAX) == 20,
+      static_cast<int>(GetSeqStateRequest::Context::MAX) == 21,
       "Not in sync with GetSeqStateRequest::Context, and fix switch case "
       "above.");
 }
@@ -204,6 +212,9 @@ void GetSeqStateRequest::bumpContextStats(GetSeqStateRequest::Context ctx) {
     case Context::IS_LOG_EMPTY_V2:
       WORKER_STAT_INCR(get_seq_state_unique_context_is_log_empty_v2);
       break;
+    case Context::RSM:
+      WORKER_STAT_INCR(get_seq_state_unique_context_rsm);
+      break;
     case Context::UNKNOWN:
     default:
       WORKER_STAT_INCR(get_seq_state_unique_context_unknown);
@@ -211,7 +222,7 @@ void GetSeqStateRequest::bumpContextStats(GetSeqStateRequest::Context ctx) {
   }
 
   static_assert(
-      static_cast<int>(GetSeqStateRequest::Context::MAX) == 20,
+      static_cast<int>(GetSeqStateRequest::Context::MAX) == 21,
       "Not in sync with GetSeqStateRequest::Context, and fix switch case "
       "above.");
 }
@@ -425,7 +436,7 @@ void GetSeqStateRequest::onSequencerKnown(NodeID dest,
   if (options_.include_historical_metadata) {
     flags |= GET_SEQ_STATE_Message::INCLUDE_HISTORICAL_METADATA;
   }
-  if (options_.min_epoch.hasValue()) {
+  if (options_.min_epoch.has_value()) {
     flags |= GET_SEQ_STATE_Message::MIN_EPOCH;
   }
   if (options_.include_tail_record) {
@@ -433,6 +444,9 @@ void GetSeqStateRequest::onSequencerKnown(NodeID dest,
   }
   if (options_.include_is_log_empty) {
     flags |= GET_SEQ_STATE_Message::INCLUDE_IS_LOG_EMPTY;
+  }
+  if (options_.skip_remote_preemption_check) {
+    flags |= GET_SEQ_STATE_Message::SKIP_REMOTE_PREEMPTION_CHECK;
   }
 
   // Keep track of the current destination node. In case of a timeout, we

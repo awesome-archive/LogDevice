@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 #include "logdevice/common/configuration/logs/FBuffersLogsConfigCodec.h"
+#include "logdevice/include/types.h"
 
 namespace facebook { namespace logdevice { namespace logsconfig {
 

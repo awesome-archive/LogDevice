@@ -34,10 +34,10 @@ class PickCurrentNodeSetSelector : public NodeSetSelector {
       nodeset_size_t target_nodeset_size,
       uint64_t seed,
       const EpochMetaData* prev,
-      const Options* options = nullptr /* ignored */
+      const Options& /* options */
       ) override {
     Result res;
-    const std::shared_ptr<LogsConfig::LogGroupNode> logcfg =
+    const LogsConfig::LogGroupNodePtr logcfg =
         cfg->getLogGroupByIDShared(log_id);
     if (!logcfg) {
       res.decision = Decision::FAILED;

@@ -103,13 +103,24 @@ class FlowGroupsUpdate {
       // the allotment provided by this entry's policy.
       int64_t last_overflow = 0;
       // Excess bandwidth accrued during the current FlowGroupUpdate.
-      // Note: Overflows from filling a FlowMeter entry using last_overflow
+      // NOTE: Overflows from filling a FlowMeter entry using last_overflow
       //       bandwidth is returned to last_overflow, not added here.
       //       Otherwise, excess bandwidth that cannot fit given the
       //       configured maximum capacity (maximum burst) would accrue
       //       indefinitely, effectively overriding the maximum capacity
       //       setting.
       int64_t cur_overflow = 0;
+      // Unused deposit budget from the last FlowGroupUpdate.
+      // This excess budget is consumed in a first fit fashion across
+      // all buckets of this priority.  Any unused budget in this category will
+      // be discarded upon completion of processing the current FlowGroupUpdate.
+      size_t last_deposit_budget_overflow = 0;
+      // Unused deposit budget from earlier in the current FlowGroupUpdate.
+      // This unused budget is accumulated and then transferred to
+      // last_deposit_budget_overflow upon completion of processing the current
+      // FlowGroupUpdate. It is not consumed during the current FlowGroupUpdate
+      // to ensure fair access across workers to excess budget.
+      size_t cur_deposit_budget_overflow = 0;
     };
 
     /**
@@ -188,10 +199,6 @@ class FlowGroup {
     return meter_.entries[asInt(p)].debt();
   }
 
-  size_t depositBudget(Priority p) const {
-    return meter_.entries[asInt(p)].depositBudget();
-  }
-
   size_t level(Priority p) const {
     return meter_.entries[asInt(p)].level();
   }
@@ -203,18 +210,18 @@ class FlowGroup {
     ld_check(s <= NodeLocationScope::ROOT);
     scope_ = s;
     // The FlowGroups for NODE and ROOT scopes are automatically
-    // configured. The configuration of ROOT guarantees that all Sockets
+    // configured. The configuration of ROOT guarantees that all Connections
     // can be assigned to a configured FlowGroup even when no FlowGroups
     // are explicitly defined in the configuration. The configuration
     // of NODE is for convenience since very few configurations will need
     // to restrict traffic where source and destination are the same node.
     //
     // Note: configured_ and enabled_ mean different things. A
-    //       configured_ FlowGroup accepts the Socket assignments. An
+    //       configured_ FlowGroup accepts the Connection assignments. An
     //       enabled_ FlowGroup wll apply its configured traffic
     //       shaping restrictions.  Both configured_ and enabled_
     //       default to off. This means the actions here will result
-    //       in a default configuration with Sockets assigned to either
+    //       in a default configuration with Connection assigned to either
     //       the NODE or ROOT FlowGroup, both of which will pass traffic
     //       unconditionally.
     if (scope_ == NodeLocationScope::NODE ||
@@ -343,21 +350,18 @@ class FlowGroup {
    * Transfer the specified amount of credit from the 'source' to 'sink'
    * FlowMeter.
    */
-  void transferCredit(Priority source, Priority sink, size_t amount) {
+  void transferCredit(Priority source,
+                      Priority sink,
+                      size_t amount,
+                      size_t& budget) {
     auto& source_entry = meter_.entries[asInt(source)];
     auto& sink_entry = meter_.entries[asInt(sink)];
     auto initialSourceLevel = source_entry.level();
-    source_entry.transferCredit(sink_entry, amount);
+    source_entry.transferCredit(sink_entry, amount, budget);
     deps_->statsAdd(&PerShapingPriorityStats::bwtransferred,
                     scope_,
                     sink,
                     initialSourceLevel - source_entry.level());
-
-    // If the sink can no longer take additional credit, remove it from
-    // contention for bandwidth from the priority queue.
-    if (!sink_entry.canFill()) {
-      priorityq_.enable(sink, false);
-    }
   }
 
   /**

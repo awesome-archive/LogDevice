@@ -64,7 +64,7 @@ class MockGraylistingTracker : public GraylistingTracker {
   explicit MockGraylistingTracker(MockWorkerTimeoutStats stats)
       : stats_(std::move(stats)) {
     for (node_index_t n : {1, 2, 3, 4, 5, 6}) {
-      nodes_.push_back(buildNode(n, "ash.2.08.k.z", n <= 3 ? true : false));
+      nodes_.emplace(n, buildNode("ash.2.08.k.z", n <= 3 ? true : false));
     }
     reComputeNodesConfiguraton();
   }
@@ -98,15 +98,21 @@ class MockGraylistingTracker : public GraylistingTracker {
     return 0.5;
   }
 
-  NodesConfigurationTestUtil::NodeTemplate buildNode(node_index_t id,
-                                                     std::string domain,
-                                                     bool metadata = false) {
-    return {
-        id, NodesConfigurationTestUtil::both_role, domain, 1.0, 2, metadata};
+  std::chrono::milliseconds getGraylistingMinLatency() const override {
+    return 0s;
+  }
+
+  configuration::Node buildNode(std::string domain, bool metadata = false) {
+    configuration::Node node;
+    node.addStorageRole();
+    node.addSequencerRole();
+    node.setLocation(domain);
+    node.setIsMetadataNode(metadata);
+    return node;
   }
 
   void addNode(node_index_t id, std::string domain) {
-    nodes_.push_back(buildNode(id, domain));
+    nodes_.emplace(id, buildNode(domain));
     reComputeNodesConfiguraton();
   }
 
@@ -117,7 +123,7 @@ class MockGraylistingTracker : public GraylistingTracker {
  private:
   MockWorkerTimeoutStats stats_;
 
-  std::vector<NodesConfigurationTestUtil::NodeTemplate> nodes_;
+  configuration::Nodes nodes_;
 
   std::shared_ptr<const configuration::nodes::NodesConfiguration>
       nodes_configuration_;
@@ -135,7 +141,7 @@ TEST(GraylistingTrackerTest, OutlierGraylisted) {
                                  {3, 500ms}, // Outlier
                                  {4, 20ms}},
                                 10);
-  auto now = std::chrono::steady_clock::now();
+  auto now = SteadyTimestamp::now();
 
   MockGraylistingTracker tracker(std::move(stats));
   tracker.updateGraylist(now);
@@ -151,7 +157,7 @@ TEST(GraylistingTrackerTest, MonitoredGraylisted) {
                                  {3, 500ms}, // Outlier
                                  {4, 20ms}},
                                 10);
-  auto now = std::chrono::steady_clock::now();
+  auto now = SteadyTimestamp::now();
 
   MockGraylistingTracker tracker(std::move(stats));
   tracker.updateGraylist(now);
@@ -188,7 +194,7 @@ TEST(GraylistingTrackerTest, MonitoredGraylistedExpire) {
                                  {3, 500ms}, // Outlier
                                  {4, 20ms}},
                                 10);
-  auto now = std::chrono::steady_clock::now();
+  auto now = SteadyTimestamp::now();
 
   MockGraylistingTracker tracker(std::move(stats));
   tracker.updateGraylist(now);
@@ -237,7 +243,7 @@ TEST(GraylistingTrackerTest, EjectOlderGraylists) {
                                  {4, 500ms},  // Outlier
                                  {5, 500ms}}, // Outlier
                                 10);
-  auto now = std::chrono::steady_clock::now();
+  auto now = SteadyTimestamp::now();
 
   MockGraylistingTracker tracker(std::move(stats));
 
@@ -272,7 +278,7 @@ TEST(GraylistingTrackerTest, MultiplicativeIncreaseAdditiveDecrease) {
                                  {4, 500ms},  // Outlier
                                  {5, 500ms}}, // Outlier
                                 10);
-  auto now = std::chrono::steady_clock::now();
+  auto now = SteadyTimestamp::now();
 
   MockGraylistingTracker tracker(std::move(stats));
 
@@ -342,7 +348,7 @@ TEST(GraylistingTrackerTest, FixedPotentialOutlier) {
                                  {4, 20ms},
                                  {5, 20ms}},
                                 10);
-  auto now = std::chrono::steady_clock::now();
+  auto now = SteadyTimestamp::now();
 
   MockGraylistingTracker tracker(std::move(stats));
 
@@ -368,7 +374,7 @@ TEST(GraylistingTrackerTest, ExpiredGraylists) {
                                  {4, 20ms},
                                  {5, 20ms}},
                                 10);
-  auto now = std::chrono::steady_clock::now();
+  auto now = SteadyTimestamp::now();
 
   MockGraylistingTracker tracker(std::move(stats));
 
@@ -389,7 +395,7 @@ TEST(GraylistingTrackerTest, ExpiredGraylists) {
 
 TEST(GraylistingTrackerTest, AllOutlierExceptOne) {
   auto stats = buildWorkerStats({{1, 20ms}, {2, 500ms}, {3, 500ms}}, 10);
-  auto now = std::chrono::steady_clock::now();
+  auto now = SteadyTimestamp::now();
 
   MockGraylistingTracker tracker(std::move(stats));
 
@@ -400,7 +406,7 @@ TEST(GraylistingTrackerTest, AllOutlierExceptOne) {
 
 TEST(GraylistingTrackerTest, AllNotOutlier) {
   auto stats = buildWorkerStats({{1, 20ms}, {2, 20ms}, {3, 20ms}}, 10);
-  auto now = std::chrono::steady_clock::now();
+  auto now = SteadyTimestamp::now();
 
   MockGraylistingTracker tracker(std::move(stats));
 
@@ -411,7 +417,7 @@ TEST(GraylistingTrackerTest, AllNotOutlier) {
 
 TEST(GraylistingTrackerTest, NoStoresSent) {
   auto stats = buildWorkerStats({}, 0);
-  auto now = std::chrono::steady_clock::now();
+  auto now = SteadyTimestamp::now();
 
   MockGraylistingTracker tracker(std::move(stats));
 
@@ -428,7 +434,7 @@ TEST(GraylistingTrackerTest, ResetGraylist) {
                                  {3, 500ms}, // Outlier
                                  {4, 20ms}},
                                 10);
-  auto now = std::chrono::steady_clock::now();
+  auto now = SteadyTimestamp::now();
 
   MockGraylistingTracker tracker(std::move(stats));
   tracker.updateGraylist(now);

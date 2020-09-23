@@ -20,6 +20,7 @@
 #include "logdevice/common/configuration/nodes/FileBasedNodesConfigurationStore.h"
 #include "logdevice/common/configuration/nodes/ZookeeperNodesConfigurationStore.h"
 #include "logdevice/common/test/InMemNodesConfigurationStore.h"
+#include "logdevice/common/test/MockZookeeperClient.h"
 #include "logdevice/common/test/TestUtil.h"
 #include "logdevice/common/test/ZookeeperClientInMemory.h"
 
@@ -31,6 +32,8 @@ using mutation_callback_t = FileBasedVersionedConfigStore::mutation_callback_t;
 
 using version_t = NodesConfigurationStore::version_t;
 
+using testing::_;
+
 namespace {
 std::unique_ptr<NodesConfigurationStore> store{nullptr};
 
@@ -39,11 +42,11 @@ const std::string kConfigKey{"/foo"};
 class NodesConfigurationStoreTest : public ::testing::Test {
  public:
   // temporary dir for file baesd store test
-  std::unique_ptr<folly::test::TemporaryDirectory> temp_dir_;
+  std::unique_ptr<TemporaryDirectory> temp_dir_;
 
   explicit NodesConfigurationStoreTest()
-      : temp_dir_(createTemporaryDir("NodesConfigurationStoreTest",
-                                     /*keep_data*/ false)) {
+      : temp_dir_(std::make_unique<TemporaryDirectory>(
+            "NodesConfigurationStoreTest")) {
     ld_check(temp_dir_ != nullptr);
   }
 
@@ -106,7 +109,8 @@ void runBasicTests(std::unique_ptr<NodesConfigurationStore> store,
     // initial write
     EXPECT_EQ(Status::OK,
               store->updateConfigSync(
-                  TestEntry{10, "foo123"}.serialize(), folly::none));
+                  TestEntry{10, "foo123"}.serialize(),
+                  NodesConfigurationStore::Condition::createIfNotExists()));
 
     EXPECT_EQ(Status::OK, store->getConfigSync(&value_out));
     EXPECT_EQ(TestEntry(10, "foo123"), TestEntry::fromSerialized(value_out));
@@ -130,9 +134,18 @@ void runBasicTests(std::unique_ptr<NodesConfigurationStore> store,
   }
 
   // update: blind overwrite
-  EXPECT_EQ(Status::OK,
+  EXPECT_EQ(
+      Status::OK,
+      store->updateConfigSync(TestEntry{12, "foo456"}.serialize(),
+                              NodesConfigurationStore::Condition::overwrite()));
+
+  // A write with a createIfNotExists on an object that exists should fail with
+  // a VERSION_MISMATCH
+  EXPECT_EQ(Status::VERSION_MISMATCH,
             store->updateConfigSync(
-                TestEntry{12, "foo456"}.serialize(), folly::none));
+                TestEntry{13, "foo456"}.serialize(),
+                NodesConfigurationStore::Condition::createIfNotExists()));
+
   EXPECT_EQ(Status::OK, store->getConfigSync(&value_out));
   auto e = TestEntry::fromSerialized(value_out);
   EXPECT_EQ(TestEntry(12, "foo456"), e);
@@ -282,7 +295,8 @@ void runMultiThreadedTests(std::unique_ptr<NodesConfigurationStore> store) {
   // write version 0 (i.e., ~provision)
   ASSERT_EQ(
       Status::OK,
-      store->updateConfigSync(TestEntry{0, "foobar"}.serialize(), folly::none));
+      store->updateConfigSync(TestEntry{0, "foobar"}.serialize(),
+                              NodesConfigurationStore::Condition::overwrite()));
 
   {
     std::lock_guard<std::mutex> g{m};
@@ -299,6 +313,37 @@ void runMultiThreadedTests(std::unique_ptr<NodesConfigurationStore> store) {
             TestEntry::fromSerialized(std::move(value_out)));
   EXPECT_EQ(kIter, successCnt.load());
 }
+
+void runReadModifyWriteCreateIfNotExistTest(
+    std::unique_ptr<NodesConfigurationStore> store) {
+  folly::Baton<> value_read, value_written;
+  ASSERT_EQ(E::NOTFOUND, store->getConfigSync(nullptr));
+
+  std::thread t([&]() {
+    store->readModifyWriteConfig(
+        [&](auto) {
+          value_read.post();
+          value_written.wait();
+          return std::make_pair<Status, std::string>(
+              E::OK, TestEntry{0, "foobar"}.serialize());
+        },
+        [](auto st, auto, auto) { EXPECT_EQ(E::VERSION_MISMATCH, st); });
+  });
+  value_read.wait();
+
+  EXPECT_EQ(
+      Status::OK,
+      store->updateConfigSync(TestEntry{0, "foobar2"}.serialize(),
+                              NodesConfigurationStore::Condition::overwrite()));
+  value_written.post();
+  t.join();
+
+  std::string value_out;
+  EXPECT_EQ(Status::OK, store->getConfigSync(&value_out));
+  EXPECT_EQ(
+      TestEntry(0, "foobar2"), TestEntry::fromSerialized(std::move(value_out)));
+}
+
 } // namespace
 
 TEST(NodesConfigurationStore, basic) {
@@ -311,11 +356,20 @@ TEST(NodesConfigurationStore, basicMT) {
       kConfigKey, TestEntry::extractVersionFn));
 }
 
+TEST(NodesConfigurationStore, basicRMWCreateIfNotExist) {
+  runReadModifyWriteCreateIfNotExistTest(
+      std::make_unique<InMemNodesConfigurationStore>(
+          kConfigKey, TestEntry::extractVersionFn));
+}
+
 TEST(NodesConfigurationStore, zk_basic) {
   auto z = std::make_unique<ZookeeperClientInMemory>(
       "unused quorum", ZookeeperClientInMemory::state_map_t{});
   runBasicTests(std::make_unique<ZookeeperNodesConfigurationStore>(
-                    kConfigKey, TestEntry::extractVersionFn, std::move(z)),
+                    kConfigKey,
+                    TestEntry::extractVersionFn,
+                    std::move(z),
+                    /* max_retries= */ 3),
                 /* initialWrite = */ false);
 }
 
@@ -326,7 +380,164 @@ TEST(NodesConfigurationStore, zk_basicMT) {
           {kConfigKey,
            {TestEntry{0, "initValue"}.serialize(), zk::Stat{.version_ = 4}}}});
   runMultiThreadedTests(std::make_unique<ZookeeperNodesConfigurationStore>(
-      kConfigKey, TestEntry::extractVersionFn, std::move(z)));
+      kConfigKey,
+      TestEntry::extractVersionFn,
+      std::move(z),
+      /* max_retries= */ 3));
+}
+
+TEST(NodesConfigurationStore, zk_basicRMWCreateIfNotExist) {
+  auto z = std::make_unique<ZookeeperClientInMemory>(
+      "unused quorum", ZookeeperClientInMemory::state_map_t{});
+  runReadModifyWriteCreateIfNotExistTest(
+      std::make_unique<ZookeeperNodesConfigurationStore>(
+          kConfigKey,
+          TestEntry::extractVersionFn,
+          std::move(z),
+          /* max_retries= */ 3));
+}
+
+// A test that mocks all of the interactions between the ZKVCS and ZK API and
+// injects retryable errors on every interaction and makes sure that the VCS
+// reties the operations.
+TEST(NodesConfigurationStore, zk_retryTransientErrors) {
+  // Utilities to build mock callbacks responding with a certain status
+  const auto build_read_cb =
+      [](int rc, std::string data = "", zk::Stat stat = zk::Stat{}) {
+        return [=](std::string, ZookeeperClientBase::data_callback_t* cb) {
+          (*cb)(rc, data, stat);
+        };
+      };
+  const auto build_sync_cb = [](int rc) {
+    return [=](ZookeeperClientBase::sync_callback_t* cb) { (*cb)(rc); };
+  };
+  const auto build_create_cb = [](int rc) {
+    return [=](std::string path,
+               std::string,
+               ZookeeperClientBase::create_callback_t* cb,
+               std::vector<zk::ACL>,
+               int32_t) { (*cb)(rc, path); };
+  };
+
+  const auto build_stat_cb = [](int rc) {
+    return [=](std::string path,
+               std::string,
+               ZookeeperClientBase::stat_callback_t* cb,
+               zk::version_t) { (*cb)(rc, zk::Stat{}); };
+  };
+
+  static const std::string data1 = TestEntry{10, "foo123"}.serialize();
+  static const std::string data2 = TestEntry{11, "foo345"}.serialize();
+
+  {
+    ld_info("getConfig tests");
+
+    auto z = std::make_unique<MockZookeeperClient>();
+    EXPECT_CALL(*z, getData(kConfigKey, _))
+        .WillOnce(testing::Invoke(build_read_cb(ZCONNECTIONLOSS)))
+        .WillOnce(testing::Invoke(build_read_cb(ZOPERATIONTIMEOUT)))
+        .WillOnce(testing::Invoke(build_read_cb(ZSESSIONEXPIRED)))
+        .WillOnce(testing::Invoke(build_read_cb(ZOK, data1)));
+
+    auto vcs = std::make_unique<ZookeeperNodesConfigurationStore>(
+        kConfigKey,
+        TestEntry::extractVersionFn,
+        std::move(z),
+        /* max_retries= */ 3);
+    std::string ret;
+    EXPECT_EQ(Status::OK, vcs->getConfigSync(&ret));
+    EXPECT_EQ(data1, ret);
+  }
+
+  {
+    ld_info("getLatestConfig tests");
+
+    auto z = std::make_unique<MockZookeeperClient>();
+
+    testing::InSequence seq;
+    EXPECT_CALL(*z, sync(_))
+        .WillOnce(testing::Invoke(build_sync_cb(ZCONNECTIONLOSS)))
+        .WillOnce(testing::Invoke(build_sync_cb(ZOK)));
+
+    EXPECT_CALL(*z, getData(kConfigKey, _))
+        .WillOnce(testing::Invoke(build_read_cb(ZCONNECTIONLOSS)));
+
+    EXPECT_CALL(*z, sync(_)).WillOnce(testing::Invoke(build_sync_cb(ZOK)));
+
+    EXPECT_CALL(*z, getData(kConfigKey, _))
+        .WillOnce(testing::Invoke(build_read_cb(ZOK, data1)));
+
+    auto vcs = std::make_unique<ZookeeperNodesConfigurationStore>(
+        kConfigKey,
+        TestEntry::extractVersionFn,
+        std::move(z),
+        /* max_retries= */ 3);
+    folly::Baton<> b;
+    vcs->getLatestConfig([&b](auto st, auto data) {
+      EXPECT_EQ(Status::OK, st);
+      EXPECT_EQ(data1, data);
+      b.post();
+    });
+    b.wait();
+  }
+
+  {
+    ld_info("updateConfig tests");
+
+    auto z = std::make_unique<MockZookeeperClient>();
+
+    testing::InSequence seq;
+
+    EXPECT_CALL(*z, getData(kConfigKey, _))
+        .WillOnce(testing::Invoke(build_read_cb(ZCONNECTIONLOSS)))
+        .WillOnce(testing::Invoke(build_read_cb(ZOK, data1, zk::Stat{10})));
+
+    EXPECT_CALL(*z, setData(kConfigKey, data2, _, 10))
+        .WillOnce(testing::Invoke(build_stat_cb(ZCONNECTIONLOSS)))
+        .WillOnce(testing::Invoke(build_stat_cb(ZOK)));
+
+    auto vcs = std::make_unique<ZookeeperNodesConfigurationStore>(
+        kConfigKey,
+        TestEntry::extractVersionFn,
+        std::move(z),
+        /* max_retries= */ 3);
+    EXPECT_EQ(
+        Status::OK,
+        vcs->updateConfigSync(data2,
+                              VersionedConfigStore::Condition::overwrite(),
+                              nullptr,
+                              nullptr));
+  }
+
+  {
+    ld_info("readModifyWrite tests");
+
+    auto z = std::make_unique<MockZookeeperClient>();
+
+    testing::InSequence seq;
+
+    EXPECT_CALL(*z, getData(kConfigKey, _))
+        .WillOnce(testing::Invoke(build_read_cb(ZCONNECTIONLOSS)))
+        .WillOnce(testing::Invoke(build_read_cb(ZNONODE, data1)));
+
+    EXPECT_CALL(*z, createWithAncestors(kConfigKey, data2, _, _, _))
+        .WillOnce(testing::Invoke(build_create_cb(ZCONNECTIONLOSS)))
+        .WillOnce(testing::Invoke(build_create_cb(ZOK)));
+
+    auto vcs = std::make_unique<ZookeeperNodesConfigurationStore>(
+        kConfigKey,
+        TestEntry::extractVersionFn,
+        std::move(z),
+        /* max_retries= */ 3);
+    folly::Baton<> b;
+    vcs->readModifyWriteConfig(
+        [](auto val_opt) { return std::make_pair(Status::OK, data2); },
+        [&b](Status st, version_t, std::string) {
+          EXPECT_EQ(Status::OK, st);
+          b.post();
+        });
+    b.wait();
+  }
 }
 
 TEST_F(NodesConfigurationStoreTest, file_basic) {
@@ -335,4 +546,9 @@ TEST_F(NodesConfigurationStoreTest, file_basic) {
 
 TEST_F(NodesConfigurationStoreTest, file_basicMT) {
   runMultiThreadedTests(createFileBasedStore(TestEntry::extractVersionFn));
+}
+
+TEST_F(NodesConfigurationStoreTest, file_basicRMWCreateIfNotExist) {
+  runReadModifyWriteCreateIfNotExistTest(
+      createFileBasedStore(TestEntry::extractVersionFn));
 }

@@ -27,6 +27,7 @@
 
 namespace facebook { namespace logdevice {
 
+class RocksDBCustomiser;
 class RocksDBIterator;
 class RocksDBMemTableRepFactory;
 class RocksDBWriter;
@@ -195,10 +196,13 @@ class RocksDBLogStoreBase : public LocalLogStore {
   virtual void onMemTableWindowUpdated() {}
 
   /**
-   * @return  path of RocksDB directory
+   * Returns path of RocksDB directory in local file system.
+   * Returns folly::none if the DB doesn't live in local file system (but in
+   * e.g. some remote storage service or in memory) according to
+   * RocksDBCustomiser::isDBLocal().
    */
-  std::string getDBPath() const {
-    return db_path_;
+  folly::Optional<std::string> getLocalDBPath() const {
+    return is_db_local_ ? folly::make_optional(db_path_) : folly::none;
   }
 
   RocksDBLogStoreConfig& getRocksDBLogStoreConfig() {
@@ -294,7 +298,7 @@ class RocksDBLogStoreBase : public LocalLogStore {
   // True if an error has occurred which indicates partial loss of
   // access or corruption of the database. Reads can still be attempted,
   // but writes will be denied.
-  bool inFailSafeMode() const {
+  bool inFailSafeMode() const override {
     return fail_safe_mode_.load();
   }
 
@@ -374,6 +378,12 @@ class RocksDBLogStoreBase : public LocalLogStore {
       LocalLogStore::SealPreemption seal_preempt,
       const WriteOptions& write_options = WriteOptions()) override;
 
+  int getRebuildingRanges(RebuildingRangesMetadata& rrm,
+                          RebuildingRangesVersion& version) override;
+  int writeRebuildingRanges(RebuildingRangesMetadata& rrm,
+                            RebuildingRangesVersion base_version,
+                            RebuildingRangesVersion new_version) override;
+
   int deleteStoreMetadata(
       const StoreMetadataType type,
       const WriteOptions& write_options = WriteOptions()) override;
@@ -387,6 +397,10 @@ class RocksDBLogStoreBase : public LocalLogStore {
       epoch_t epoch,
       const PerEpochLogMetadataType type,
       const WriteOptions& write_options = WriteOptions()) override;
+
+  int traverseLogsMetadata(
+      LogMetadataType type,
+      LocalLogStore::TraverseLogsMetadataCallback cb) override;
 
   virtual void onSettingsUpdated(
       const std::shared_ptr<const RocksDBSettings> /* unused */) {}
@@ -422,6 +436,7 @@ class RocksDBLogStoreBase : public LocalLogStore {
                       uint32_t num_shards,
                       const std::string& path,
                       RocksDBLogStoreConfig rocksdb_config,
+                      RocksDBCustomiser* customiser,
                       StatsHolder* stats_holder,
                       IOTracing* io_tracing);
 
@@ -464,7 +479,14 @@ class RocksDBLogStoreBase : public LocalLogStore {
 
     // Schema version key not found.  Check if the database is empty ...
     int rv = isCFEmpty(cf);
-    if (rv != 1) {
+    if (rv == -1) {
+      // isCFEmpty() already logged an error.
+      return -1;
+    }
+    if (rv == 0) {
+      ld_error(
+          "Schema version key is missing, but the DB is not empty. This should "
+          "be impossible. The DB may be corrupted. Refusing to open.");
       return -1;
     }
 
@@ -550,8 +572,14 @@ class RocksDBLogStoreBase : public LocalLogStore {
   uint32_t shard_idx_;
   uint32_t num_shards_;
 
-  // path to the rocksdb directory
+  // Path to the rocksdb directory. Keep in mind that if is_db_local_ is false,
+  // this is not a real path in local FS.
   const std::string db_path_;
+
+  RocksDBCustomiser* customiser_;
+
+  // See RocksDBCustomiser::isDBLocal().
+  const bool is_db_local_;
 
   // object used to perform writes to the db
   std::unique_ptr<RocksDBWriter> writer_;
@@ -616,7 +644,7 @@ struct IterateUpperBoundHelper {
   explicit IterateUpperBoundHelper(folly::Optional<logid_t> log_id)
       : data_key(log_id.value_or(LOGID_INVALID),
                  std::numeric_limits<lsn_t>::max()) {
-    if (log_id.hasValue()) {
+    if (log_id.has_value()) {
       // Set (log_id, LSN_MAX) as the upper bound.
       // Note that this may prevent iterator from seeing record LSN_MAX because
       // iterate_upper_bound is the exclusive upper bound.
@@ -704,7 +732,7 @@ class RocksDBIterator {
   rocksdb::Status status() const {
     ld_check(iterator_ != nullptr);
     // Makes no sense to call status() before doing the first seek.
-    ld_check(status_.hasValue());
+    ld_check(status_.has_value());
 
     status_checked_ = true;
 

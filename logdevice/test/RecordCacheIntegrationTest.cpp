@@ -33,11 +33,11 @@ TEST_F(RecordCacheIntegrationTest, RecordCacheHitForNewAppends) {
   const int NNODES = 2;
   const int NLOGS = 1;
 
-  logsconfig::LogAttributes log_attrs =
-      IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(2);
-  log_attrs.set_maxWritesInFlight(1024);
-  log_attrs.set_replicationFactor(2);
-  log_attrs.set_extraCopies(0);
+  auto log_attrs =
+      IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(2)
+          .with_maxWritesInFlight(1024)
+          .with_replicationFactor(2)
+          .with_extraCopies(0);
 
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
@@ -48,6 +48,7 @@ TEST_F(RecordCacheIntegrationTest, RecordCacheHitForNewAppends) {
           .setLogAttributes(log_attrs)
           .useHashBasedSequencerAssignment()
           .create(NNODES);
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
 
   std::shared_ptr<Client> client =
       cluster->createClient(std::chrono::seconds(2));
@@ -63,19 +64,16 @@ TEST_F(RecordCacheIntegrationTest, RecordCacheHitForNewAppends) {
 
   do_write();
 
-  int rv = cluster->waitForMetaDataLogWrites(std::chrono::steady_clock::now() +
-                                             std::chrono::seconds(5));
-  cluster->waitForRecovery();
+  cluster->waitUntilAllSequencersQuiescent();
 
   ld_info("disabling N1, expect sequencer re-activations...");
   for (auto n : {1}) {
     cluster->updateNodeAttributes(n, configuration::StorageState::READ_ONLY, 0);
   }
   cluster->waitForServersToPartiallyProcessConfigUpdate();
-  rv = cluster->waitForMetaDataLogWrites(std::chrono::steady_clock::now() +
-                                         std::chrono::seconds(5));
+  int rv = cluster->waitUntilAllSequencersQuiescent(
+      std::chrono::steady_clock::now() + std::chrono::seconds(10));
   EXPECT_EQ(0, rv);
-  cluster->waitForRecovery();
 
   auto get_stats_sum = [&](const std::string& name) {
     int64_t result = 0;

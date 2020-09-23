@@ -6,11 +6,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-include "logdevice/admin/if/common.thrift"
+include "logdevice/common/if/common.thrift"
 
 include "logdevice/common/membership/Membership.thrift"
 
 namespace cpp2 facebook.logdevice.thrift
+namespace go logdevice.admin.if.nodes
 namespace py3 logdevice.admin
 namespace php LogDevice
 namespace wiki Thriftdoc.LogDevice.Nodes
@@ -77,6 +78,10 @@ struct NodeConfig {
    * A unique name for the node in the cluster.
    */
   9: string name;
+  /**
+   * Custom tags.
+   */
+   10: map<string, string> tags;
 }
 
 /**
@@ -309,10 +314,6 @@ struct ShardState {
    */
   1: ShardDataHealth data_health,
   /**
-   * [DEPRECATED]. Will be removed once callers move to storage_state instead.
-   */
-  2: ShardStorageState current_storage_state (deprecated),
-  /**
    * See the ShardOperationalState enum for info. See the
    * maintenance for information about the active transition
    */
@@ -401,6 +402,38 @@ enum ServiceState {
   DEAD = 5,
 }
 
+/**
+ * ServiceHealthStatus represents whether the daemon is HEALTHY or not from the
+ * point of view of the node you are requesting this data from. This uses the
+ * gossip information propagated through the cluster.
+ */
+enum ServiceHealthStatus {
+  /**
+   * We don't know the service health status.
+   */
+  UNKNOWN = 0,
+  /**
+   * The node is UNDEFINED according to the gossip table of the node
+   * responding with this data structure.
+   */
+  UNDEFINED = 1,
+  /**
+   * The node is HEALTHY according to the gossip table of the node
+   * responding with this data structure.
+   */
+  HEALTHY = 2,
+  /**
+   * The node is OVERLOADED according to the gossip table of the node
+   * responding with this data structure.
+   */
+  OVERLOADED = 3,
+  /**
+   * The node is UNHEALTHY according to the gossip table of the node
+   * responding with this data structure.
+   */
+  UNHEALTHY = 4,
+}
+
 struct NodeState {
   /**
    * The index of this node
@@ -424,6 +457,10 @@ struct NodeState {
    * Configuration object for this node.
    */
   5: NodeConfig config,
+  /**
+   * The gossip health status of node.
+   */
+  6: ServiceHealthStatus daemon_health_status = ServiceHealthStatus.UNKNOWN,
 }
 
 typedef list<NodeConfig> NodesConfig
@@ -461,5 +498,5 @@ struct NodesStateRequest {
    * If force=true we return the state information that we have even if the node
    * is not fully ready. We don't throw NodeNotReady exception in this case.
    */
-  2: optional bool force,
+  2: optional bool force (deprecated),
 }

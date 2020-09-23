@@ -18,7 +18,6 @@ namespace facebook { namespace logdevice {
 
 const shard_index_t SHARD_IDX = 0;
 
-using Context = SealStorageTask::Context;
 using EpochInfo = SealStorageTask::EpochInfo;
 using EpochInfoMap = SealStorageTask::EpochInfoMap;
 
@@ -67,7 +66,7 @@ static lsn_t lsn(int epoch, int esn) {
 
 TEST(SealStorageTaskTest, UpdateSeal) {
   TemporaryRocksDBStore store;
-  LogStorageStateMap map(1);
+  LogStorageStateMap map(1, /*stats*/ nullptr, /*record_cache*/ false);
 
   {
     TestSealStorageTask task =
@@ -84,7 +83,7 @@ TEST(SealStorageTaskTest, UpdateSeal) {
 
 TEST(SealStorageTaskTest, UpdateSealSmaller) {
   TemporaryRocksDBStore store;
-  LogStorageStateMap map(1);
+  LogStorageStateMap map(1, /*stats*/ nullptr, /*record_cache*/ false);
 
   // local log store already contains a seal record with epoch 2
   store.writeLogMetadata(logid_t(1),
@@ -96,13 +95,13 @@ TEST(SealStorageTaskTest, UpdateSealSmaller) {
 
   folly::Optional<Seal> seal =
       map.get(logid_t(1), SHARD_IDX).getSeal(LogStorageState::SealType::NORMAL);
-  ASSERT_TRUE(seal.hasValue());
+  ASSERT_TRUE(seal.has_value());
   EXPECT_EQ(epoch_t(2), seal.value().epoch);
 }
 
 TEST(SealStorageTaskTest, LastKnownGood) {
   TemporaryRocksDBStore store;
-  LogStorageStateMap map(1);
+  LogStorageStateMap map(1, /*stats*/ nullptr, /*record_cache*/ false);
 
   std::vector<TestRecord> records = {
       TestRecord(logid_t(1), lsn(1, 1), ESN_INVALID),
@@ -178,7 +177,7 @@ TEST(SealStorageTaskTest, LastKnownGood) {
 // it also recovers soft seals if it is not in memory
 TEST(SealStorageTaskTest, SoftSeal) {
   TemporaryRocksDBStore store;
-  LogStorageStateMap map(1);
+  LogStorageStateMap map(1, /*stats*/ nullptr, /*record_cache*/ false);
 
   {
     // local log store already contains a normal seal record with epoch 2
@@ -198,7 +197,7 @@ TEST(SealStorageTaskTest, SoftSeal) {
 
     folly::Optional<Seal> soft_seal =
         map.get(logid_t(1), SHARD_IDX).getSeal(LogStorageState::SealType::SOFT);
-    ASSERT_TRUE(soft_seal.hasValue());
+    ASSERT_TRUE(soft_seal.has_value());
     EXPECT_EQ(Seal(epoch_t(3), NodeID(5, 1)), soft_seal.value());
   }
 
@@ -221,21 +220,21 @@ TEST(SealStorageTaskTest, SoftSeal) {
     folly::Optional<Seal> soft_seal =
         map.get(logid_t(2), SHARD_IDX).getSeal(LogStorageState::SealType::SOFT);
     // soft seal should have value but stay the same
-    ASSERT_TRUE(soft_seal.hasValue());
+    ASSERT_TRUE(soft_seal.has_value());
     EXPECT_EQ(Seal(epoch_t(2), NodeID(5, 1)), soft_seal.value());
 
     folly::Optional<Seal> normal_seal =
         map.get(logid_t(2), SHARD_IDX)
             .getSeal(LogStorageState::SealType::NORMAL);
     // soft seal should have value but stay the same
-    ASSERT_TRUE(normal_seal.hasValue());
+    ASSERT_TRUE(normal_seal.has_value());
     EXPECT_EQ(Seal(epoch_t(3), NodeID(0, 1)), normal_seal.value());
   }
 }
 
 TEST(SealStorageTaskTest, EpochInfoWithByteOffset) {
   TemporaryRocksDBStore store;
-  LogStorageStateMap map(1);
+  LogStorageStateMap map(1, /*stats*/ nullptr, /*record_cache*/ false);
 
   std::vector<TestRecord> records = {
       TestRecord(logid_t(1), lsn(2, 1), ESN_INVALID)
@@ -257,7 +256,7 @@ TEST(SealStorageTaskTest, EpochInfoWithByteOffset) {
 
 TEST(SealStorageTaskTest, EpochInfo) {
   TemporaryRocksDBStore store;
-  LogStorageStateMap map(1);
+  LogStorageStateMap map(1, /*stats*/ nullptr, /*record_cache*/ false);
 
   std::vector<TestRecord> records = {
       TestRecord(logid_t(1), lsn(2, 1), ESN_INVALID),
@@ -319,7 +318,7 @@ TEST(SealStorageTaskTest, EpochInfo) {
 
 TEST(SealStorageTaskTest, PurgeStillGetEpochInfoOnPreemption) {
   TemporaryRocksDBStore store;
-  LogStorageStateMap map(1);
+  LogStorageStateMap map(1, /*stats*/ nullptr, /*record_cache*/ false);
 
   std::vector<TestRecord> records = {
       TestRecord(logid_t(1), lsn(7, 21), esn_t(5))};
@@ -369,7 +368,7 @@ TEST(SealStorageTaskTest, PurgeStillGetEpochInfoOnPreemption) {
 // to get a more accurate tail record
 TEST(SealStorageTaskTest, TailRecordWithMutablePerEpochLogMetadata) {
   TemporaryRocksDBStore store;
-  LogStorageStateMap map(1);
+  LogStorageStateMap map(1, /*stats*/ nullptr, /*record_cache*/ false);
 
   std::vector<TestRecord> records = {
       TestRecord(logid_t(1), lsn(2, 1), ESN_INVALID),
@@ -417,7 +416,7 @@ TEST(SealStorageTaskTest, TailRecordWithMutablePerEpochLogMetadata) {
 
 TEST(SealStorageTaskTest, TailRecordWithEpochOffset) {
   TemporaryRocksDBStore store;
-  LogStorageStateMap map(1);
+  LogStorageStateMap map(1, /*stats*/ nullptr, /*record_cache*/ false);
 
   bool tail_optimized = true;
 
@@ -496,7 +495,7 @@ TEST(SealStorageTaskTest, TailRecordWithEpochOffset) {
 // the first attempt requires sync
 TEST(SealStorageTaskTest, RetrySealingAndDurability) {
   TemporaryRocksDBStore store;
-  LogStorageStateMap map(1);
+  LogStorageStateMap map(1, /*stats*/ nullptr, /*record_cache*/ false);
 
   std::vector<TestRecord> records = {
       TestRecord(logid_t(1), lsn(1, 2), esn_t(1)),

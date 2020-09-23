@@ -7,72 +7,96 @@
  */
 #pragma once
 
-#include <functional>
-#include <memory>
-#include <vector>
+#include <chrono>
 
-#include "logdevice/common/BackoffTimer.h"
-#include "logdevice/common/NodeID.h"
-#include "logdevice/common/ShardID.h"
-#include "logdevice/common/configuration/Configuration.h"
+#include <folly/Expected.h>
+#include <folly/executors/InlineExecutor.h>
+#include <folly/futures/Retrying.h>
 
 namespace facebook { namespace logdevice {
 
 /**
- * @file RetryHandler is a utility class used to perform an action on a
- *       storage shard (e.g. sending a message), retrying later (with a backoff)
- *       in case of a failure.
+ * @file RetryHandler provides an API to retry a certain function if it fails
+ * with exponential backoff and optional jitter.
+ *
+ * It is a thin-wrapper around folly::futures::retrying to support retrying for
+ * code that's not future based.
+ *
  */
-
+template <class T>
 class RetryHandler {
  public:
-  typedef std::function<int(ShardID)> func_t;
-
-  explicit RetryHandler(func_t handler, // handler should return 0 on success
-                        std::chrono::milliseconds retry_initial_delay =
-                            std::chrono::milliseconds(5),
-                        std::chrono::milliseconds retry_max_delay =
-                            std::chrono::milliseconds(1000))
-      : handler_(handler),
-        retry_initial_delay_(retry_initial_delay),
-        retry_max_delay_(retry_max_delay) {
-    ld_check(handler);
-  }
-
-  virtual ~RetryHandler() {}
+  using Result = std::pair<T, /* exhausted_retries */ bool>;
 
   /**
-   * Activate the timer that calls handler_.
+   * Retries the function until either we exhaust all the retries or
+   * should_retry returns false.
    *
-   * @param shard  shard to activate the timer for
-   * @param reset  if set, timeout will be reset to its initial value
+   * @param func: The function we want to retry, takes as a param the trial
+   *              number.
+   * @param should_retry: Given the output of func, returns true to retry, or
+   *                      false to stop retrying.
+   *
+   * @returns A pair of:
+   *   1- The last returned value from the function.
+   *   2- True if we exhausted all the retries, false otherwise.
    */
-  virtual void activateTimer(ShardID shard, bool reset = false);
+  static folly::SemiFuture<Result>
+  run(folly::Function<T(size_t trial_num) const> func,
+      folly::Function<bool(const T&) const> should_retry,
+      size_t max_tries,
+      std::chrono::milliseconds backoff_min,
+      std::chrono::milliseconds backoff_max,
+      double jitter_param) {
+    return folly::futures::retrying(
+               folly::futures::retryingPolicyCappedJitteredExponentialBackoff(
+                   max_tries, backoff_min, backoff_max, jitter_param),
+               [fu = std::move(func), should_retry = std::move(should_retry)](
+                   size_t trial) -> folly::SemiFuture<Result> {
+                 T ret = fu(trial);
 
-  // Call handler_ and activate the timer in case of failure
-  virtual int execute(ShardID shard) {
-    int rv = handler_(shard);
-    if (rv != 0) {
-      activateTimer(shard);
-    }
-    return rv;
+                 // If it's a failure, simulate an execption for
+                 // futures::retrying to retry.
+                 if (should_retry(ret)) {
+                   return folly::make_exception_wrapper<Failure>(
+                       std::move(ret));
+                 } else {
+                   return std::make_pair(std::move(ret), false);
+                 }
+               })
+        // Called when we exhaust all the retry. Return the last value and mark
+        // it as exhausted all retries.
+        .deferError(folly::tag_t<Failure>(),
+                    [](Failure f) -> folly::SemiFuture<Result> {
+                      return std::make_pair(std::move(f.type), true);
+                    });
   }
 
- protected:
-  // default constructor, used in tests
-  explicit RetryHandler() {}
+  /**
+   * Synchronous version of RetryHandler<T>::run.
+   */
+  static Result syncRun(folly::Function<T(size_t trial_num) const> func,
+                        folly::Function<bool(const T&) const> should_retry,
+                        size_t max_tries,
+                        std::chrono::milliseconds backoff_min,
+                        std::chrono::milliseconds backoff_max,
+                        double jitter_param) {
+    auto& executor = folly::InlineExecutor::instance();
+    return run(std::move(func),
+               std::move(should_retry),
+               max_tries,
+               backoff_min,
+               backoff_max,
+               jitter_param)
+        .via(&executor)
+        .get();
+  }
 
  private:
-  std::shared_ptr<ServerConfig> getConfig() const;
-  std::unique_ptr<BackoffTimer> createRetryTimer(ShardID shard);
-
-  func_t handler_;
-  std::chrono::milliseconds retry_initial_delay_;
-  std::chrono::milliseconds retry_max_delay_;
-
-  // Retry timers for connection or transient errors
-  std::unordered_map<ShardID, std::unique_ptr<BackoffTimer>, ShardID::Hash>
-      retry_timers_;
+  struct Failure : std::exception {
+    explicit Failure(T t) : type(std::move(t)) {}
+    T type;
+  };
 };
 
 }} // namespace facebook::logdevice

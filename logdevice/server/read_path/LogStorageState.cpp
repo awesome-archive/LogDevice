@@ -25,8 +25,8 @@
 #include "logdevice/server/ServerWorker.h"
 #include "logdevice/server/locallogstore/LocalLogStore.h"
 #include "logdevice/server/read_path/LogStorageStateMap.h"
+#include "logdevice/server/storage/PurgeCoordinator.h"
 #include "logdevice/server/storage_tasks/PerWorkerStorageTaskQueue.h"
-#include "logdevice/server/storage_tasks/RecoverLogStateTask.h"
 #include "logdevice/server/storage_tasks/RecoverSealTask.h"
 #include "logdevice/server/storage_tasks/StorageTask.h"
 
@@ -54,10 +54,7 @@ LogStorageState::LogStorageState(logid_t log_id,
       owner_(owner) {
   retry_release_.timer_scheduled_ = false;
   retry_release_.force_ = false;
-  if (owner_->getProcessor() != nullptr) { // may be null in tests
-    purge_coordinator_ =
-        owner_->getProcessor()->createPurgeCoordinator(log_id, shard_, this);
-  }
+  purge_coordinator_ = std::make_unique<PurgeCoordinator>(log_id, shard, this);
 }
 
 LogStorageState::~LogStorageState() = default;
@@ -80,21 +77,15 @@ bool LogStorageState::hasPermanentError() {
 
 int LogStorageState::updateLastReleasedLSN(lsn_t new_val,
                                            LastReleasedSource source) {
-  SCOPE_EXIT {
-    last_released_lsn_state_.fetch_or((int)source);
-  };
-
   // Update the last per-epoch released LSN first, to ensure it is always at
   // least as high as the (global) last leleased LSN.
   updateLastPerEpochReleasedLSN(new_val);
-
-  // If our LSN is larger than the one already in the map, update it.
-  lsn_t prev = atomic_fetch_max(last_released_lsn_, new_val);
-  if (prev >= new_val) {
-    // last_released_lsn was already >= new_val
+  folly::SharedMutex::WriteHolder rw_lock(lsn_mutex_);
+  if (last_released_lsn_.value() >= new_val) {
     err = E::UPTODATE;
     return -1;
   }
+  last_released_lsn_.update(new_val, source);
   return 0;
 }
 
@@ -107,12 +98,8 @@ int LogStorageState::updateLastPerEpochReleasedLSN(lsn_t new_val) {
   return 0;
 }
 
-folly::Optional<lsn_t> LogStorageState::getTrimPoint() const {
-  folly::Optional<lsn_t> result; // initially empty
-  if (trim_point_.hasValue()) {
-    result.assign(trim_point_.load());
-  }
-  return result;
+lsn_t LogStorageState::getTrimPoint() const {
+  return trim_point_.load();
 }
 
 folly::Optional<epoch_t>
@@ -134,28 +121,24 @@ LogStorageState::getSeal(LogStorageState::SealType type) const {
   return result;
 }
 
-folly::Optional<epoch_t> LogStorageState::getLastCleanEpoch() const {
-  folly::Optional<epoch_t> result; // initially empty
-  if (last_clean_epoch_.hasValue()) {
-    result.assign(epoch_t(last_clean_epoch_.load()));
-  }
-  return result;
+epoch_t LogStorageState::getLastCleanEpoch() const {
+  return epoch_t(last_clean_epoch_.load());
 }
 
-const folly::Optional<std::pair<epoch_t, OffsetMap>>&
+folly::Optional<std::pair<epoch_t, OffsetMap>>
 LogStorageState::getEpochOffsetMap() const {
   RWLock::ReadHolder read_guard(rw_lock_);
   return latest_epoch_offsets_;
 }
 
 void LogStorageState::updateLastCleanEpoch(epoch_t epoch) {
-  last_clean_epoch_.fetchMax(epoch.val_);
+  atomic_fetch_max(last_clean_epoch_, epoch.val_);
 }
 
 void LogStorageState::updateEpochOffsetMap(
     std::pair<epoch_t, OffsetMap> epoch_offsets) {
   RWLock::WriteHolder write_guard(rw_lock_);
-  if (latest_epoch_offsets_.hasValue() &&
+  if (latest_epoch_offsets_.has_value() &&
       latest_epoch_offsets_.value().first < epoch_offsets.first) {
     // No updates needed for older epoch.
     return;
@@ -165,7 +148,7 @@ void LogStorageState::updateEpochOffsetMap(
 }
 
 int LogStorageState::updateTrimPoint(lsn_t new_val) {
-  lsn_t prev = trim_point_.fetchMax(new_val);
+  lsn_t prev = atomic_fetch_max(trim_point_, new_val);
   if (prev >= new_val) {
     err = E::UPTODATE;
     return -1;
@@ -232,7 +215,7 @@ void LogStorageState::onRetryReleaseTimer(ExponentialBackoffTimerNode* node) {
 
   ReleaseRequest::broadcastReleaseRequest(
       ServerWorker::onThisThread()->processor_,
-      RecordID(last_released_lsn_, log_id_),
+      RecordID(getLastReleasedLSN().value(), log_id_),
       shard_,
       [&](worker_id_t id) {
         return failed_workers.test(id.val_) && this->isWorkerSubscribed(id);
@@ -262,20 +245,13 @@ int LogStorageState::recover(std::chrono::microseconds interval,
   ServerWorker* w = ServerWorker::onThisThread();
   ld_check(w->processor_->sequencer_locator_ != nullptr);
 
-  folly::Optional<lsn_t> trim_point = getTrimPoint();
   LogStorageState::LastReleasedLSN last_released = getLastReleasedLSN();
 
   // Do we need to ask the sequencer for any of the missing information?
-  bool ask_sequencer = (!last_released.hasValue() ||
-                        last_released.source() !=
-                            LogStorageState::LastReleasedSource::RELEASE) ||
-      force_ask_sequencer;
+  bool ask_sequencer = force_ask_sequencer ||
+      last_released.source() != LogStorageState::LastReleasedSource::RELEASE;
 
-  // should we attempt to read it from the local log store?
-  bool recover_from_store = !last_released.hasValue() ||
-      !trim_point.hasValue() || !getLastCleanEpoch().hasValue();
-
-  if (!ask_sequencer && !recover_from_store) {
+  if (!ask_sequencer) {
     // nothing needs to be recovered
     return 0;
   }
@@ -306,7 +282,7 @@ int LogStorageState::recover(std::chrono::microseconds interval,
   // GetSeqStateRequest's internal coalescing mechanism to avoid accumulating
   // callbacks; this method may be called many times quickly on server
   // startup.)
-  if (ask_sequencer && !get_seq_state_inflight_.exchange(true)) {
+  if (!get_seq_state_inflight_.exchange(true)) {
     GetSeqStateRequest::Options opts;
     opts.wait_for_recovery = true;
     opts.include_epoch_offset = true;
@@ -328,20 +304,13 @@ int LogStorageState::recover(std::chrono::microseconds interval,
     }
   }
 
-  // If we haven't yet tried to read from the local log store, try that.
-  if (recover_from_store && !recover_log_state_task_in_flight_.exchange(true)) {
-    std::unique_ptr<StorageTask> task =
-        std::make_unique<RecoverLogStateTask>(log_id_);
-    w->getStorageTaskQueueForShard(shard_)->putTask(std::move(task));
-  }
-
   return 0;
 }
 
 int LogStorageState::recoverSeal(seal_callback_t callback) {
   folly::Optional<Seal> normal_seal = getSeal(SealType::NORMAL);
   folly::Optional<Seal> soft_seal = getSeal(SealType::SOFT);
-  if (normal_seal.hasValue() && soft_seal.hasValue()) {
+  if (normal_seal.has_value() && soft_seal.has_value()) {
     // both normal and soft seals have values, no need to recover
     Seals seals;
     seals.setSeal(SealType::NORMAL, normal_seal.value());
@@ -370,31 +339,29 @@ void LogStorageState::getDebugInfo(InfoLogStorageStateTable& table) const {
   table.set<1>(shard_);
 
   LastReleasedLSN last_released = getLastReleasedLSN();
-  if (last_released.hasValue()) {
-    table.set<2>(last_released.value());
-    const char* source = last_released.source() == LastReleasedSource::RELEASE
-        ? "sequencer"
-        : "local log store";
-    table.set<3>(source);
-  }
+  table.set<2>(last_released.value());
+  const char* source = last_released.source() == LastReleasedSource::RELEASE
+      ? "sequencer"
+      : "local log store";
+  table.set<3>(source);
 
   folly::Optional<lsn_t> trim_point = getTrimPoint();
-  if (trim_point.hasValue()) {
+  if (trim_point.has_value()) {
     table.set<4>(trim_point.value());
   }
 
   folly::Optional<epoch_t> epoch_trim_point = getPerEpochLogMetadataTrimPoint();
-  if (epoch_trim_point.hasValue()) {
+  if (epoch_trim_point.has_value()) {
     table.set<5>(epoch_trim_point.value());
   }
 
   folly::Optional<Seal> seal = getSeal(SealType::NORMAL);
-  if (seal.hasValue()) {
+  if (seal.has_value()) {
     table.set<6>(seal.value().epoch);
     table.set<7>(seal.value().seq_node.toString());
   }
   folly::Optional<Seal> soft_seal = getSeal(SealType::SOFT);
-  if (seal.hasValue()) {
+  if (seal.has_value()) {
     table.set<8>(soft_seal.value().epoch);
     table.set<9>(soft_seal.value().seq_node.toString());
   }
@@ -406,14 +373,10 @@ void LogStorageState::getDebugInfo(InfoLogStorageStateTable& table) const {
        last_recovery_time_.load())));
 
   table.set<11>(log_removal_time_.load());
-
-  folly::Optional<epoch_t> last_clean = getLastCleanEpoch();
-  if (last_clean.hasValue()) {
-    table.set<12>(last_clean.value());
-  }
+  table.set<12>(getLastCleanEpoch());
 
   auto latest_epoch = getEpochOffsetMap();
-  if (latest_epoch.hasValue()) {
+  if (latest_epoch.has_value()) {
     table.set<13>(latest_epoch->first);
     table.set<14>(latest_epoch->second.toString());
   }
@@ -447,7 +410,6 @@ void LogStorageState::getSeqStateRequestCallback(
         result.last_released_lsn,
         result.last_seq,
         ReleaseType::GLOBAL,
-        true /* do_release */,
         result.epoch_offsets.value_or(OffsetMap()));
   } else {
     // Sequencer may send LSN_INVALID if it's still not done recovering the

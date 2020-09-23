@@ -30,7 +30,7 @@ class NodesConfigurationTracer : SampledTracer {
     UNKNOWN = 0,
     NCM_UPDATE = 1,
     NCM_OVERWRITE = 2,
-    NC_PUBLISHER = 3,
+    //  NC_PUBLISHER = 3, // Deprecated
   };
   static std::string toString(const Source&);
 
@@ -50,6 +50,13 @@ class NodesConfigurationTracer : SampledTracer {
   };
 
   explicit NodesConfigurationTracer(std::shared_ptr<TraceLogger> logger);
+  /**
+   * The local default for this is 100% of samples unless explicity overridden
+   * by the config file.
+   */
+  virtual folly::Optional<double> getDefaultSamplePercentage() const {
+    return 100;
+  }
 
   void trace(Sample sample);
 };

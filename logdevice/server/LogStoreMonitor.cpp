@@ -11,11 +11,11 @@
 #include <folly/Memory.h>
 
 #include "logdevice/common/ThreadID.h"
-#include "logdevice/server/RebuildingSupervisor.h"
 #include "logdevice/server/ServerProcessor.h"
 #include "logdevice/server/locallogstore/CompactionRequest.h"
 #include "logdevice/server/locallogstore/RocksDBLocalLogStore.h"
 #include "logdevice/server/locallogstore/ShardedRocksDBLocalLogStore.h"
+#include "logdevice/server/rebuilding/RebuildingSupervisor.h"
 #include "logdevice/server/storage_tasks/ShardedStorageThreadPool.h"
 
 namespace facebook { namespace logdevice {
@@ -155,8 +155,10 @@ void MonitorRequestQueue::MonitorRequestCallback::operator()(Status /*st*/) {
 
 LogStoreMonitor::LogStoreMonitor(
     ServerProcessor* processor,
+    RebuildingSupervisor* rebuilding_supervisor,
     UpdateableSettings<LocalLogStoreSettings> settings)
     : processor_(processor),
+      rebuilding_supervisor_(rebuilding_supervisor),
       settings_(std::move(settings)),
       request_queue_(std::make_shared<MonitorRequestQueue>(
           processor,
@@ -213,6 +215,11 @@ void LogStoreMonitor::checkFreeSpace() {
                            ShardedRocksDBLocalLogStore::DiskShardMappingEntry>&
       shards_to_disks = sharded_rocks_store->getShardToDiskMapping();
 
+  if (shards_to_disks.empty()) {
+    // Data is not stored locally. Checking free space is not supported.
+    return;
+  }
+
   for (auto& shards_to_disk : shards_to_disks) {
     boost::filesystem::path path = shards_to_disk.second.example_path;
     boost::filesystem::space_info info = boost::filesystem::space(path, code);
@@ -257,6 +264,7 @@ void LogStoreMonitor::checkFreeSpace() {
         shards_to_disk.second, info, &space_based_trimming_threshold_exceeded);
 
     for (RocksDBLogStoreBase* rocks_store_base : shards) {
+      std::string shard_path = rocks_store_base->getLocalDBPath().value();
       RocksDBLocalLogStore* rocks_store =
           dynamic_cast<RocksDBLocalLogStore*>(rocks_store_base);
       ld_debug(
@@ -293,7 +301,7 @@ void LogStoreMonitor::checkFreeSpace() {
                        "Capacity: %lu, Free %lu (%f), min threshold %f, "
                        "stop accepting writes for the shard",
                        rocks_store_base->getShardIdx(),
-                       rocks_store_base->getDBPath().c_str(),
+                       shard_path.c_str(),
                        info.capacity,
                        info.free,
                        static_cast<double>(info.free) / info.capacity,
@@ -307,7 +315,7 @@ void LogStoreMonitor::checkFreeSpace() {
                        "Capacity: %lu, Free %lu (%f), min threshold %f, "
                        "resume accepting writes for the shard",
                        rocks_store_base->getShardIdx(),
-                       rocks_store_base->getDBPath().c_str(),
+                       shard_path.c_str(),
                        info.capacity,
                        info.free,
                        static_cast<double>(info.free) / info.capacity,
@@ -334,7 +342,7 @@ void LogStoreMonitor::checkFreeSpace() {
           ld_error("Cannot get property %s from rocksdb shard [%d]: %s.",
                    property.c_str(),
                    rocks_store_base->getShardIdx(),
-                   rocks_store->getDBPath().c_str());
+                   shard_path.c_str());
           // skip this rocksdb store
           continue;
         }
@@ -354,7 +362,7 @@ void LogStoreMonitor::checkFreeSpace() {
                          "%s that is not accepting writes, num-l0-files: %d, "
                          "compaction threshold: %d",
                          rocks_store_base->getShardIdx(),
-                         rocks_store->getDBPath().c_str(),
+                         shard_path.c_str(),
                          num,
                          threshold);
 
@@ -371,7 +379,7 @@ void LogStoreMonitor::checkFreeSpace() {
 }
 
 void LogStoreMonitor::checkNeedRebuilding() {
-  auto supervisor = processor_->rebuilding_supervisor_;
+  auto supervisor = rebuilding_supervisor_;
   if (!supervisor) {
     // Rebuilding is disabled.
     return;

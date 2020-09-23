@@ -16,7 +16,6 @@
 #include "logdevice/common/EpochMetaDataMap.h"
 #include "logdevice/common/EpochMetaDataUpdater.h"
 #include "logdevice/common/EpochStore.h"
-#include "logdevice/common/FileEpochStore.h"
 #include "logdevice/common/LocalLogStoreRecordFormat.h"
 #include "logdevice/common/MetaDataLog.h"
 #include "logdevice/common/Metadata.h"
@@ -31,6 +30,7 @@
 #include "logdevice/include/Client.h"
 #include "logdevice/include/ClientSettings.h"
 #include "logdevice/lib/ClientImpl.h"
+#include "logdevice/server/epoch_store/FileEpochStore.h"
 #include "logdevice/server/locallogstore/test/StoreUtil.h"
 #include "logdevice/test/utils/IntegrationTestBase.h"
 #include "logdevice/test/utils/IntegrationTestUtils.h"
@@ -101,12 +101,12 @@ class NodeSetTest : public IntegrationTestBase {
 void NodeSetTest::init() {
   ld_check(replication_ <= nodes_);
 
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_maxWritesInFlight(256);
-  log_attrs.set_singleWriter(false);
-  log_attrs.set_replicationFactor(replication_);
-  log_attrs.set_extraCopies(extra_);
-  log_attrs.set_syncedCopies(synced_);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_maxWritesInFlight(256)
+                       .with_singleWriter(false)
+                       .with_replicationFactor(replication_)
+                       .with_extraCopies(extra_)
+                       .with_syncedCopies(synced_);
 
   auto factory =
       IntegrationTestUtils::ClusterFactory()
@@ -160,7 +160,7 @@ void NodeSetTest::updateMetaDataInEpochStore(logid_t log) {
               log,
               std::make_shared<CustomEpochMetaDataUpdater>(
                   config,
-                  config->getNodesConfigurationFromServerConfigSource(),
+                  cluster_->getConfig()->getNodesConfiguration(),
                   selector,
                   true,
                   true /* provision_if_empty */,
@@ -214,8 +214,10 @@ void NodeSetTest::writeMetaDataLog() {
   auto count_activations = [&]() {
     size_t count = 0;
     for (size_t i = 0; i < nodes_; ++i) {
-      auto config = cluster_->getConfig()->get()->serverConfig();
-      if (!config->getNode(i) || !config->getNode(i)->isSequencingEnabled()) {
+      if (!cluster_->getConfig()
+               ->getNodesConfiguration()
+               ->getSequencerMembership()
+               ->isSequencingEnabled(i)) {
         continue;
       }
       auto stats = cluster_->getNode(i).stats();
@@ -254,12 +256,10 @@ void NodeSetTest::writeMetaDataLog() {
     reader->setRecordCallback(
         [expected, &sem, this, log](std::unique_ptr<DataRecord>& record) {
           EpochMetaData info;
-          int rv = info.fromPayload(
-              record->payload,
-              log,
-              *cluster_->getConfig()
-                   ->getServerConfig()
-                   ->getNodesConfigurationFromServerConfigSource());
+          int rv =
+              info.fromPayload(record->payload,
+                               log,
+                               *cluster_->getConfig()->getNodesConfiguration());
           EXPECT_EQ(0, rv);
           EXPECT_EQ(info.h.epoch, info.h.effective_since);
           if (info.h.epoch == expected) {
@@ -822,10 +822,9 @@ TEST_F(NodeSetTest, RebuildMultipleEpochs) {
   // do a rolling replacement of storage nodes
   for (int i = 0; i < nodes_; ++i) {
     if (cluster_->getConfig()
-            ->get()
-            ->serverConfig()
-            ->getNode(i)
-            ->isReadableStorageNode()) {
+            ->getNodesConfiguration()
+            ->getStorageMembership()
+            ->hasShardShouldReadFrom(i)) {
       ASSERT_EQ(0, cluster_->replace(i));
       ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, i, SHARD_IDX));
       // Wait until all shards finish rebuilding.
@@ -885,12 +884,12 @@ TEST_F(NodeSetTest, RebuildMultipleEpochs) {
 }
 
 TEST_F(NodeSetTest, EpochMetaDataCache) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_maxWritesInFlight(256);
-  log_attrs.set_singleWriter(false);
-  log_attrs.set_replicationFactor(replication_);
-  log_attrs.set_extraCopies(extra_);
-  log_attrs.set_syncedCopies(synced_);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_maxWritesInFlight(256)
+                       .with_singleWriter(false)
+                       .with_replicationFactor(replication_)
+                       .with_extraCopies(extra_)
+                       .with_syncedCopies(synced_);
 
   // we have a specific setup:
   // node 0: sequencer

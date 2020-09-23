@@ -47,6 +47,7 @@ int SyncCheckpointedReaderImpl::startReading(
     lsn_t from,
     lsn_t until,
     const ReadStreamAttributes* attrs) {
+  last_read_lsn_.erase(log_id);
   return reader_->startReading(log_id, from, until, attrs);
 }
 
@@ -70,11 +71,31 @@ ssize_t SyncCheckpointedReaderImpl::read(
     size_t nrecords,
     std::vector<std::unique_ptr<DataRecord>>* data_out,
     GapRecord* gap_out) {
-  return reader_->read(nrecords, data_out, gap_out);
+  int nread = reader_->read(nrecords, data_out, gap_out);
+  if (nread >= 0) {
+    ld_check(data_out);
+    for (auto& record_ptr : *data_out) {
+      setLastLSNInMap(record_ptr->logid, record_ptr->attrs.lsn);
+    }
+  } else {
+    ld_check(gap_out);
+    if (gap_out->hi != LSN_MAX) {
+      setLastLSNInMap(gap_out->logid, gap_out->hi);
+    }
+  }
+  return nread;
 }
 
 void SyncCheckpointedReaderImpl::waitOnlyWhenNoData() {
   reader_->waitOnlyWhenNoData();
+}
+
+void SyncCheckpointedReaderImpl::setMonitoringTier(MonitoringTier tier) {
+  reader_->setMonitoringTier(tier);
+}
+
+void SyncCheckpointedReaderImpl::addMonitoringTag(std::string tag) {
+  reader_->addMonitoringTag(std::move(tag));
 }
 
 void SyncCheckpointedReaderImpl::withoutPayload() {
@@ -99,6 +120,10 @@ int SyncCheckpointedReaderImpl::isConnectionHealthy(logid_t log_id) const {
 
 void SyncCheckpointedReaderImpl::doNotDecodeBufferedWrites() {
   reader_->doNotDecodeBufferedWrites();
+}
+
+void SyncCheckpointedReaderImpl::setReaderName(const std::string& reader_name) {
+  reader_->setReaderName(reader_name);
 }
 
 }} // namespace facebook::logdevice

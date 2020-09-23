@@ -20,7 +20,6 @@ from ldops.testutil.async_test import async_test
 from ldops.testutil.mock_admin_api import MockAdminAPI, gen_word
 from ldops.types.cluster_view import ClusterView
 from ldops.types.node_view import NodeView
-from logdevice.admin.common.types import NodeID, ShardID
 from logdevice.admin.maintenance.types import (
     MaintenanceDefinition,
     MaintenanceProgress,
@@ -33,35 +32,63 @@ from logdevice.admin.nodes.types import (
     NodeState,
     SequencingState,
     ShardOperationalState,
+    StorageConfig,
 )
+from logdevice.common.types import NodeID, ShardID
 
 
 class TestClusterView(TestCase):
     @async_test
-    async def test_smoke(self):
+    async def test_normal(self) -> None:
         async with MockAdminAPI() as client:
-            cv = await get_cluster_view(client)
-            await apply_maintenance(
-                client=client,
-                shards=[
-                    ShardID(
-                        node=cv.get_node_view_by_node_index(0).node_id, shard_index=1
-                    )
-                ],
-                sequencer_nodes=[cv.get_node_view_by_node_index(0).node_id],
-            )
-            await apply_maintenance(
-                client=client,
-                node_ids=[cv.get_node_id(node_index=1)],
-                user="hello",
-                reason="whatever",
-            )
-            (cv, nc_resp, ns_resp, mnts_resp) = await asyncio.gather(
-                get_cluster_view(client),
-                client.getNodesConfig(NodesFilter()),
-                client.getNodesState(NodesStateRequest()),
-                client.getMaintenances(MaintenancesFilter()),
-            )
+            return await self.smoke(client)
+
+    @async_test
+    async def test_disagg(self) -> None:
+        async with MockAdminAPI(
+            disaggregated=True, num_storage_nodes=50, num_sequencer_nodes=50
+        ) as client:
+            return await self.smoke(client)
+
+    async def smoke(self, client) -> None:
+        cv = await get_cluster_view(client)
+        storages_node_views = [nv for nv in cv.get_all_node_views() if nv.is_storage]
+        sequencers_node_views = [
+            nv for nv in cv.get_all_node_views() if nv.is_sequencer
+        ]
+
+        # combined maintenance, storages and sequencers
+        await apply_maintenance(
+            client=client,
+            shards=[ShardID(node=storages_node_views[0].node_id, shard_index=1)],
+            sequencer_nodes=[sequencers_node_views[0].node_id],
+        )
+
+        # storage-only maintenance
+        await apply_maintenance(
+            client=client,
+            shards=[ShardID(node=storages_node_views[1].node_id, shard_index=1)],
+        )
+
+        # sequencer-only maintenance
+        await apply_maintenance(
+            client=client, sequencer_nodes=[sequencers_node_views[2].node_id]
+        )
+
+        # maintenance for whole nodes
+        await apply_maintenance(
+            client=client,
+            node_ids=[storages_node_views[3].node_id, sequencers_node_views[4].node_id],
+            user="hello",
+            reason="whatever",
+        )
+
+        (cv, nc_resp, ns_resp, mnts_resp) = await asyncio.gather(
+            get_cluster_view(client),
+            client.getNodesConfig(NodesFilter()),
+            client.getNodesState(NodesStateRequest()),
+            client.getMaintenances(MaintenancesFilter()),
+        )
         self._validate(cv, nc_resp.nodes, ns_resp.states, tuple(mnts_resp.maintenances))
 
     def _validate(
@@ -70,7 +97,7 @@ class TestClusterView(TestCase):
         ncs: List[NodeConfig],
         nss: List[NodeState],
         mnts: Tuple[MaintenanceDefinition, ...],
-    ):
+    ) -> None:
         nis = sorted(nc.node_index for nc in ncs)
         ni_to_nc = {nc.node_index: nc for nc in ncs}
         ni_to_ns = {ns.node_index: ns for ns in nss}
@@ -106,7 +133,11 @@ class TestClusterView(TestCase):
         self.assertEqual(sorted(cv.get_all_node_names()), sorted(nc.name for nc in ncs))
 
         self.assertEqual(
-            sorted(cv.get_all_maintenance_ids()), sorted(mnt.group_id for mnt in mnts)
+            sorted(cv.get_all_maintenance_ids()),
+            # pyre-fixme[6]: Expected `Iterable[Variable[_LT (bound to
+            #  _SupportsLessThan)]]` for 1st param but got
+            #  `Generator[typing.Optional[str], None, None]`.
+            sorted(mnt.group_id for mnt in mnts),
         )
 
         self.assertEqual(
@@ -184,6 +215,7 @@ class TestClusterView(TestCase):
         # non-existent node_name
         with self.assertRaises(NodeNotFoundError):
             nns = {nc.name for nc in ncs}
+            nn: str = ""
             while True:
                 nn = gen_word()
                 if nn not in nns:
@@ -191,10 +223,10 @@ class TestClusterView(TestCase):
             cv.get_node_view(node_name=nn)
 
         for mnt in mnts:
-            assert mnt.group_id is not None
-            self.assertEqual(cv.get_maintenance_by_id(mnt.group_id), mnt)
+            group_id: str = mnt.group_id or ""
+            self.assertEqual(cv.get_maintenance_by_id(group_id), mnt)
             self.assertTupleEqual(
-                cv.get_node_indexes_by_maintenance_id(mnt.group_id),
+                cv.get_node_indexes_by_maintenance_id(group_id),
                 tuple(
                     sorted(
                         set(
@@ -213,13 +245,14 @@ class TestClusterView(TestCase):
                     )
                 ),
             )
-            self.assertEqual(
-                mnt.group_id, cv.get_maintenance_view_by_id(mnt.group_id).group_id
-            )
+            self.assertEqual(group_id, cv.get_maintenance_view_by_id(group_id).group_id)
 
         self.assertListEqual(
-            list(sorted(m.group_id for m in mnts)),
-            list(sorted(mv.group_id for mv in cv.get_all_maintenance_views())),
+            # pyre-fixme[6]: Expected `Iterable[Variable[_LT (bound to
+            #  _SupportsLessThan)]]` for 1st param but got
+            #  `Generator[typing.Optional[str], None, None]`.
+            sorted(m.group_id for m in mnts),
+            sorted(mv.group_id for mv in cv.get_all_maintenance_views()),
         )
 
         # expand_shards
@@ -238,6 +271,9 @@ class TestClusterView(TestCase):
                 ),
             ),
         )
+        num_shards: int = getattr(
+            ni_to_nc[nis[0]], "storage", StorageConfig()
+        ).num_shards
         self.assertEqual(
             len(
                 cv.expand_shards(
@@ -246,7 +282,7 @@ class TestClusterView(TestCase):
                     ]
                 )
             ),
-            ni_to_nc[nis[0]].storage.num_shards,
+            num_shards,
         )
         self.assertEqual(
             len(
@@ -258,7 +294,8 @@ class TestClusterView(TestCase):
                     ]
                 )
             ),
-            ni_to_nc[nis[0]].storage.num_shards + ni_to_nc[nis[1]].storage.num_shards,
+            getattr(ni_to_nc[nis[0]], "storage", StorageConfig()).num_shards
+            + getattr(ni_to_nc[nis[1]], "storage", StorageConfig()).num_shards,
         )
         self.assertEqual(
             len(
@@ -270,7 +307,7 @@ class TestClusterView(TestCase):
                     node_ids=[NodeID(node_index=0)],
                 )
             ),
-            ni_to_nc[nis[0]].storage.num_shards + 1,
+            getattr(ni_to_nc[nis[0]], "storage", StorageConfig()).num_shards + 1,
         )
 
         # normalize_node_id
@@ -291,18 +328,42 @@ class TestClusterView(TestCase):
             ),
         )
 
+        # get_node_id
+        self.assertEqual(cv.get_node_id(node_index=0).node_index, 0)
+
         # search_maintenances
+        storages_node_views = [nv for nv in cv.get_all_node_views() if nv.is_storage]
+        sequencers_node_views = [
+            nv for nv in cv.get_all_node_views() if nv.is_sequencer
+        ]
         self.assertEqual(len(cv.search_maintenances()), len(mnts))
+        self.assertEqual(len(cv.search_maintenances(node_ids=[])), 0)
         self.assertEqual(
-            len(cv.search_maintenances(node_ids=[cv.get_node_id(node_index=3)])), 0
-        )
-        self.assertEqual(
-            len(cv.search_maintenances(node_ids=[cv.get_node_id(node_index=1)])), 1
+            len(
+                cv.search_maintenances(
+                    sequencer_nodes=[
+                        storages_node_views[3].node_id,
+                        sequencers_node_views[4].node_id,
+                    ]
+                )
+            ),
+            1,
         )
         self.assertEqual(
             len(
                 cv.search_maintenances(
-                    shards=[ShardID(node=cv.get_node_id(node_index=0), shard_index=1)]
+                    node_ids=[
+                        storages_node_views[3].node_id,
+                        sequencers_node_views[4].node_id,
+                    ]
+                )
+            ),
+            1,
+        )
+        self.assertEqual(
+            len(
+                cv.search_maintenances(
+                    shards=[ShardID(node=storages_node_views[1].node_id, shard_index=1)]
                 )
             ),
             1,
@@ -315,7 +376,7 @@ class TestClusterView(TestCase):
                     shard_target_state=ShardOperationalState.MAY_DISAPPEAR
                 )
             ),
-            2,
+            3,
         )
         self.assertEqual(
             len(
@@ -333,23 +394,23 @@ class TestClusterView(TestCase):
             len(
                 cv.search_maintenances(sequencer_target_state=SequencingState.DISABLED)
             ),
-            2,
+            3,
         )
 
         self.assertEqual(len(cv.search_maintenances(user="hello")), 1)
         self.assertEqual(len(cv.search_maintenances(reason="whatever")), 1)
 
         self.assertEqual(len(cv.search_maintenances(skip_safety_checks=True)), 0)
-        self.assertEqual(len(cv.search_maintenances(skip_safety_checks=False)), 2)
+        self.assertEqual(len(cv.search_maintenances(skip_safety_checks=False)), 4)
 
         self.assertEqual(len(cv.search_maintenances(force_restore_rebuilding=True)), 0)
-        self.assertEqual(len(cv.search_maintenances(force_restore_rebuilding=False)), 2)
+        self.assertEqual(len(cv.search_maintenances(force_restore_rebuilding=False)), 4)
 
         self.assertEqual(len(cv.search_maintenances(allow_passive_drains=True)), 0)
-        self.assertEqual(len(cv.search_maintenances(allow_passive_drains=False)), 2)
+        self.assertEqual(len(cv.search_maintenances(allow_passive_drains=False)), 4)
 
         self.assertEqual(len(cv.search_maintenances(group_id=mnts[0].group_id)), 1)
 
         self.assertEqual(
-            len(cv.search_maintenances(progress=MaintenanceProgress.IN_PROGRESS)), 2
+            len(cv.search_maintenances(progress=MaintenanceProgress.IN_PROGRESS)), 4
         )

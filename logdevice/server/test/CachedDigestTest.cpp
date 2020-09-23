@@ -28,6 +28,7 @@
 #include "logdevice/common/protocol/STARTED_Message.h"
 #include "logdevice/common/test/MockBackoffTimer.h"
 #include "logdevice/common/test/MockTimer.h"
+#include "logdevice/common/test/SenderTestProxy.h"
 #include "logdevice/server/EpochRecordCache.h"
 #include "logdevice/server/EpochRecordCacheEntry.h"
 #include "logdevice/server/RecordCacheDependencies.h"
@@ -283,14 +284,10 @@ void CachedDigestTest::setUp() {
                                          EpochRecordCache::StoredBefore::NEVER);
 
   auto gen_payload = [](lsn_t lsn) {
-    lsn_t* payload_flat = (lsn_t*)malloc(sizeof(lsn_t));
-    *payload_flat = lsn;
-    return std::make_shared<PayloadHolder>(payload_flat, sizeof(lsn_t));
+    return PayloadHolder::copyBuffer(static_cast<void*>(&lsn), sizeof(lsn));
   };
 
   auto put_record = [&](lsn_t lsn, const Snapshot::Record& r) {
-    auto ph = gen_payload(lsn);
-    Payload pl = ph->getPayload();
     cache_->putRecord(RecordID(lsn, LOG_ID),
                       r.timestamp,
                       r.last_known_good,
@@ -298,8 +295,7 @@ void CachedDigestTest::setUp() {
                       dummyCopyset,
                       r.flags,
                       std::map<KeyType, std::string>{},
-                      Slice(pl),
-                      std::move(ph));
+                      gen_payload(lsn));
   };
 
   // now write all records to cache
@@ -385,7 +381,7 @@ void CachedDigestTest::verifyResult() {
         CachedDigest::StoreFlagsToRecordFlags(r.flags), rm->header_.flags);
     ASSERT_EQ(SHARD, rm->header_.shard);
     ASSERT_EQ(sizeof(lsn_t), rm->payload_.size());
-    ASSERT_EQ(rm->header_.lsn, *((lsn_t*)rm->payload_.data()));
+    ASSERT_EQ(rm->header_.lsn, *((lsn_t*)rm->payload_.getPayload().data()));
     itr++, itm++;
     ++record_delivered;
   }

@@ -12,6 +12,7 @@
 #include <mutex>
 
 #include <folly/futures/Future.h>
+#include <folly/synchronization/Baton.h>
 #include <gtest/gtest.h>
 
 using namespace facebook::logdevice;
@@ -74,7 +75,7 @@ void runBasicTests(std::unique_ptr<ZookeeperClientInMemory> z) {
   z->getData(kBar, getDataCallback);
   z->getData(kBar, C::getDataCallback);
 
-  collectAll(std::move(fs)).wait();
+  collectAllUnsafe(std::move(fs)).wait();
 
   // create
   {

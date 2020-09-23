@@ -152,7 +152,7 @@ bool LocalLogStoreReadFilter::operator()(logid_t,
   }
 
   // The following filtering logic ensures that, assuming copysets are
-  // consistent accross all copies of the same record, at least one shard will
+  // consistent across all copies of the same record, at least one shard will
   // ship each copy, and if possible only one shard will ship it.
   //
   // This is guaranteed in three steps:
@@ -189,7 +189,7 @@ bool LocalLogStoreReadFilter::operator()(logid_t,
     auto is_local = [&](int i) {
       if (auto node = nc->getNodeServiceDiscovery(copyset[i].node())) {
         const folly::Optional<NodeLocation>& location = node->location;
-        if (location.hasValue()) {
+        if (location.has_value()) {
           if (client_location_->sharesScopeWith(
                   location.value(), NodeLocationScope::REGION)) {
             return true;

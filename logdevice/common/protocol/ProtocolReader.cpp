@@ -7,100 +7,14 @@
  */
 #include "logdevice/common/protocol/ProtocolReader.h"
 
-#include "event2/buffer.h"
 #include "logdevice/common/Checksum.h"
 #include "logdevice/common/debug.h"
-#include "logdevice/common/libevent/compat.h"
 #include "logdevice/common/protocol/MessageTypeNames.h"
 #include "logdevice/common/util.h"
 
 namespace facebook { namespace logdevice {
 
 namespace {
-class EvbufferSource : public ProtocolReader::Source {
- public:
-  int read(void* dest, size_t to_read, size_t nread) override {
-    // must be checked by caller
-    ld_check(nread + to_read <= len_);
-    int rv = LD_EV(evbuffer_remove)(src_, dest, to_read);
-    if (rv < 0 || rv != to_read) {
-      err = E::INTERNAL;
-      ld_check(false);
-    }
-    return rv;
-  }
-
-  int readEvbuffer(evbuffer* dest, size_t to_read, size_t nread) override {
-    // must be checked by caller
-    ld_check(nread + to_read <= len_);
-    int rv = LD_EV(evbuffer_remove_buffer)(src_, dest, to_read);
-    if (rv < 0 || rv != to_read) {
-      err = E::INTERNAL;
-      ld_check(false);
-    }
-    return rv;
-  }
-
-  int drain(size_t to_drain, size_t nread) override {
-    // must be checked by caller
-    ld_check(nread + to_drain <= len_);
-    int rv = LD_EV(evbuffer_drain)(src_, to_drain);
-    if (rv != 0) {
-      err = E::INTERNAL;
-      ld_check(false);
-    }
-    return rv;
-  }
-
-  size_t getLength() const override {
-    return len_;
-  }
-
-  // This assumes caller is sure about presence of checksum
-  // field in header
-  uint64_t computeChecksum(size_t msg_len) override {
-    uint64_t checksum = 0;
-    size_t len = LD_EV(evbuffer_get_length)(src_);
-
-    if (len < msg_len) {
-      RATELIMIT_WARNING(
-          std::chrono::seconds(1),
-          2,
-          "evbuffer doesn't have enough bytes, len:%zu, msg_len:%zu",
-          len,
-          msg_len);
-    }
-    ld_check(msg_len <= len);
-
-    len = std::min(len, msg_len);
-    std::string data(len, 0);
-    ev_ssize_t nbytes = LD_EV(evbuffer_copyout)(src_, &data[0], len);
-    ld_check(nbytes == len);
-
-    Slice slice(&data[0], len);
-    checksum_bytes(slice, 64, (char*)&checksum);
-    return checksum;
-  }
-
-  const char* identify() const override {
-    return "evbuffer source";
-  }
-
-  std::string hexDump(size_t /*unused*/) const override {
-    // currently not supported for evbuffer
-    return "N/A";
-  }
-
-  explicit EvbufferSource(evbuffer* src, size_t len) : src_(src), len_(len) {
-    // source must be valid
-    ld_check(src != nullptr);
-  }
-
- private:
-  struct evbuffer* const src_;
-  const size_t len_;
-};
-
 class LinearBufferSource : public ProtocolReader::Source {
  public:
   int read(void* dest, size_t to_read, size_t nread) override {
@@ -108,13 +22,6 @@ class LinearBufferSource : public ProtocolReader::Source {
     ld_check(nread + to_read <= getLength());
     memcpy(dest, (char*)src_.data + nread, to_read);
     return to_read;
-  }
-
-  int readEvbuffer(evbuffer* /*dest*/,
-                   size_t /*to_read*/,
-                   size_t /*nread*/) override {
-    err = E::NOTSUPPORTED;
-    return -1;
   }
 
   int drain(size_t to_drain, size_t nread) override {
@@ -149,6 +56,81 @@ class LinearBufferSource : public ProtocolReader::Source {
  private:
   const Slice src_;
 };
+
+class IOBufSource : public ProtocolReader::Source {
+ public:
+  int read(void* dest, size_t to_read, size_t /* nread */) override {
+    if (to_read == 0) {
+      return to_read;
+    }
+    // must be checked by caller
+    ld_check(to_read <= io_buf_->length());
+    ld_check(dest);
+    memcpy(dest, io_buf_->data(), to_read);
+    io_buf_->trimStart(to_read);
+    return to_read;
+  }
+
+  int readIOBuf(folly::IOBuf* dest, size_t to_read, size_t nread) override {
+    ld_check(to_read <= io_buf_->length());
+    if (to_read * 3 < io_buf_->capacity()) {
+      // The allocated size of io_buf_ is more than 3x greater than what we're
+      // reading. Let's avoid pinning the whole buffer and fall back to just
+      // making a copy.
+      return Source::readIOBuf(dest, to_read, nread);
+    } else {
+      *dest = io_buf_->cloneAsValue();
+      dest->trimEnd(io_buf_->length() - to_read);
+      ld_check_eq(dest->length(), to_read);
+      io_buf_->trimStart(to_read);
+      return dest->length();
+    }
+  }
+
+  int drain(size_t to_drain, size_t /* nread*/) override {
+    // must be checked by caller
+    ld_check(to_drain <= io_buf_->length());
+    io_buf_->trimStart(to_drain);
+    return 0;
+  }
+
+  size_t getLength() const override {
+    return io_buf_->length();
+  }
+
+  // This assumes caller is sure about presence of checksum
+  // field in header. Also should not be called after buffer has been trimmed in
+  // anyway by calling read API's
+  uint64_t computeChecksum(size_t /* msg_len */) override {
+    uint64_t checksum = 0;
+    size_t len = io_buf_->length();
+    if (len == 0) {
+      return checksum;
+    }
+
+    Slice slice(static_cast<void*>(io_buf_->writableData()), len);
+    checksum_bytes(slice, 64, (char*)&checksum);
+    return checksum;
+  }
+
+  const char* identify() const override {
+    return "iobuf source";
+  }
+
+  std::string hexDump(size_t /*unused*/) const override {
+    // currently not supported for evbuffer
+    return "N/A";
+  }
+
+  explicit IOBufSource(std::unique_ptr<folly::IOBuf> iobuf)
+      : io_buf_(std::move(iobuf)) {
+    // source must be valid
+    ld_check(io_buf_ != nullptr);
+  }
+
+ private:
+  std::unique_ptr<folly::IOBuf> io_buf_;
+};
 } // anonymous namespace
 
 ProtocolReader::ProtocolReader(Source* src,
@@ -161,18 +143,6 @@ ProtocolReader::ProtocolReader(Source* src,
   ld_check(src_ != nullptr);
 }
 
-ProtocolReader::ProtocolReader(MessageType type,
-                               struct evbuffer* src,
-                               size_t to_read,
-                               folly::Optional<uint16_t> proto)
-    : src_owned_(true),
-      src_(new (src_space_) EvbufferSource(src, to_read)),
-      context_(messageTypeNames()[type].c_str()),
-      proto_(proto),
-      src_left_(src_->getLength()) {
-  static_assert(sizeof(src_space_) >= sizeof(EvbufferSource));
-}
-
 ProtocolReader::ProtocolReader(Slice src,
                                std::string context,
                                folly::Optional<uint16_t> proto)
@@ -183,6 +153,17 @@ ProtocolReader::ProtocolReader(Slice src,
       proto_(proto),
       src_left_(src_->getLength()) {
   static_assert(sizeof(src_space_) >= sizeof(LinearBufferSource));
+}
+
+ProtocolReader::ProtocolReader(MessageType type,
+                               std::unique_ptr<folly::IOBuf> src,
+                               folly::Optional<uint16_t> proto)
+    : src_owned_(true),
+      src_(new (src_space_) IOBufSource(std::move(src))),
+      context_(messageTypeNames()[type].c_str()),
+      proto_(proto),
+      src_left_(src_->getLength()) {
+  static_assert(sizeof(src_space_) >= sizeof(IOBufSource));
 }
 
 ProtocolReader::~ProtocolReader() {
@@ -221,25 +202,12 @@ void ProtocolReader::readImpl(void* out, size_t to_read) {
   readImplCb(to_read, [&] { return src_->read(out, to_read, nread_); });
 }
 
-void ProtocolReader::readEvbuffer(evbuffer* out, size_t to_read) {
+void ProtocolReader::readIOBuf(folly::IOBuf* out, size_t to_read) {
+  ld_check(out);
+  ld_check(!out->isChained());
   if (ok() && isProtoVersionAllowed()) {
-    readImplCb(
-        to_read, [&] { return src_->readEvbuffer(out, to_read, nread_); });
+    readImplCb(to_read, [&] { return src_->readIOBuf(out, to_read, nread_); });
   }
-}
-
-std::unique_ptr<folly::IOBuf> ProtocolReader::readIntoIOBuf(size_t to_read) {
-  auto iobuf = folly::IOBuf::create(to_read);
-  if (ok() && isProtoVersionAllowed()) {
-    readImplCb(to_read, [&] {
-      auto nread = src_->read((void*)iobuf->writableData(), to_read, nread_);
-      if (nread == to_read) {
-        iobuf->append(to_read);
-      }
-      return nread;
-    });
-  }
-  return iobuf;
 }
 
 void ProtocolReader::checkReadableBytes(size_t bytes_to_read) {

@@ -7,8 +7,6 @@
  */
 #include "logdevice/common/AppenderPrep.h"
 
-#include <opentracing/tracer.h>
-
 #include "logdevice/common/Appender.h"
 #include "logdevice/common/AppenderBuffer.h"
 #include "logdevice/common/Checksum.h"
@@ -44,22 +42,8 @@ void AppenderPrep::sendReply(std::unique_ptr<Appender> appender,
   std::shared_ptr<Sequencer> sequencer = findSequencer(datalog_id);
   ld_check(sequencer || err == E::NOSEQUENCER);
 
-  if (permission_checking_span_) {
-    sequencer_locating_span_ = e2e_tracer_->StartSpan(
-        "Sequencer_locating",
-        {FollowsFrom(&permission_checking_span_->context())});
-  }
-
   auto appender_ptr = appender.get();
   auto cb = [=](Status status, logid_t log_id, NodeID node_id) {
-    if (sequencer_locating_span_) {
-      sequencer_locating_span_->SetTag("status", error_name(status));
-      sequencer_locating_span_->SetTag("log_id", log_id.val());
-      sequencer_locating_span_->SetTag("node_id", node_id.toString());
-
-      sequencer_locating_span_->Finish();
-      appender_ptr->setPrevTracingSpan(sequencer_locating_span_);
-    }
     onSequencerNodeFound(status,
                          log_id,
                          node_id,
@@ -158,6 +142,16 @@ void AppenderPrep::execute(std::unique_ptr<Appender> appender) {
     return;
   }
 
+  if (!isClientConnected()) {
+    RATELIMIT_INFO(std::chrono::seconds(1),
+                   10,
+                   "APPEND Request for log %lu failed because "
+                   "connection creating this append is no longer there",
+                   header_.logid.val_);
+    // Intentionally not sending a reply here since connection is lost
+    return;
+  }
+
   const PrincipalIdentity* principal = getPrincipal();
   if (principal == nullptr) {
     ld_critical("APPEND Request from %s for log %lu failed because "
@@ -165,29 +159,16 @@ void AppenderPrep::execute(std::unique_ptr<Appender> appender) {
                 Sender::describeConnection(from_).c_str(),
                 header_.logid.val_,
                 Sender::describeConnection(from_).c_str());
-    // This should never happen. We are invoking onReceived from the socket
-    // that has already performed the hello/ack handshake.
-    ld_check(false);
     sendError(appender.get(), E::ACCESS);
     return;
-  }
-
-  if (appender_span_) {
-    permission_checking_span_ = e2e_tracer_->StartSpan(
-        "Permission_checking", {ChildOf(&appender_span_->context())});
   }
 
   std::shared_ptr<AppenderPrep> appender_prep = shared_from_this();
   isAllowed(permission_checker,
             *principal,
             [appender = std::move(appender),
-             appender_prep = std::move(appender_prep),
-             permission_checking_span_ = permission_checking_span_](
+             appender_prep = std::move(appender_prep)](
                 PermissionCheckStatus permission_status) mutable {
-              if (permission_checking_span_) {
-                permission_checking_span_->Finish();
-              }
-
               appender_prep->sendReply(std::move(appender), permission_status);
             });
 
@@ -422,17 +403,17 @@ std::unique_ptr<Appender> AppenderPrep::constructAppender() {
           APPEND_Header::CHECKSUM_64BIT == STORE_Header::CHECKSUM_64BIT &&
           APPEND_Header::CHECKSUM_PARITY == STORE_Header::CHECKSUM_PARITY &&
           APPEND_Header::BUFFERED_WRITER_BLOB ==
-              STORE_Header::BUFFERED_WRITER_BLOB,
+              STORE_Header::BUFFERED_WRITER_BLOB &&
+          APPEND_Header::PAYLOAD_GROUP == STORE_Header::PAYLOAD_GROUP,
       "");
   STORE_flags_t passthru_flags = header_.flags &
       (APPEND_Header::CHECKSUM | APPEND_Header::CHECKSUM_64BIT |
-       APPEND_Header::CHECKSUM_PARITY | APPEND_Header::BUFFERED_WRITER_BLOB);
+       APPEND_Header::CHECKSUM_PARITY | APPEND_Header::BUFFERED_WRITER_BLOB |
+       APPEND_Header::PAYLOAD_GROUP);
 
-  // TODO: This does not account for Appender's
-  // std::shared_ptr<PayloadHolder>'s shared segment, or evbuffer overhead if
-  // the PayloadHolder wraps one.  There is no longer a reason to calculate
-  // this externally and pass into Appender; Appender could just calculate it
-  // itself.
+  // TODO: This does not account for Appender's PayloadHolder's shared segment.
+  //       There is no longer a reason to calculate this externally and pass
+  //       into Appender; Appender could just calculate it itself.
   size_t full_size = sizeof(Appender) + payload_.size();
 
   auto appender =
@@ -447,8 +428,7 @@ std::unique_ptr<Appender> AppenderPrep::constructAppender() {
                                  from_,
                                  header_.seen,
                                  full_size,
-                                 lsn_before_redirect_,
-                                 e2e_tracer_);
+                                 lsn_before_redirect_);
   appender->setAppendMessageCount(append_message_count_);
   appender->setAcceptableEpoch(acceptable_epoch_);
   if (header_.flags & APPEND_Header::WRITE_STREAM_REQUEST) {
@@ -517,11 +497,13 @@ bool AppenderPrep::nodeInConfig(NodeID node) const {
   const auto& seq_membership = nodes_configuration->getSequencerMembership();
 
   if (!seq_membership->isSequencingEnabled(node.index())) {
-    RATELIMIT_WARNING(std::chrono::seconds(1),
+    RATELIMIT_WARNING(std::chrono::seconds(5),
                       1,
                       "Node %s is not in sequencer membership or does not have "
-                      "a positive sequencer weight",
-                      node.toString().c_str());
+                      "a positive sequencer weight. Log: %lu, request from: %s",
+                      node.toString().c_str(),
+                      header_.logid.val_,
+                      Sender::describeConnection(from_).c_str());
     return false;
   }
 
@@ -973,7 +955,7 @@ RunAppenderStatus AppenderPrep::append(std::shared_ptr<Sequencer>& sequencer,
       ld_debug("Ignoring APPEND message: not accepting more work");
       break;
     case E::ABORTED:
-      ld_check(acceptable_epoch_.hasValue());
+      ld_check(acceptable_epoch_.has_value());
       RATELIMIT_INFO(std::chrono::seconds(1),
                      10,
                      "Aborted append from %s for log %lu due to unacceptable "
@@ -1039,6 +1021,10 @@ const PrincipalIdentity* AppenderPrep::getPrincipal() {
   return Worker::onThisThread()->sender().getPrincipal(Address(from_));
 }
 
+bool AppenderPrep::isClientConnected() const {
+  return !Worker::onThisThread()->sender().isClosed(Address(from_));
+}
+
 void AppenderPrep::isAllowed(
     std::shared_ptr<PermissionChecker> permission_checker,
     const PrincipalIdentity& principal,
@@ -1063,7 +1049,8 @@ std::shared_ptr<PermissionChecker> AppenderPrep::getPermissionChecker() {
     return nullptr;
   }
   return Worker::onThisThread()
-      ->processor_->security_info_->getPermissionChecker();
+      ->processor_->security_info_->get()
+      ->permission_checker;
 }
 
 }} // namespace facebook::logdevice

@@ -178,15 +178,6 @@ bool ClientReadStreamScd::shardsDownFailoverTimerCallback(
     small_shardset_t down) {
   ld_check(isActive());
 
-  if (isSlowShardsDetectionEnabled()) {
-    // If slow shards detection is enabled, the shards that are stuck and
-    // haven't sent a record for a long time will be marked as slow instead of
-    // down (see onOutliersChanged()).
-    // TODO(T21282553): remove this function once the outlier detector has
-    // proven stable.
-    return false;
-  }
-
   // Rewind the stream if the shards down list changed. If the shards down list
   // contains all the shards in the read set, do nothing as the
   // all_send_all_failover_timer_ timer will take care of failing over to all
@@ -359,7 +350,7 @@ void ClientReadStreamScd::applyScheduledChanges() {
       // list to have all shards in it. Failover to all send all mode instead.
       if (mode_ == Mode::ALL_SEND_ALL) {
         // We are already here, nothing to do.
-        scheduled_mode_transition_.clear();
+        scheduled_mode_transition_.reset();
         filtered_out_.clear();
         return;
       }
@@ -393,7 +384,7 @@ void ClientReadStreamScd::applyScheduledChanges() {
     shards_down_failover_timer_.activate();
     all_send_all_failover_timer_.activate();
   }
-  scheduled_mode_transition_.clear();
+  scheduled_mode_transition_.reset();
 }
 
 void ClientReadStreamScd::scheduleRewindToMode(Mode mode,
@@ -769,6 +760,20 @@ void ClientReadStreamScd::FailoverTimer::callback() {
   if (cb_(std::move(new_known_down))) {
     activate();
   }
+}
+
+std::string toString(ClientReadStreamScd::Mode mode) {
+  using Mode = ClientReadStreamScd::Mode;
+  switch (mode) {
+    case Mode::LOCAL_SCD:
+      return "LOCAL_SCD";
+    case Mode::SCD:
+      return "SCD";
+    case Mode::ALL_SEND_ALL:
+      return "ALL_SEND_ALL";
+  }
+  ld_check(false);
+  __builtin_unreachable();
 }
 
 }} // namespace facebook::logdevice

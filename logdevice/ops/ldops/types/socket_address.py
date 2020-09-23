@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from ipaddress import AddressValueError, IPv4Address, IPv6Address
 from typing import Any, List, Optional, Tuple, Union
 
-from logdevice.admin.common.types import (
+from logdevice.common.types import (
     SocketAddress as ThriftSocketAddress,
     SocketAddressFamily,
 )
@@ -41,7 +41,7 @@ class SocketAddress:
             if not self.path:
                 raise ValueError(f"Invalid path: {self.path}")
         else:
-            assert False, "unreachable"  # pragma: nocover
+            raise AssertionError("unreachable")  # pragma: nocover
 
     def to_thrift(self) -> ThriftSocketAddress:
         """
@@ -53,14 +53,12 @@ class SocketAddress:
             assert self.address is not None
             # TODO Admin Server uses string comparison for IP addresses
             # on 'compressed' (T45290450)
-            # pyre-fixme[16]: `Optional` has no attribute `compressed`.
             addr = self.address.compressed
         elif self.address_family == SocketAddressFamily.UNIX:
             assert self.path is not None
-            # pyre-fixme[9]: addr has type `str`; used as `Optional[str]`.
             addr = self.path
         else:
-            assert False, "unreachable"  # pragma: nocover
+            raise AssertionError("unreachable")  # pragma: nocover
 
         return ThriftSocketAddress(
             address_family=self.address_family,
@@ -89,7 +87,12 @@ class SocketAddress:
         Convenience helper which does resolving and returns instance
         """
         socket_address: SocketAddress
-        info: List[  # type: ignore
+        # pyre-fixme[33]: Given annotation cannot contain `Any`.
+        # pyre-fixme[9]: info has type `List[Tuple[socket.AddressFamily,
+        #  socket.SocketKind, int, str, typing.Tuple[typing.Any, ...]]]`; used as
+        #  `List[Tuple[socket.AddressFamily, socket.SocketKind, int, str,
+        #  Union[Tuple[str, int], Tuple[str, int, int, int]]]]`.
+        info: List[
             Tuple[socket.AddressFamily, socket.SocketKind, int, str, Tuple[Any, ...]]
         ] = socket.getaddrinfo(host, port)
         return cls.from_ip_port(random.choice(info)[4][0], port)
@@ -102,25 +105,23 @@ class SocketAddress:
         socket_address: SocketAddress
         if src.address_family == SocketAddressFamily.INET:
             assert src.address is not None
-            # pyre-fixme[6]: Expected `str` for 1st param but got `Optional[str]`.
             socket_address = cls.from_ip_port(src.address, src.port)
         elif src.address_family == SocketAddressFamily.UNIX:
             socket_address = SocketAddress(
                 address_family=src.address_family, path=src.address
             )
         else:
-            assert False, "unreachable"  # pragma: nocover
+            raise AssertionError("unreachable")  # pragma: nocover
 
         return socket_address
 
     def __str__(self) -> str:
         if self.address_family == SocketAddressFamily.INET:
             if isinstance(self.address, IPv4Address):
-                # pyre-fixme[16]: `Optional` has no attribute `compressed`.
                 return f"{self.address.compressed}:{self.port}"
             elif isinstance(self.address, IPv6Address):
                 return f"[{self.address.compressed}]:{self.port}"
             else:
-                assert False, "unreachable"  # pragma: nocover
+                raise AssertionError("unreachable")  # pragma: nocover
         else:
             return f"unix:{self.path}"

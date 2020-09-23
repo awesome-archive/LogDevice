@@ -34,6 +34,14 @@ void RocksDBListener::OnTableFileCreated(
     // Let's ignore such compactions.
     return;
   }
+  if (info.file_size == 0) {
+    // This currently happens in rare cases when an empty memtable gets flushed
+    // for some weird reason.
+    // TODO (#55376527):
+    //   Would be nice to make rocksdb either not flush empty memtables or set
+    //   file_path to "(nil)".
+    return;
+  }
   if (info.cf_name == "metadata") {
     if (info.reason == rocksdb::TableFileCreationReason::kFlush) {
       PER_SHARD_STAT_INCR(
@@ -73,7 +81,10 @@ void RocksDBListener::OnTableFileCreated(
             2,
             "Failed to parse retention distribution from table properties that "
             "were supposed to be produced by us just now. Something about "
-            "table properties is broken, please investigate. Properties: %s",
+            "table properties is broken, please investigate. Reason for file "
+            "creation: %d, CF: %s. Properties: %s",
+            (int)info.reason,
+            info.cf_name.c_str(),
             toString(info.table_properties.user_collected_properties).c_str());
       }
     }
@@ -293,8 +304,7 @@ RocksDBTablePropertiesCollector::GetReadableProperties() const {
 
     if (config_) {
       std::chrono::seconds backlog;
-      const std::shared_ptr<LogsConfig::LogGroupNode> log_config =
-          config_->getLogGroupByIDShared(p.first);
+      const auto log_config = config_->getLogGroupByIDShared(p.first);
       if (!log_config) {
         backlog = std::chrono::seconds(0);
       } else if (log_config->attrs().backlogDuration().value()) {
@@ -430,6 +440,12 @@ bool RocksDBTablePropertiesCollector::extractLogSizeHistogram(
   }
 
   out_histogram.clear();
+
+  if (list_section.empty()) {
+    // No log IDs in the file. Unusual but possible.
+    return true;
+  }
+
   std::vector<std::string> tokens;
   folly::split(',', list_section, tokens);
   for (const std::string& tok : tokens) {

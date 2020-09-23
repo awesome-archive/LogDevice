@@ -37,12 +37,20 @@ class LogStorageStateMap {
    *                           map, required by AtomicHashMap
    * @param recovery_interval  interval between consecutive attempts to recover
    *                           log state
-   * @param processor          may be null in tests
    */
   explicit LogStorageStateMap(shard_size_t num_shards,
+                              StatsHolder* stats,
+                              bool enable_record_cache,
                               std::chrono::microseconds recovery_interval =
-                                  std::chrono::microseconds(500000),
-                              ServerProcessor* processor = nullptr);
+                                  std::chrono::microseconds(500000))
+      : cache_disposal_(enable_record_cache
+                            ? std::make_unique<RecordCacheDisposal>(this)
+                            : nullptr),
+        num_shards_(num_shards),
+        processor_(nullptr),
+        shard_map_(makeMap(num_shards)),
+        state_recovery_interval_(recovery_interval),
+        stats_(stats) {}
 
   LogStorageStateMap(const LogStorageStateMap&) = delete;
   LogStorageStateMap& operator=(const LogStorageStateMap&) = delete;
@@ -96,9 +104,8 @@ class LogStorageStateMap {
   ReleaseStates getAllLastReleasedLSNs(shard_index_t shard) const;
 
   /**
-   * If last released LSN or trim point for log_id is not known, this function
-   * tries to recover it by reading it from the local log store and (for last
-   * released LSN) asking the sequencer to resend it.
+   * If last released LSN is not known, this function tries to recover
+   * it by asking the sequencer to resend it.
    *
    * This method should be called on a worker thread.
    *
@@ -153,6 +160,7 @@ class LogStorageStateMap {
 
   // May be nullptr in tests.
   ServerProcessor* getProcessor();
+  void setProcessor(ServerProcessor*);
   StatsHolder* getStats();
 
   /**
@@ -164,8 +172,9 @@ class LogStorageStateMap {
  private:
   shard_size_t num_shards_;
 
-  // Parent Processor instance. May be null in tests.
-  ServerProcessor* const processor_;
+  // Parent Processor instance. May be nullptr in tests and during
+  // initialization.
+  ServerProcessor* processor_;
 
   // use Hash64 to mitigate the effect of logid (data and metadata) collision
   using Map = folly::ConcurrentHashMap<logid_t::raw_type,
@@ -184,6 +193,7 @@ class LogStorageStateMap {
    * if needed.
    */
   std::unique_ptr<RecordCacheMonitorThread> record_cache_monitor_;
+  StatsHolder* stats_;
 };
 
 template <typename Func>

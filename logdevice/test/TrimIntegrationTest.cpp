@@ -178,15 +178,13 @@ TEST_F(TrimIntegrationTest, TrimPastTail) {
 
   // We expect this to be a 1 seqencer + 1 storage node setup
   EXPECT_TRUE(cluster->getConfig()
-                  ->get()
-                  ->serverConfig()
-                  ->getNode(0)
-                  ->isSequencingEnabled());
+                  ->getNodesConfiguration()
+                  ->getSequencerMembership()
+                  ->isSequencingEnabled(0));
   EXPECT_TRUE(cluster->getConfig()
-                  ->get()
-                  ->serverConfig()
-                  ->getNode(1)
-                  ->isReadableStorageNode());
+                  ->getNodesConfiguration()
+                  ->getStorageMembership()
+                  ->hasShardShouldReadFrom(1));
 
   // Waiting for metadata provisioning to complete to avoid spurious sequencer
   // reactivations that can cause the test to fail
@@ -228,12 +226,12 @@ TEST_F(TrimIntegrationTest, AutoLegacy) {
   const int NNODES = 2;
   const logid_t LOG_ID(1);
 
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(1);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_backlogDuration(std::chrono::seconds(2));
-  log_attrs.set_maxWritesInFlight(NRECORDS);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(1)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_backlogDuration(std::chrono::seconds(2))
+                       .with_maxWritesInFlight(NRECORDS);
 
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
@@ -253,7 +251,7 @@ TEST_F(TrimIntegrationTest, AutoLegacy) {
     std::string data("data" + std::to_string(i));
     lsn = client->appendSync(LOG_ID, Payload(data.data(), data.size()));
     ASSERT_NE(LSN_INVALID, lsn);
-    if (!first.hasValue()) {
+    if (!first.has_value()) {
       first = lsn;
     }
   }
@@ -307,12 +305,12 @@ TEST_F(TrimIntegrationTest, Auto) {
   const int NNODES = 2;
   const logid_t LOG_ID(1);
 
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(1);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_backlogDuration(std::chrono::seconds(2));
-  log_attrs.set_maxWritesInFlight(NRECORDS);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(1)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_backlogDuration(std::chrono::seconds(2))
+                       .with_maxWritesInFlight(NRECORDS);
 
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
@@ -333,7 +331,7 @@ TEST_F(TrimIntegrationTest, Auto) {
     std::string data("data" + std::to_string(i));
     lsn = client->appendSync(LOG_ID, Payload(data.data(), data.size()));
     ASSERT_NE(LSN_INVALID, lsn);
-    if (!first.hasValue()) {
+    if (!first.has_value()) {
       first = lsn;
     }
   }

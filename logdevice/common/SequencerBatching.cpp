@@ -8,7 +8,8 @@
 #include "logdevice/common/SequencerBatching.h"
 
 #include <chrono>
-#include <unordered_set>
+
+#include <folly/container/F14Set.h>
 
 #include "logdevice/common/AppendRequestBase.h"
 #include "logdevice/common/Appender.h"
@@ -16,15 +17,15 @@
 #include "logdevice/common/ClusterState.h"
 #include "logdevice/common/InternalAppendRequest.h"
 #include "logdevice/common/MetaDataLogWriter.h"
+#include "logdevice/common/PayloadGroupCodec.h"
 #include "logdevice/common/PayloadHolder.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/Sender.h"
-#include "logdevice/common/Socket.h"
 #include "logdevice/common/Worker.h"
-#include "logdevice/common/buffered_writer/BufferedWriteDecoderImpl.h"
+#include "logdevice/common/buffered_writer/BufferedWriteCodec.h"
+#include "logdevice/common/buffered_writer/BufferedWriterImpl.h"
 #include "logdevice/common/debug.h"
 #include "logdevice/common/settings/Settings.h"
-#include "logdevice/include/BufferedWriter.h"
 
 namespace facebook { namespace logdevice {
 
@@ -45,8 +46,7 @@ static BufferedWriter::LogOptions get_log_options(logid_t log_id) {
   auto config = Worker::getConfig();
   const auto& settings = Worker::settings();
 
-  const std::shared_ptr<LogsConfig::LogGroupNode> group =
-      config->getLogGroupByIDShared(log_id);
+  const auto group = config->getLogGroupByIDShared(log_id);
 
   if (!group) {
     opts.time_trigger = settings.sequencer_batching_time_trigger;
@@ -98,47 +98,61 @@ void SequencerBatching::shutDown() {
 
 namespace {
 
-static int prepare_batch(logid_t log_id,
-                         Appender& appender,
-                         BufferedWriter::AppendCallback::Context context,
-                         std::vector<BufferedWriter::Append>* out) {
-  ld_check(appender.getLSNBeforeRedirect() == LSN_INVALID);
-
-  Payload payload =
-      const_cast<PayloadHolder*>(appender.getPayload())->getPayload();
-  folly::StringPiece range{payload.toStringPiece()};
-
-  STORE_flags_t passthru_flags = appender.getPassthruFlags();
-  if (passthru_flags & STORE_Header::CHECKSUM) {
-    // NOTE: Assumes checksum was already checked
-    range.advance((passthru_flags & STORE_Header::CHECKSUM_64BIT) ? 8 : 4);
+std::string iobuf_to_string(const folly::IOBuf& iobuf) {
+  std::string str;
+  str.reserve(iobuf.computeChainDataLength());
+  for (auto chunk : iobuf) {
+    str.append(reinterpret_cast<const char*>(chunk.data()), chunk.size());
   }
-  if (!(passthru_flags & STORE_Header::BUFFERED_WRITER_BLOB)) {
-    // Not a buffered writer blob, just a plain append
-    out->emplace_back(
-        log_id, range.str(), context, appender.getAppendAttributes());
-    STAT_ADD(Worker::stats(), append_bytes_seq_batching_in, range.size());
-    return 0;
-  }
+  return str;
+}
 
-  BufferedWriteDecoderImpl decoder;
-  std::vector<Payload> outp;
-  int rv = decoder.decodeOne(Slice(range.data(), range.size()),
-                             outp,
-                             std::unique_ptr<DataRecord>(),
-                             /* copy_blob_if_uncompressed */ false);
-  if (rv == 0) {
-    out->reserve(outp.size());
-    // NOTE: This makes a copy of every payload as an std::string to conform
-    // to the BufferedWriter interface.  There is room for optimization here
-    // by keeping `decoder' around and making BufferedWriter accept raw
-    // pointers into the blob.
-    StatsHolder* stats = Worker::stats();
-    for (Payload p : outp) {
-      out->emplace_back(
-          log_id, p.toString(), context, appender.getAppendAttributes());
-      STAT_ADD(stats, append_bytes_seq_batching_in, p.size());
-    }
+void append_batch(logid_t log_id,
+                  BufferedWriter::AppendCallback::Context context,
+                  std::vector<folly::IOBuf>&& batch,
+                  const AppendAttributes& attributes,
+                  std::vector<BufferedWriter::Append>* out) {
+  out->reserve(batch.size());
+  // NOTE: This makes a copy of every payload as an std::string to conform
+  // to the BufferedWriter interface.  There is room for optimization here
+  // by keeping `decoder' around and making BufferedWriter accept raw
+  // pointers into the blob or by making BufferedWriter accept IOBufs.
+  StatsHolder* stats = Worker::stats();
+  for (folly::IOBuf& iobuf : batch) {
+    std::string str = iobuf_to_string(iobuf);
+    const size_t appended_bytes = BufferedWriterPayloadMeter::memorySize(str);
+    out->emplace_back(log_id, std::move(str), context, attributes);
+    STAT_ADD(stats, append_bytes_seq_batching_in, appended_bytes);
+    iobuf = {};
+  }
+}
+
+void append_batch(logid_t log_id,
+                  BufferedWriter::AppendCallback::Context context,
+                  std::vector<PayloadGroup>&& batch,
+                  const AppendAttributes& attributes,
+                  std::vector<BufferedWriter::Append>* out) {
+  out->reserve(batch.size());
+  StatsHolder* stats = Worker::stats();
+  for (PayloadGroup& p : batch) {
+    const size_t appended_bytes = BufferedWriterPayloadMeter::memorySize(p);
+    out->emplace_back(log_id, std::move(p), context, attributes);
+    STAT_ADD(stats, append_bytes_seq_batching_in, appended_bytes);
+  }
+}
+
+template <typename T>
+int append_batch(logid_t log_id,
+                 BufferedWriter::AppendCallback::Context context,
+                 const folly::StringPiece payload,
+                 const AppendAttributes& attributes,
+                 std::vector<BufferedWriter::Append>* out,
+                 bool allow_buffer_sharing) {
+  std::vector<T> batch;
+  size_t bytes_consumed = BufferedWriteCodec::decode(
+      Slice(payload.data(), payload.size()), batch, allow_buffer_sharing);
+  if (bytes_consumed != 0) {
+    append_batch(log_id, context, std::move(batch), attributes, out);
     return 0;
   } else {
     err = E::BADPAYLOAD;
@@ -146,19 +160,121 @@ static int prepare_batch(logid_t log_id,
   }
 }
 
+int append_decoded_plain(logid_t log_id,
+                         BufferedWriter::AppendCallback::Context context,
+                         STORE_flags_t flags,
+                         const folly::StringPiece payload,
+                         const AppendAttributes& attributes,
+                         std::vector<BufferedWriter::Append>* out) {
+  size_t appended_bytes;
+  if (flags & STORE_Header::PAYLOAD_GROUP) {
+    PayloadGroup payload_group;
+    const size_t bytes_consumed =
+        PayloadGroupCodec::decode(Slice(payload.data(), payload.size()),
+                                  payload_group,
+                                  /* allow_buffer_sharing */ false);
+    if (bytes_consumed == 0) {
+      err = E::BADPAYLOAD;
+      return -1;
+    }
+    appended_bytes = BufferedWriterPayloadMeter::memorySize(payload_group);
+    out->emplace_back(log_id, std::move(payload_group), context, attributes);
+  } else {
+    auto str = payload.str();
+    appended_bytes = BufferedWriterPayloadMeter::memorySize(str);
+    out->emplace_back(log_id, std::move(str), context, attributes);
+  }
+  STAT_ADD(Worker::stats(), append_bytes_seq_batching_in, appended_bytes);
+  return 0;
+}
+
+int append_decoded_batch(logid_t log_id,
+                         BufferedWriter::AppendCallback::Context context,
+                         const folly::StringPiece payload,
+                         const AppendAttributes& attributes,
+                         std::vector<BufferedWriter::Append>* out) {
+  BufferedWriteCodec::Format format;
+  if (!BufferedWriteCodec::decodeFormat(
+          Slice(payload.data(), payload.size()), &format)) {
+    err = E::BADPAYLOAD;
+    return -1;
+  }
+
+  // Decode and append records using different APIs depending on format
+  // to preserve client compatibility, i.e. if all writes are in SINGLE_PAYLOADS
+  // format, then result will also be in SINGLE_PAYLOADS format, compatible with
+  // older clients.
+  switch (format) {
+    case BufferedWriteCodec::Format::SINGLE_PAYLOADS: {
+      return append_batch<folly::IOBuf>(log_id,
+                                        context,
+                                        payload,
+                                        attributes,
+                                        out,
+                                        /* allow_buffer_sharing */ true);
+    }
+    case BufferedWriteCodec::Format::PAYLOAD_GROUPS: {
+      // NOTE: Buffer sharing is not allowed, since payload owned by Appender
+      // will be destroyed while request is being processed. This can be fixed
+      // by using managed IOBufs throughout. However this only matters for
+      // uncompressible payloads, since only they can share output buffers with
+      // input buffers.
+      return append_batch<PayloadGroup>(log_id,
+                                        context,
+                                        payload,
+                                        attributes,
+                                        out,
+                                        /* allow_buffer_sharing */ false);
+    }
+  }
+
+  ld_check(false);
+  err = E::BADPAYLOAD;
+  return -1;
+}
+
+int prepare_batch(logid_t log_id,
+                  Appender& appender,
+                  BufferedWriter::AppendCallback::Context context,
+                  std::vector<BufferedWriter::Append>* out) {
+  ld_check(appender.getLSNBeforeRedirect() == LSN_INVALID);
+
+  Payload payload =
+      const_cast<PayloadHolder*>(appender.getPayload())->getPayload();
+  folly::StringPiece range{payload.toStringPiece()};
+
+  const STORE_flags_t passthru_flags = appender.getPassthruFlags();
+  if (passthru_flags & STORE_Header::CHECKSUM) {
+    // NOTE: Assumes checksum was already checked
+    range.advance((passthru_flags & STORE_Header::CHECKSUM_64BIT) ? 8 : 4);
+  }
+
+  if (!(passthru_flags & STORE_Header::BUFFERED_WRITER_BLOB)) {
+    return append_decoded_plain(log_id,
+                                context,
+                                passthru_flags,
+                                range,
+                                appender.getAppendAttributes(),
+                                out);
+  } else {
+    return append_decoded_batch(
+        log_id, context, range, appender.getAppendAttributes(), out);
+  }
+}
+
 } // namespace
 
 bool SequencerBatching::buffer(logid_t log_id,
                                std::unique_ptr<Appender>& appender_in) {
-  const std::shared_ptr<LogsConfig::LogGroupNode> group =
-      Worker::getConfig()->getLogGroupByIDShared(log_id);
+  Worker* w = Worker::onThisThread();
+  const auto group = w->getConfiguration()->getLogGroupByIDShared(log_id);
+  const Settings& settings = *w->immutable_settings_;
 
   const bool enable_batching = group
-      ? group->attrs().sequencerBatching().getValue(
-            processor_->settings()->sequencer_batching)
-      : processor_->settings()->sequencer_batching;
+      ? group->attrs().sequencerBatching().getValue(settings.sequencer_batching)
+      : settings.sequencer_batching;
 
-  if (shutting_down_.load() || !enable_batching ||
+  if (!enable_batching || shutting_down_.load() ||
       MetaDataLog::isMetaDataLog(log_id)) {
     return false;
   }
@@ -181,7 +297,7 @@ bool SequencerBatching::buffer(logid_t log_id,
     return false;
   }
 
-  if (shouldPassthru(*appender_in)) {
+  if (shouldPassthru(*appender_in, group.get(), settings)) {
     StatsHolder* stats = Worker::stats();
     const size_t payload_size = appender_in->getPayload()->size();
     // Count these as both in and out so that out/in gives an accurate
@@ -200,7 +316,7 @@ bool SequencerBatching::buffer(logid_t log_id,
   std::unique_ptr<AppendMessageState> machine(new AppendMessageState());
   machine->owner_worker = Worker::onThisThread()->idx_.val_;
   machine->reply_to = appender->getReplyTo();
-  machine->socket_proxy = appender->getClientSocketProxy();
+  machine->socket_token = appender->getClientConnectionToken();
   machine->log_id = log_id;
   machine->append_request_id = appender->getClientRequestID();
   // Passing the pointer to the state machine as context to BufferedWriter
@@ -231,14 +347,13 @@ bool SequencerBatching::buffer(logid_t log_id,
   return true;
 }
 
-bool SequencerBatching::shouldPassthru(const Appender& appender) const {
-  const std::shared_ptr<LogsConfig::LogGroupNode> group =
-      Worker::getConfig()->getLogGroupByIDShared(appender.getLogID());
-
+bool SequencerBatching::shouldPassthru(const Appender& appender,
+                                       const LogsConfig::LogGroupNode* group,
+                                       const Settings& settings) const {
   const auto passthru_threshold = group
       ? group->attrs().sequencerBatchingPassthruThreshold().getValue(
-            processor_->settings()->sequencer_batching_passthru_threshold)
-      : processor_->settings()->sequencer_batching_passthru_threshold;
+            settings.sequencer_batching_passthru_threshold)
+      : settings.sequencer_batching_passthru_threshold;
 
   if (passthru_threshold < 0) {
     return false;
@@ -246,8 +361,8 @@ bool SequencerBatching::shouldPassthru(const Appender& appender) const {
 
   const auto compression = group
       ? group->attrs().sequencerBatchingCompression().getValue(
-            processor_->settings()->sequencer_batching_compression)
-      : processor_->settings()->sequencer_batching_compression;
+            settings.sequencer_batching_compression)
+      : settings.sequencer_batching_compression;
 
   bool compressing = compression != Compression::NONE;
 
@@ -268,7 +383,7 @@ std::pair<Status, NodeID> SequencerBatching::appendBuffered(
     logid_t logid,
     const BufferedWriter::AppendCallback::ContextSet& contexts,
     AppendAttributes attrs,
-    const Payload& payload,
+    PayloadHolder&& payload,
     AppendRequestCallback callback,
     worker_id_t target_worker,
     int checksum_bits) {
@@ -304,21 +419,21 @@ std::pair<Status, NodeID> SequencerBatching::appendBuffered(
   // is tracked by an `AppendMessageState' instance and the context we pass to
   // BufferedWriter is pointers to those state machines, counting the number
   // of distinct contexts will give the number of APPEND messages.
-  std::unordered_set<BufferedWriter::AppendCallback::Context> unique_contexts;
+  folly::F14ValueSet<BufferedWriter::AppendCallback::Context> unique_contexts;
   for (const auto& context : contexts) {
     unique_contexts.insert(context.first);
   }
 
   auto reply = runBufferedAppend(logid,
                                  std::move(attrs),
-                                 payload,
+                                 std::move(payload),
                                  std::move(ia_callback),
                                  flags,
                                  checksum_bits,
                                  client_timeout_ms,
                                  unique_contexts.size());
 
-  if (reply.hasValue()) {
+  if (reply.has_value()) {
     // Uh oh, runInternalAppend() failed synchronously and invoked the
     // callback with an error code.  Propagate it to BufferedWriter.
     std::pair<Status, NodeID> res;
@@ -332,16 +447,13 @@ std::pair<Status, NodeID> SequencerBatching::appendBuffered(
 
 class SequencerBatching::DispatchResultsRequest : public Request {
  public:
-  DispatchResultsRequest(
-      int target_worker,
-      std::unordered_map<AppendMessageState*, uint32_t> appends,
-      Status status,
-      NodeID redirect,
-      lsn_t lsn,
-      RecordTimestamp timestamp)
+  DispatchResultsRequest(int target_worker,
+                         Status status,
+                         NodeID redirect,
+                         lsn_t lsn,
+                         RecordTimestamp timestamp)
       : Request(RequestType::SEQUENCER_BATCHING_DISPATCH_RESULTS),
         target_worker_(target_worker),
-        appends_(std::move(appends)),
         lsn_(lsn),
         timestamp_(timestamp),
         redirect_(redirect),
@@ -356,9 +468,10 @@ class SequencerBatching::DispatchResultsRequest : public Request {
   }
 
   Execution execute() override {
-    for (; !appends_.empty(); appends_.erase(appends_.begin())) {
-      std::unique_ptr<AppendMessageState> ams(appends_.begin()->first);
-      uint32_t offset = appends_.begin()->second;
+    ld_check(!appends_.empty());
+    for (auto& p : appends_) {
+      std::unique_ptr<AppendMessageState> ams(p.first);
+      uint32_t offset = p.second;
       ld_assert(ams->owner_worker.load() == target_worker_);
       Worker::onThisThread()->processor_->sequencerBatching().sendReply(
           *ams, status_, redirect_, lsn_, timestamp_, offset);
@@ -367,9 +480,11 @@ class SequencerBatching::DispatchResultsRequest : public Request {
     return Execution::COMPLETE;
   }
 
+  // Can be populated after request construction.
+  folly::F14ValueMap<AppendMessageState*, uint32_t> appends_;
+
  private:
   int target_worker_;
-  std::unordered_map<AppendMessageState*, uint32_t> appends_;
   lsn_t lsn_;
   RecordTimestamp timestamp_;
   NodeID redirect_;
@@ -391,37 +506,43 @@ void SequencerBatching::onResult(logid_t log_id,
   // Unpack the ContextSet (which are really AppendMessageState pointers) and
   // group by owner worker.
   //
-  // NOTE: Using a map not a vector because all constituent writes in an
-  // AppendMessageState will have the same context passed to BufferedWriter,
-  // but we only want to notify it once.  The value in the map is the offset
-  // in the batch, which will be included in APPENDED_Message.
-  std::vector<std::unordered_map<AppendMessageState*, uint32_t>> ptrs(
-      worker_state_machines_.size());
+  // NOTE: The inner map deduplicates AppendMessageState-s originating from
+  // the same APPEND message, since we only want to each message once.
+  // The value in the map is the offset in the batch, which will be included
+  // in APPENDED_Message.
+  folly::F14ValueMap<int, std::unique_ptr<DispatchResultsRequest>>
+      request_by_worker(
+          std::min(contexts.size(), worker_state_machines_.size()));
 
   using Context = BufferedWriter::AppendCallback::Context;
+  using PayloadVariant = BufferedWriter::PayloadVariant;
   for (int i = 0; i < contexts.size(); ++i) {
-    const std::pair<Context, std::string>& ctx = contexts[i];
+    const std::pair<Context, PayloadVariant>& ctx = contexts[i];
     AppendMessageState* ptr = static_cast<AppendMessageState*>(ctx.first);
     // Since AppendMessageState instances get destroyed in the BufferedWriter
     // callback and our destructor tears down BufferedWriter first, `ptr' is
     // guaranteed to still exist.
-    //
-    // emplace() does not overwrite if the key already exists so the value
-    // will be the smallest offset for a key.
-    ptrs[ptr->owner_worker.load()].emplace(ptr, i);
+    int w = ptr->owner_worker.load();
+    auto ins = request_by_worker.emplace(w, nullptr);
+    auto& rq = ins.first->second;
+    if (ins.second) {
+      // Haven't seen this worker before. Create the Request.
+      rq = std::make_unique<DispatchResultsRequest>(
+          w, status, redirect, lsn, timestamp);
+    }
+    // emplace() does not overwrite if the key already exists so
+    // the value will be the smallest offset for a key.
+    rq->appends_.emplace(ptr, i);
   }
 
-  // Create Requests for all target workers to send replies to individual
-  // writes
-  for (int w = 0; w < int(ptrs.size()); ++w) {
-    if (!ptrs[w].empty()) {
-      std::unique_ptr<Request> req = std::make_unique<DispatchResultsRequest>(
-          w, std::move(ptrs[w]), status, redirect, lsn, timestamp);
-      // Need to use postWithRetrying() otherwise AppendMessageState instances
-      // would leak
-      int rv = processor_->postWithRetrying(req);
-      ld_check(rv == 0);
-    }
+  // Post Requests for all target workers to send replies to individual
+  // writes.
+  for (auto& p : request_by_worker) {
+    // Need to use postImportant(), otherwise AppendMessageState instances
+    // would leak.
+    std::unique_ptr<Request> rq(p.second.release());
+    int rv = processor_->postImportant(rq);
+    ld_check(rv == 0);
   }
 }
 
@@ -432,9 +553,10 @@ void SequencerBatching::sendReply(const AppendMessageState& ams,
                                   RecordTimestamp timestamp,
                                   uint32_t offset) {
   if (ams.reply_to.valid() &&
-      (!ams.socket_proxy || ams.socket_proxy->isClosed())) {
+      (!ams.socket_token || !ams.socket_token->load())) {
     // Release the proxy so that socket can be reclaimed and released.
-    ld_debug("Not sending reply to client %s, socket has disconnected.",
+    ld_debug("Not sending reply to clientSequencer.cpp:1693 %s, socket has "
+             "disconnected.",
              ams.reply_to.toString().c_str());
     return;
   }
@@ -467,7 +589,7 @@ void SequencerBatching::sendReply(const AppendMessageState& ams,
 }
 
 Status SequencerBatching::canSendToWorker() {
-  size_t limit = processor_->settings()->max_total_buffered_append_size;
+  size_t limit = Worker::settings().max_total_buffered_append_size;
   size_t cur_value = totalBufferedAppendSize_.load();
   if (cur_value >= limit) {
     RATELIMIT_WARNING(1s,
@@ -502,7 +624,7 @@ Status SequencerBatching::appendProbe() {
 folly::Optional<APPENDED_Header>
 SequencerBatching::runBufferedAppend(logid_t logid,
                                      AppendAttributes attrs,
-                                     const Payload& payload,
+                                     PayloadHolder&& payload,
                                      InternalAppendRequest::Callback callback,
                                      APPEND_flags_t flags,
                                      int checksum_bits,
@@ -510,7 +632,7 @@ SequencerBatching::runBufferedAppend(logid_t logid,
                                      uint32_t append_message_count) {
   return runInternalAppend(logid,
                            std::move(attrs),
-                           payload,
+                           std::move(payload),
                            std::move(callback),
                            flags,
                            checksum_bits,

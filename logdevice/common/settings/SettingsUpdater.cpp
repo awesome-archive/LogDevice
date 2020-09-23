@@ -9,6 +9,8 @@
 
 #include <boost/program_options.hpp>
 #include <folly/Memory.h>
+#include <folly/dynamic.h>
+#include <folly/json.h>
 
 #include "logdevice/common/commandline_util_chrono.h"
 #include "logdevice/common/debug.h"
@@ -18,7 +20,7 @@ namespace facebook { namespace logdevice {
 
 bool fails_check(const SettingsUpdater::setting_checker_t& checker,
                  const SettingsUpdater::SettingState& setting) {
-  return checker && checker(setting, "").hasValue();
+  return checker && checker(setting, "").has_value();
 }
 
 #define ENSURES_FALSE(condition, description)                                \
@@ -57,7 +59,7 @@ std::string SettingsUpdater::help(SettingFlag::flag_t flag,
   std::map<std::string, std::unique_ptr<options_description>> bundles;
   for (auto& opt : settings_) {
     std::string name = opt.second.bundle_name;
-    if (bundle.hasValue() && name != bundle.value()) {
+    if (bundle.has_value() && name != bundle.value()) {
       continue;
     }
     if (opt.second.descriptor.flags & SettingFlag::INTERNAL_ONLY) {
@@ -139,6 +141,39 @@ std::string SettingsUpdater::markdownDoc(bool include_deprecated) const {
   return doc.str();
 }
 
+std::string SettingsUpdater::jsonConfigSchema() const {
+  folly::dynamic output = folly::dynamic::array;
+
+  for (const auto& opt : settings_) {
+    const auto& desc = opt.second;
+    folly::dynamic setting = folly::dynamic::object;
+    setting["name"] = opt.first;
+    setting["bundle_name"] = desc.bundle_name;
+    setting["category"] = desc.descriptor.category;
+    setting["default"] = desc.descriptor.default_value_docs_override.value_or(
+        desc.descriptor.default_value.at(0));
+    setting["is_internal"] =
+        static_cast<bool>(desc.descriptor.flags & SettingFlag::INTERNAL_ONLY);
+    setting["is_cli_only"] =
+        static_cast<bool>(desc.descriptor.flags & SettingFlag::CLI_ONLY);
+    setting["is_deprecated"] =
+        static_cast<bool>(desc.descriptor.flags & SettingFlag::DEPRECATED);
+    setting["is_experimental"] =
+        static_cast<bool>(desc.descriptor.flags & SettingFlag::EXPERIMENTAL);
+    setting["is_client"] =
+        static_cast<bool>(desc.descriptor.flags & SettingFlag::CLIENT);
+    setting["is_server"] =
+        static_cast<bool>(desc.descriptor.flags & SettingFlag::SERVER);
+    setting["requires_restart"] = static_cast<bool>(
+        desc.descriptor.flags & SettingFlag::REQUIRES_RESTART);
+    output.push_back(std::move(setting));
+  }
+
+  auto serialized =
+      folly::json::serialize(output, folly::json::serialization_opts());
+  return serialized;
+}
+
 /**
  * Get the value for a setting considering the precedence rules for all
  * sources.
@@ -186,8 +221,8 @@ formatEffectiveValue(const SettingsUpdater::SettingState& state) {
   folly::Optional<SettingsUpdater::Source> source;
   auto v = computeValue(state, &source);
   return formatValue(v) + " (from " +
-      (source.hasValue() ? SettingsUpdater::sourceNames()[source.value()]
-                         : std::string("defaults")) +
+      (source.has_value() ? SettingsUpdater::sourceNames()[source.value()]
+                          : std::string("defaults")) +
       ")";
 }
 
@@ -236,7 +271,7 @@ void SettingsUpdater::parse(int argc,
       try {
         if (checker && settings_.count(opt.first)) {
           auto e = checker(settings_.at(opt.first), opt.first);
-          if (e.hasValue()) {
+          if (e.has_value()) {
             throw boost::program_options::error(e.value());
           }
         }
@@ -251,7 +286,7 @@ void SettingsUpdater::parse(int argc,
       if (settings_.count(opt.first)) {
         if (checker) {
           auto e = checker(settings_.at(opt.first), opt.first);
-          if (e.hasValue()) {
+          if (e.has_value()) {
             throw boost::program_options::error(e.value());
           }
         }
@@ -633,7 +668,7 @@ void SettingsUpdater::setFromAdminCmd(std::string name, std::string value) {
   std::vector<std::pair<std::string, std::string>> v = {{name, value}};
 
   try {
-    parse(v.begin(), v.end(), Source::ADMIN_CMD, true, checker);
+    parse(v.begin(), v.end(), Source::ADMIN_OVERRIDE, true, checker);
   } catch (const boost::program_options::error& ex) {
     ld_error("%s", ex.what());
     throw;
@@ -663,13 +698,18 @@ void SettingsUpdater::unsetFromAdminCmd(std::string name) {
     throw boost::program_options::error("Unknown option \"" + name + "\"");
   } else {
     auto e = checker(settings_[name], name);
-    if (e.hasValue()) {
+    if (e.has_value()) {
       throw boost::program_options::error(folly::to<std::string>(
           "Option '", name, "' cannot be used: ", e.value()));
     }
 
     std::vector<std::string> to_unset = {name};
-    parse(0, nullptr, Source::ADMIN_CMD, /* store */ true, checker, &to_unset);
+    parse(0,
+          nullptr,
+          Source::ADMIN_OVERRIDE,
+          /* store */ true,
+          checker,
+          &to_unset);
     update(checker);
   }
 }
@@ -704,7 +744,7 @@ void SettingsUpdater::SourceNameMap::setValues() {
   SET_SOURCE_NAME(CLI);
   SET_SOURCE_NAME(CLIENT);
   SET_SOURCE_NAME(CONFIG);
-  SET_SOURCE_NAME(ADMIN_CMD);
+  SET_SOURCE_NAME(ADMIN_OVERRIDE);
   SET_SOURCE_NAME(CURRENT);
 #undef SET_SOURCE_NAME
 }

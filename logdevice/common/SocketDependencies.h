@@ -4,19 +4,15 @@
 
 #include <folly/io/async/SSLContext.h>
 
-#include "event2/buffer.h"
-#include "event2/bufferevent.h"
-#include "event2/bufferevent_ssl.h"
-#include "event2/event.h"
-#include "event2/event_struct.h"
-#include "logdevice/common/Address.h"
-#include "logdevice/common/NodeID.h"
+#include "logdevice/common/ConnectionInfo.h"
 #include "logdevice/common/PrincipalIdentity.h"
 #include "logdevice/common/ResourceBudget.h"
 #include "logdevice/common/RunContext.h"
 #include "logdevice/common/SocketTypes.h"
 #include "logdevice/common/libevent/LibEventCompatibility.h"
+#include "logdevice/common/network/LinuxNetUtils.h"
 #include "logdevice/common/protocol/Message.h"
+
 namespace facebook { namespace logdevice {
 namespace configuration { namespace nodes {
 class NodesConfiguration;
@@ -25,69 +21,46 @@ class NodesConfiguration;
 class Processor;
 class Sender;
 class Configuration;
+class SSLPrincipalParser;
 class ServerConfig;
 class StatsHolder;
 struct Settings;
 class Sockaddr;
+class SSLSessionCache;
 class Worker;
 
 /**
- * Interface to access dependencies of Socket.
  * Unit tests implement a derived class, @see common/test/SocketTest.cpp.
  */
 class SocketDependencies {
  public:
-  SocketDependencies(Processor* processor, Sender* sender);
+  using SSLCtxPtr = std::shared_ptr<folly::SSLContext>;
 
+  SocketDependencies(Processor* processor, Sender* sender);
   virtual const Settings& getSettings() const;
   virtual StatsHolder* getStats() const;
   virtual std::shared_ptr<Configuration> getConfig() const;
   virtual std::shared_ptr<ServerConfig> getServerConfig() const;
   virtual std::shared_ptr<const configuration::nodes::NodesConfiguration>
   getNodesConfiguration() const;
-  virtual void noteBytesQueued(size_t nbytes, folly::Optional<MessageType>);
-  virtual void noteBytesDrained(size_t nbytes, folly::Optional<MessageType>);
+  virtual void noteBytesQueued(size_t nbytes,
+                               PeerType peer_type,
+                               folly::Optional<MessageType>);
+  virtual void noteBytesDrained(size_t nbytes,
+                                PeerType peer_type,
+                                folly::Optional<MessageType>);
   virtual size_t getBytesPending() const;
 
-  virtual std::shared_ptr<folly::SSLContext>
-  getSSLContext(bool accepting) const;
+  virtual SSLCtxPtr getSSLContext() const;
+  virtual SSLSessionCache& getSSLSessionCache() const;
+  virtual std::shared_ptr<SSLPrincipalParser> getPrincipalParser() const;
   virtual bool shuttingDown() const;
   virtual std::string dumpQueuedMessages(Address addr) const;
-  virtual const Sockaddr& getNodeSockaddr(NodeID nid,
-                                          SocketType type,
-                                          ConnectionType conntype);
+  virtual const Sockaddr& getNodeSockaddr(NodeID node_id,
+                                          SocketType socket_type,
+                                          ConnectionType connection_type);
   virtual EvBase* getEvBase();
-  virtual const struct timeval* getCommonTimeout(std::chrono::milliseconds t);
-  virtual const timeval*
-  getTimevalFromMilliseconds(std::chrono::milliseconds t);
-  virtual const struct timeval* getZeroTimeout();
-  virtual struct bufferevent* buffereventSocketNew(int sfd,
-                                                   int opts,
-                                                   bool secure,
-                                                   bufferevent_ssl_state,
-                                                   folly::SSLContext*);
 
-  virtual struct evbuffer* getOutput(struct bufferevent* bev);
-  virtual struct evbuffer* getInput(struct bufferevent* bev);
-  virtual int buffereventSocketConnect(struct bufferevent* bev,
-                                       struct sockaddr* ss,
-                                       int len);
-  virtual void buffereventSetWatermark(struct bufferevent* bev,
-                                       short events,
-                                       size_t lowmark,
-                                       size_t highmark);
-  virtual void buffereventSetCb(struct bufferevent* bev,
-                                bufferevent_data_cb readcb,
-                                bufferevent_data_cb writecb,
-                                bufferevent_event_cb eventcb,
-                                void* cbarg);
-  virtual void buffereventShutDownSSL(struct bufferevent* bev);
-  virtual void buffereventFree(struct bufferevent* bev);
-  virtual int evUtilMakeSocketNonBlocking(int sfd);
-  virtual int buffereventSetMaxSingleWrite(struct bufferevent* bev,
-                                           size_t size);
-  virtual int buffereventSetMaxSingleRead(struct bufferevent* bev, size_t size);
-  virtual int buffereventEnable(struct bufferevent* bev, short event);
   virtual void onSent(std::unique_ptr<Message> msg,
                       const Address& to,
                       Status st,
@@ -100,12 +73,6 @@ class SocketDependencies {
              ResourceBudget::Token resource_token);
   virtual void processDeferredMessageCompletions();
   virtual NodeID getMyNodeID();
-  virtual void configureSocket(bool is_tcp,
-                               int fd,
-                               int* snd_out,
-                               int* rcv_out,
-                               sa_family_t sa_family,
-                               const uint8_t default_dscp);
   virtual int setDSCP(int fd,
                       sa_family_t sa_family,
                       const uint8_t default_dscp);
@@ -116,6 +83,7 @@ class SocketDependencies {
   virtual const std::string& getHELLOCredentials();
   virtual const std::string& getCSID();
   virtual std::string getClientBuildInfo();
+  virtual SteadyTimestamp getCurrentTimestamp();
   virtual bool authenticationEnabled();
   virtual bool allowUnauthenticated();
   virtual bool includeHELLOCredentials();
@@ -125,10 +93,8 @@ class SocketDependencies {
   virtual std::unique_ptr<Message> createHelloMessage(NodeID destNodeID);
   virtual std::unique_ptr<Message>
   createShutdownMessage(uint32_t serverInstanceID);
-  virtual uint16_t processHelloMessage(const Message* msg);
-  virtual void processACKMessage(const Message* msg,
-                                 ClientID* our_name_at_peer,
-                                 uint16_t* destProto);
+  virtual void processHelloMessage(const Message& msg, ConnectionInfo& info);
+  virtual void processACKMessage(const Message& msg, ConnectionInfo& info);
   virtual std::unique_ptr<Message> deserialize(const ProtocolHeader& ph,
                                                ProtocolReader& reader);
   virtual std::string describeConnection(const Address& addr);
@@ -141,6 +107,8 @@ class SocketDependencies {
    * for usage.
    */
   virtual folly::Func setupContextGuard();
+  virtual folly::Executor* getExecutor() const;
+  virtual int getTCPInfo(TCPInfo* info, int fd);
   virtual ~SocketDependencies() {}
 
  private:

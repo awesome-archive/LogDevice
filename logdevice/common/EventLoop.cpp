@@ -10,7 +10,6 @@
 #include <errno.h>
 #include <unistd.h>
 
-#include <event2/event.h>
 #include <folly/Memory.h>
 #include <folly/container/Array.h>
 #include <folly/io/async/Request.h>
@@ -18,12 +17,10 @@
 #include <sys/types.h>
 
 #include "logdevice/common/ConstructorFailed.h"
-#include "logdevice/common/EventHandler.h"
 #include "logdevice/common/EventLoopTaskQueue.h"
 #include "logdevice/common/Request.h"
 #include "logdevice/common/ThreadID.h"
 #include "logdevice/common/debug.h"
-#include "logdevice/common/libevent/compat.h"
 #include "logdevice/include/Err.h"
 
 namespace facebook { namespace logdevice {
@@ -62,30 +59,37 @@ EventLoop::EventLoop(
     bool enable_priority_queues,
     const std::array<uint32_t, EventLoopTaskQueue::kNumberOfPriorities>&
         requests_per_iteration,
-    EvBase::EvBaseType base_type)
+    EvBase::EvBaseType base_type,
+    bool start_running)
     : thread_type_(thread_type),
       thread_name_(thread_name),
       priority_queues_enabled_(enable_priority_queues) {
   Semaphore initialized;
   Status init_result{Status::INTERNAL};
-  thread_ = std::thread([request_pump_capacity,
-                         &requests_per_iteration,
-                         &init_result,
-                         &initialized,
-                         &base_type,
-                         this]() {
+  thread_ = PThread([request_pump_capacity,
+                     &requests_per_iteration,
+                     &init_result,
+                     &initialized,
+                     &base_type,
+                     this]() {
     auto res = init_result =
         init(base_type, request_pump_capacity, requests_per_iteration);
     initialized.post();
-    if (res == Status::OK) {
-      run();
+    if (res != Status::OK) {
+      return;
     }
+
+    start_running_.wait();
+    run();
   });
   initialized.wait();
   if (init_result != Status::OK) {
     err = init_result;
     thread_.join();
     throw ConstructorFailed();
+  }
+  if (start_running) {
+    startRunning();
   }
 }
 
@@ -99,8 +103,17 @@ EventLoop::~EventLoop() {
   // the eventloop instance.
   // Tell EventLoop on the other end to destroy itself and terminate the
   // thread
+  if (!started_running_) {
+    start_running_.post();
+  }
   task_queue_->shutdown();
   thread_.join();
+}
+
+void EventLoop::startRunning() {
+  ld_check(!started_running_);
+  start_running_.post();
+  started_running_ = true;
 }
 
 void EventLoop::add(folly::Function<void()> func) {

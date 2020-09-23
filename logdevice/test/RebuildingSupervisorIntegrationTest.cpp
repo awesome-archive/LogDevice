@@ -160,14 +160,13 @@ TEST_F(RebuildingSupervisorIntegrationTest,
 
   cluster->start({0, 1, 2, 3});
 
-  ld_info("Waiting for rebuilding of N4 to be scheduled");
-  wait_until("rebuilding scheduled", [&]() {
-    // Check N0
-    auto tmp_stats = cluster->getNode(0).stats();
-    auto n1 = tmp_stats["shard_rebuilding_scheduled"];
-    auto n2 = tmp_stats["shard_rebuilding_not_triggered_nodealive"];
-    return n1 == 8 && n2 == 6;
-  });
+  // We'd like to wait for rebuilding supervisor to schedule rebuilding of N4.
+  // There's currently no easy way to wait for that (it would make sense to
+  // add an admin command to dump rebuilding supervisor state), so we'll just
+  // wait for gossip to converge, then sleep for a bit.
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
+  /* sleep override */
+  std::this_thread::sleep_for(std::chrono::seconds(10));
 
   // rebuilding will be initiated in 20min
   // update config to set self-initiate-rebuilding-grace-period to 1s
@@ -178,11 +177,9 @@ TEST_F(RebuildingSupervisorIntegrationTest,
   new_settings["self-initiated-rebuilding-grace-period"] = "1s";
   std::shared_ptr<ServerConfig> new_config = ServerConfig::fromDataTest(
       config->getClusterName(),
-      configuration::NodesConfig(config->getNodes()),
       config->getMetaDataLogsConfig(),
       ServerConfig::PrincipalsConfig(),
       ServerConfig::SecurityConfig(),
-      ServerConfig::TraceLoggerConfig(),
       ServerConfig::TrafficShapingConfig(),
       ServerConfig::ShapingConfig(
           std::set<NodeLocationScope>{NodeLocationScope::NODE},
@@ -213,14 +210,9 @@ TEST_F(RebuildingSupervisorIntegrationTest,
 
   cluster->start({0, 1, 2, 3});
 
-  ld_info("Waiting for rebuilding of N4 to be scheduled");
-  wait_until("rebuilding scheduled", [&]() {
-    // Check N0
-    auto tmp_stats = cluster->getNode(0).stats();
-    auto n1 = tmp_stats["shard_rebuilding_scheduled"];
-    auto n2 = tmp_stats["shard_rebuilding_not_triggered_nodealive"];
-    return n1 == 8 && n2 == 6;
-  });
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
+  /* sleep override */
+  std::this_thread::sleep_for(std::chrono::seconds(10));
 
   // rebuilding will be initiated in 20min
   // send admin command to set self-initiate-rebuilding-grace-period to 1s
@@ -316,11 +308,18 @@ TEST_F(RebuildingSupervisorIntegrationTest, DontRebuildNonStorageNode) {
     node.generation = 1;
     node.addSequencerRole();
     node.addStorageRole(num_shards);
-    if (i == dead_node) {
-      node.storage_attributes->state = configuration::StorageState::DISABLED;
-    }
     nodes[i] = std::move(node);
   }
+
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes));
+
+  nodes_configuration = nodes_configuration->applyUpdate(
+      NodesConfigurationTestUtil::setStorageMembershipUpdate(
+          *nodes_configuration,
+          {ShardID(dead_node, -1)},
+          membership::StorageState::NONE,
+          folly::none));
 
   // Replication factor is 2 by default.
   auto cluster = IntegrationTestUtils::ClusterFactory()
@@ -329,7 +328,7 @@ TEST_F(RebuildingSupervisorIntegrationTest, DontRebuildNonStorageNode) {
                      .setParam("--disable-event-log-trimming", "true")
                      .useHashBasedSequencerAssignment()
                      .setNumDBShards(num_shards)
-                     .setNodes(nodes)
+                     .setNodes(std::move(nodes_configuration))
                      .deferStart()
                      .create(num_nodes);
 
@@ -372,7 +371,6 @@ TEST_F(RebuildingSupervisorIntegrationTest, IsolatedNode) {
                      .useHashBasedSequencerAssignment()
                      .setParam("--min-gossips-for-stable-state", "0")
                      .setNumDBShards(num_shards)
-                     .oneConfigPerNode()
                      .create(num_nodes);
 
   waitForNodesToReadEventLog(*cluster);
@@ -424,12 +422,13 @@ TEST_F(RebuildingSupervisorIntegrationTest, IsolatedRack) {
   int num_shards = 2;
   int num_racks = 3;
 
-  logsconfig::LogAttributes event_log_attrs;
-  event_log_attrs.set_replicationFactor(2);
-  event_log_attrs.set_extraCopies(0);
-  event_log_attrs.set_syncedCopies(0);
-  event_log_attrs.set_singleWriter(false);
-  event_log_attrs.set_syncReplicationScope(NodeLocationScope::RACK);
+  auto event_log_attrs =
+      logsconfig::LogAttributes()
+          .with_replicationFactor(2)
+          .with_extraCopies(0)
+          .with_syncedCopies(0)
+          .with_singleWriter(false)
+          .with_syncReplicationScope(NodeLocationScope::RACK);
 
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .enableSelfInitiatedRebuilding("10s")
@@ -442,7 +441,6 @@ TEST_F(RebuildingSupervisorIntegrationTest, IsolatedRack) {
                      .setNumDBShards(num_shards)
                      .setNumRacks(num_racks)
                      .setEventLogAttributes(event_log_attrs)
-                     .oneConfigPerNode()
                      .deferStart()
                      .create(num_nodes);
 
@@ -518,12 +516,13 @@ TEST_F(RebuildingSupervisorIntegrationTest, s143309) {
   int num_shards = 2;
   int num_racks = 3;
 
-  logsconfig::LogAttributes event_log_attrs;
-  event_log_attrs.set_replicationFactor(2);
-  event_log_attrs.set_extraCopies(0);
-  event_log_attrs.set_syncedCopies(0);
-  event_log_attrs.set_singleWriter(false);
-  event_log_attrs.set_syncReplicationScope(NodeLocationScope::RACK);
+  auto event_log_attrs =
+      logsconfig::LogAttributes()
+          .with_replicationFactor(2)
+          .with_extraCopies(0)
+          .with_syncedCopies(0)
+          .with_singleWriter(false)
+          .with_syncReplicationScope(NodeLocationScope::RACK);
 
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .setParam("--event-log-grace-period", "1ms")
@@ -536,7 +535,6 @@ TEST_F(RebuildingSupervisorIntegrationTest, s143309) {
                      .setNumDBShards(num_shards)
                      .setNumRacks(num_racks)
                      .setEventLogAttributes(event_log_attrs)
-                     .oneConfigPerNode()
                      .create(num_nodes);
 
   waitForNodesToReadEventLog(*cluster);
@@ -610,11 +608,15 @@ TEST_F(RebuildingSupervisorIntegrationTest, BasicShard) {
     nodes_config[i] = std::move(node);
   }
 
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes_config),
+      ReplicationProperty{{NodeLocationScope::NODE, 3}});
+
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .enableSelfInitiatedRebuilding()
                      .setParam("--event-log-grace-period", "1ms")
                      .setParam("--disable-event-log-trimming", "true")
-                     .setNodes(nodes_config)
+                     .setNodes(std::move(nodes_configuration))
                      .setNumDBShards(3)
                      .deferStart()
                      .create(5);
@@ -664,13 +666,16 @@ TEST_F(RebuildingSupervisorIntegrationTest, NodeRebuildingHitThreshold) {
     node.addStorageRole(/*num_shards*/ 1);
     nodes_config[i] = std::move(node);
   }
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes_config));
 
-  logsconfig::LogAttributes event_log_attrs;
-  event_log_attrs.set_replicationFactor(3);
-  event_log_attrs.set_extraCopies(0);
-  event_log_attrs.set_syncedCopies(0);
-  event_log_attrs.set_singleWriter(false);
-  event_log_attrs.set_syncReplicationScope(NodeLocationScope::NODE);
+  auto event_log_attrs =
+      logsconfig::LogAttributes()
+          .with_replicationFactor(3)
+          .with_extraCopies(0)
+          .with_syncedCopies(0)
+          .with_singleWriter(false)
+          .with_syncReplicationScope(NodeLocationScope::NODE);
 
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
@@ -682,7 +687,7 @@ TEST_F(RebuildingSupervisorIntegrationTest, NodeRebuildingHitThreshold) {
           .setParam("--reader-stalled-grace-period", "1s")
           .setParam("--disable-event-log-trimming", "true")
           .useHashBasedSequencerAssignment()
-          .setNodes(nodes_config)
+          .setNodes(std::move(nodes_configuration))
           .setEventLogAttributes(event_log_attrs)
           .deferStart()
           .create(num_nodes);
@@ -761,13 +766,16 @@ TEST_F(RebuildingSupervisorIntegrationTest, NodeRebuildingExitThresholdOnAck) {
     node.addStorageRole(/*num_shards*/ 1);
     nodes_config[i] = std::move(node);
   }
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes_config),
+      ReplicationProperty{{NodeLocationScope::NODE, 3}});
 
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_singleWriter(false);
-  log_attrs.set_syncReplicationScope(NodeLocationScope::NODE);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_singleWriter(false)
+                       .with_syncReplicationScope(NodeLocationScope::NODE);
 
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .setParam("--enable-self-initiated-rebuilding", "true")
@@ -779,7 +787,7 @@ TEST_F(RebuildingSupervisorIntegrationTest, NodeRebuildingExitThresholdOnAck) {
                      .setParam("--reader-stalled-grace-period", "1s")
                      .setParam("--disable-event-log-trimming", "true")
                      .useHashBasedSequencerAssignment()
-                     .setNodes(nodes_config)
+                     .setNodes(std::move(nodes_configuration))
                      .setLogAttributes(log_attrs)
                      .setEventLogAttributes(log_attrs)
                      .deferStart()
@@ -787,20 +795,9 @@ TEST_F(RebuildingSupervisorIntegrationTest, NodeRebuildingExitThresholdOnAck) {
                      .create(num_nodes);
 
   cluster->start({});
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
 
   auto client = cluster->createClient();
-
-  // Wait until all nodes are seen as alive
-  for (const auto& n : cluster->getNodes()) {
-    wait_until([&]() {
-      for (const auto& it : n.second->gossipCount()) {
-        if (it.second.first != "ALIVE" || it.second.second > 1000000) {
-          return false;
-        }
-      }
-      return true;
-    });
-  }
 
   // Write some records.
   ld_info("write some records");
@@ -908,13 +905,17 @@ TEST_F(RebuildingSupervisorIntegrationTest, NodeRebuildingHitThresholdAtOnce) {
     node.addStorageRole(/*num_shards*/ 1);
     nodes_config[i] = std::move(node);
   }
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes_config),
+      ReplicationProperty{{NodeLocationScope::NODE, 3}});
 
-  logsconfig::LogAttributes event_log_attrs;
-  event_log_attrs.set_replicationFactor(3);
-  event_log_attrs.set_extraCopies(0);
-  event_log_attrs.set_syncedCopies(0);
-  event_log_attrs.set_singleWriter(false);
-  event_log_attrs.set_syncReplicationScope(NodeLocationScope::NODE);
+  auto event_log_attrs =
+      logsconfig::LogAttributes()
+          .with_replicationFactor(3)
+          .with_extraCopies(0)
+          .with_syncedCopies(0)
+          .with_singleWriter(false)
+          .with_syncReplicationScope(NodeLocationScope::NODE);
 
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
@@ -926,7 +927,7 @@ TEST_F(RebuildingSupervisorIntegrationTest, NodeRebuildingHitThresholdAtOnce) {
           .setParam("--reader-stalled-grace-period", "1s")
           .setParam("--disable-event-log-trimming", "true")
           .useHashBasedSequencerAssignment()
-          .setNodes(nodes_config)
+          .setNodes(std::move(nodes_configuration))
           .setEventLogAttributes(event_log_attrs)
           .deferStart()
           .create(num_nodes);
@@ -1034,13 +1035,17 @@ TEST_F(RebuildingSupervisorIntegrationTest,
     node.addStorageRole(/*num_shards*/ 1);
     nodes_config[i] = std::move(node);
   }
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes_config),
+      ReplicationProperty{{NodeLocationScope::NODE, 3}});
 
-  logsconfig::LogAttributes event_log_attrs;
-  event_log_attrs.set_replicationFactor(3);
-  event_log_attrs.set_extraCopies(0);
-  event_log_attrs.set_syncedCopies(0);
-  event_log_attrs.set_singleWriter(false);
-  event_log_attrs.set_syncReplicationScope(NodeLocationScope::NODE);
+  auto event_log_attrs =
+      logsconfig::LogAttributes()
+          .with_replicationFactor(3)
+          .with_extraCopies(0)
+          .with_syncedCopies(0)
+          .with_singleWriter(false)
+          .with_syncReplicationScope(NodeLocationScope::NODE);
 
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
@@ -1052,7 +1057,7 @@ TEST_F(RebuildingSupervisorIntegrationTest,
           .setParam("--reader-stalled-grace-period", "1s")
           .setParam("--disable-event-log-trimming", "true")
           .useHashBasedSequencerAssignment()
-          .setNodes(nodes_config)
+          .setNodes(std::move(nodes_configuration))
           .setEventLogAttributes(event_log_attrs)
           .deferStart()
           .create(num_nodes);
@@ -1150,13 +1155,16 @@ TEST_F(RebuildingSupervisorIntegrationTest,
     node.addStorageRole(/*num_shards*/ 1);
     nodes_config[i] = std::move(node);
   }
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes_config));
 
-  logsconfig::LogAttributes event_log_attrs;
-  event_log_attrs.set_replicationFactor(3);
-  event_log_attrs.set_extraCopies(0);
-  event_log_attrs.set_syncedCopies(0);
-  event_log_attrs.set_singleWriter(false);
-  event_log_attrs.set_syncReplicationScope(NodeLocationScope::NODE);
+  auto event_log_attrs =
+      logsconfig::LogAttributes()
+          .with_replicationFactor(3)
+          .with_extraCopies(0)
+          .with_syncedCopies(0)
+          .with_singleWriter(false)
+          .with_syncReplicationScope(NodeLocationScope::NODE);
 
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
@@ -1168,7 +1176,7 @@ TEST_F(RebuildingSupervisorIntegrationTest,
           .setParam("--reader-stalled-grace-period", "1s")
           .setParam("--disable-event-log-trimming", "true")
           .useHashBasedSequencerAssignment()
-          .setNodes(nodes_config)
+          .setNodes(std::move(nodes_configuration))
           .setEventLogAttributes(event_log_attrs)
           .deferStart()
           .create(num_nodes);
@@ -1225,13 +1233,16 @@ TEST_F(RebuildingSupervisorIntegrationTest,
     node.addStorageRole(/*num_shards*/ 1);
     nodes_config[i] = std::move(node);
   }
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes_config));
 
-  logsconfig::LogAttributes event_log_attrs;
-  event_log_attrs.set_replicationFactor(3);
-  event_log_attrs.set_extraCopies(0);
-  event_log_attrs.set_syncedCopies(0);
-  event_log_attrs.set_singleWriter(false);
-  event_log_attrs.set_syncReplicationScope(NodeLocationScope::NODE);
+  auto event_log_attrs =
+      logsconfig::LogAttributes()
+          .with_replicationFactor(3)
+          .with_extraCopies(0)
+          .with_syncedCopies(0)
+          .with_singleWriter(false)
+          .with_syncReplicationScope(NodeLocationScope::NODE);
 
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
@@ -1243,7 +1254,7 @@ TEST_F(RebuildingSupervisorIntegrationTest,
           .setParam("--reader-stalled-grace-period", "1s")
           .setParam("--disable-event-log-trimming", "true")
           .useHashBasedSequencerAssignment()
-          .setNodes(nodes_config)
+          .setNodes(std::move(nodes_configuration))
           .setEventLogAttributes(event_log_attrs)
           .deferStart()
           .create(num_nodes);
@@ -1335,13 +1346,16 @@ TEST_F(RebuildingSupervisorIntegrationTest,
     node.addStorageRole(/*num_shards*/ 1);
     nodes_config[i] = std::move(node);
   }
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes_config));
 
-  logsconfig::LogAttributes event_log_attrs;
-  event_log_attrs.set_replicationFactor(3);
-  event_log_attrs.set_extraCopies(0);
-  event_log_attrs.set_syncedCopies(0);
-  event_log_attrs.set_singleWriter(false);
-  event_log_attrs.set_syncReplicationScope(NodeLocationScope::NODE);
+  auto event_log_attrs =
+      logsconfig::LogAttributes()
+          .with_replicationFactor(3)
+          .with_extraCopies(0)
+          .with_syncedCopies(0)
+          .with_singleWriter(false)
+          .with_syncReplicationScope(NodeLocationScope::NODE);
 
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
@@ -1353,7 +1367,7 @@ TEST_F(RebuildingSupervisorIntegrationTest,
           .setParam("--reader-stalled-grace-period", "1s")
           .setParam("--disable-event-log-trimming", "true")
           .useHashBasedSequencerAssignment()
-          .setNodes(nodes_config)
+          .setNodes(std::move(nodes_configuration))
           .setEventLogAttributes(event_log_attrs)
           .deferStart()
           .create(num_nodes);
@@ -1416,18 +1430,21 @@ TEST_F(RebuildingSupervisorIntegrationTest, ReadIOError) {
     nodes_config[i] = std::move(node);
   }
 
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes_config));
+
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .enableSelfInitiatedRebuilding()
                      .setParam("--event-log-grace-period", "1ms")
                      .setParam("--disable-event-log-trimming", "true")
                      .setParam("--sticky-copysets-block-size", "1")
                      .useHashBasedSequencerAssignment()
-                     .setNodes(nodes_config)
+                     .setNodes(std::move(nodes_configuration))
                      .deferStart()
                      .create(5);
 
   cluster->start({0, 1, 2, 3, 4});
-  cluster->waitForRecovery();
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
 
   auto client = cluster->createClient();
 
@@ -1492,13 +1509,16 @@ TEST_F(RebuildingSupervisorIntegrationTest,
     }
     nodes_config[i] = std::move(node);
   }
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes_config));
 
-  logsconfig::LogAttributes event_log_attrs;
-  event_log_attrs.set_replicationFactor(3);
-  event_log_attrs.set_extraCopies(0);
-  event_log_attrs.set_syncedCopies(0);
-  event_log_attrs.set_singleWriter(false);
-  event_log_attrs.set_syncReplicationScope(NodeLocationScope::NODE);
+  auto event_log_attrs =
+      logsconfig::LogAttributes()
+          .with_replicationFactor(3)
+          .with_extraCopies(0)
+          .with_syncedCopies(0)
+          .with_singleWriter(false)
+          .with_syncReplicationScope(NodeLocationScope::NODE);
 
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
@@ -1510,7 +1530,7 @@ TEST_F(RebuildingSupervisorIntegrationTest,
           .setParam("--reader-stalled-grace-period", "1s")
           .setParam("--disable-event-log-trimming", "true")
           .useHashBasedSequencerAssignment()
-          .setNodes(nodes_config)
+          .setNodes(std::move(nodes_configuration))
           .setEventLogAttributes(event_log_attrs)
           .deferStart()
           .create(num_nodes);

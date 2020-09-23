@@ -7,6 +7,8 @@
  */
 #include "logdevice/common/ClientReadersFlowTracer.h"
 
+#include <cmath>
+
 #include "logdevice/common/DataRecordOwnsPayload.h"
 #include "logdevice/common/GetSeqStateRequest.h"
 #include "logdevice/common/Processor.h"
@@ -19,12 +21,99 @@
 #include "logdevice/common/client_read_stream/ClientReadStreamScd.h"
 #include "logdevice/common/debug.h"
 #include "logdevice/common/network/OverloadDetector.h"
+#include "logdevice/common/stats/PerMonitoringTagHistograms.h"
 #include "logdevice/common/stats/Stats.h"
 namespace facebook { namespace logdevice {
+
+using namespace std::literals::chrono_literals;
+
+std::string toString(ClientReadersFlowTracer::State state) {
+  using State = ClientReadersFlowTracer::State;
+  switch (state) {
+    case State::STUCK:
+      return "stuck";
+    case State::STUCK_WHILE_FAILING_SYNC_SEQ_REQ:
+      return "stuck_while_failing_sync_seq_req";
+    case State::LAGGING:
+      return "lagging";
+    case State::HEALTHY:
+      return "healthy";
+  }
+  ld_check(false);
+  __builtin_unreachable();
+}
 
 inline uint16_t get_initial_ttl(size_t group_size, size_t num_groups) {
   return 1.25 * group_size * num_groups;
 }
+
+void updateCountersForState(
+    ClientReadersFlowTracer::State state,
+    bool ignoring_overload,
+    const folly::small_vector<std::string>& monitoring_tags,
+    int increment) {
+  using State = ClientReadersFlowTracer::State;
+
+  if (ignoring_overload) {
+    if (state == State::STUCK || state == State::LAGGING) {
+      WORKER_STAT_ADD(
+          read_streams_stuck_or_lagging_ignoring_overload, increment);
+    }
+
+    if (state == State::STUCK ||
+        state == State::STUCK_WHILE_FAILING_SYNC_SEQ_REQ) {
+      WORKER_STAT_ADD(read_streams_stuck_ignoring_overload, increment);
+    } else if (state == State::LAGGING) {
+      WORKER_STAT_ADD(read_streams_lagging_ignoring_overload, increment);
+    } else {
+      // ignore
+    }
+
+  } else {
+    if (state == State::STUCK || state == State::LAGGING) {
+      TAGGED_STAT_ADD(Worker::stats(),
+                      monitoring_tags,
+                      read_streams_stuck_or_lagging,
+                      increment);
+    }
+
+    if (state == State::STUCK_WHILE_FAILING_SYNC_SEQ_REQ) {
+      TAGGED_STAT_ADD(Worker::stats(),
+                      monitoring_tags,
+                      read_streams_stuck_failing_sync_seq_req,
+                      increment);
+    }
+
+    if (state == State::STUCK ||
+        state == State::STUCK_WHILE_FAILING_SYNC_SEQ_REQ) {
+      TAGGED_STAT_ADD(
+          Worker::stats(), monitoring_tags, read_streams_stuck, increment);
+    } else if (state == State::LAGGING) {
+      TAGGED_STAT_ADD(
+          Worker::stats(), monitoring_tags, read_streams_lagging, increment);
+    } else {
+      // ignore
+    }
+  }
+}
+
+namespace {
+
+/**
+ * This is a common way of calculating exponential moving average.
+ *
+ * See for example
+ * https://en.wikipedia.org/wiki/Moving_average#Application_to_measuring_computer_performance
+ */
+void updateExponentialMovingAverage(double& current_value,
+                                    double new_sample,
+                                    std::chrono::duration<double> time_diff) {
+  const std::chrono::duration<double> kWindowSize = std::chrono::minutes{1};
+  double alpha = 1.0 - std::exp(-time_diff / kWindowSize);
+  current_value = (1 - alpha) * current_value + alpha * new_sample;
+}
+
+} // namespace
 
 ClientReadersFlowTracer::ClientReadersFlowTracer(
     std::shared_ptr<TraceLogger> logger,
@@ -33,8 +122,9 @@ ClientReadersFlowTracer::ClientReadersFlowTracer(
     bool ignore_overload)
     : SampledTracer(std::move(logger)),
       ref_holder_(this),
-      push_samples_(push_samples),
-      ignore_overload_(ignore_overload),
+      params_{/*tracer_period=*/0ms,
+              /*push_samples=*/push_samples,
+              /*ignore_overload=*/ignore_overload},
       owner_(owner) {
   timer_ = std::make_unique<Timer>([this] { onTimerTriggered(); });
 
@@ -55,29 +145,41 @@ ClientReadersFlowTracer::~ClientReadersFlowTracer() {
 
 void ClientReadersFlowTracer::traceReaderFlow(size_t num_bytes_read,
                                               size_t num_records_read) {
-  if (!push_samples_) {
+  if (!params_.push_samples) {
     return;
   }
-  auto time_stuck = std::max(msec_since(last_time_stuck_), 0l);
-  auto time_lagging = std::max(msec_since(last_time_lagging_), 0l);
-  auto shard_status_version = owner_->deps_->getShardStatus().getVersion();
-  auto time_lag = estimateTimeLag();
-  auto byte_lag = estimateByteLag();
-  bool overloaded = owner_->deps_->isWorkerOverloaded();
 
-  auto sample_builder =
-      [=,
-       reading_speed_bytes = num_bytes_read - last_num_bytes_read_,
-       reading_speed_records = num_records_read -
-           last_num_records_read_]() -> std::unique_ptr<TraceSample> {
+  auto now = SteadyClock::now();
+
+  auto time_diff = now - last_trace_time_;
+  updateExponentialMovingAverage(speed_records_moving_avg_,
+                                 num_records_read - last_num_records_read_,
+                                 time_diff);
+  updateExponentialMovingAverage(speed_bytes_moving_avg_,
+                                 num_bytes_read - last_num_bytes_read_,
+                                 time_diff);
+
+  int reading_speed_records =
+      static_cast<int>(std::round(speed_records_moving_avg_));
+  int reading_speed_bytes =
+      static_cast<int>(std::round(speed_bytes_moving_avg_));
+
+  auto sample_builder = [&, this]() -> std::unique_ptr<TraceSample> {
+    auto time_stuck = std::max(msec_since(last_time_stuck_), 0l);
+    auto time_lagging = std::max(msec_since(last_time_lagging_), 0l);
+    auto shard_status_version = owner_->deps_->getShardStatus().getVersion();
+    auto time_lag = estimateTimeLag();
+    auto byte_lag = estimateByteLag();
+    bool overloaded = owner_->deps_->isWorkerOverloaded();
+
     auto sample = std::make_unique<TraceSample>();
     sample->addNormalValue("log_id", std::to_string(owner_->log_id_.val()));
-
     sample->addNormalValue("log_group_name", owner_->log_group_name_);
-
     sample->addNormalValue(
         "read_stream_id",
         std::to_string(owner_->deps_->getReadStreamID().val()));
+    sample->addIntValue(
+        "read_stream_pointer", reinterpret_cast<intptr_t>(owner_));
     sample->addNormalValue("csid", owner_->deps_->getClientSessionID());
     sample->addNormalValue("from_lsn", lsn_to_string(owner_->start_lsn_));
     sample->addNormalValue("until_lsn", lsn_to_string(owner_->until_lsn_));
@@ -101,7 +203,7 @@ void ClientReadersFlowTracer::traceReaderFlow(size_t num_bytes_read,
       sample->addIntValue("bytes_lagged", byte_lag.value());
     }
     if (time_lag.has_value()) {
-      sample->addIntValue("timestamp_lagged", time_lag.value());
+      sample->addIntValue("timestamp_lagged", time_lag->count());
     }
     sample->addIntValue("time_stuck", time_stuck);
     sample->addIntValue("time_lagging", time_lagging);
@@ -111,10 +213,21 @@ void ClientReadersFlowTracer::traceReaderFlow(size_t num_bytes_read,
     sample->addNormalValue("grace_counters", owner_->graceCountersPretty());
     sample->addIntValue("shard_status_version", shard_status_version);
     sample->addIntValue("in_overloaded_worker", overloaded);
+    sample->addNormalValue(
+        "waiting_for_node", readerIsStuck() ? owner_->waitingForNodeStr() : "");
+    sample->addNormalValue("reading_mode", owner_->readingModeStr());
+    sample->addNormalValue("state", toString(last_reported_state_));
+    sample->addNormalValue(
+        "monitoring_tier",
+        folly::join(",", owner_->monitoring_tags_)); // deprecated
+    sample->addSetValue("monitoring_tags",
+                        std::set<std::string>(owner_->monitoring_tags_.begin(),
+                                              owner_->monitoring_tags_.end()));
     return sample;
   };
   last_num_bytes_read_ = num_bytes_read;
   last_num_records_read_ = num_records_read;
+  last_trace_time_ = now;
   publish(READERS_FLOW_TRACER,
           sample_builder,
           /*force=*/false,
@@ -130,16 +243,21 @@ double ClientReadersFlowTracer::calculateSamplingWeight() {
   }
 }
 
-bool ClientReadersFlowTracer::readerIsUnhealthy() {
+bool ClientReadersFlowTracer::readerIsStuck() const {
+  return last_reported_state_ == State::STUCK ||
+      last_reported_state_ == State::STUCK_WHILE_FAILING_SYNC_SEQ_REQ;
+}
+
+bool ClientReadersFlowTracer::readerIsUnhealthy() const {
   return last_reported_state_ != State::HEALTHY;
 }
 
 void ClientReadersFlowTracer::onSettingsUpdated() {
   auto& settings = Worker::settings();
-  tracer_period_ = settings.client_readers_flow_tracer_period;
-  if (tracer_period_ != std::chrono::milliseconds::zero()) {
+  params_.tracer_period = settings.client_readers_flow_tracer_period;
+  if (params_.tracer_period != 0ms) {
     if (!timer_->isActive()) {
-      timer_->activate(std::chrono::milliseconds{0});
+      timer_->activate(0ms);
     }
   } else {
     if (timer_->isActive()) {
@@ -167,14 +285,20 @@ void ClientReadersFlowTracer::onTimerTriggered() {
                        // changes.
 
   maybeBumpStats();
-  traceReaderFlow(owner_->num_bytes_delivered_, owner_->num_records_delivered_);
-  timer_->activate(tracer_period_);
+  timer_->activate(params_.tracer_period);
 }
 
 void ClientReadersFlowTracer::sendSyncSequencerRequest() {
+  auto flags = SyncSequencerRequest::INCLUDE_TAIL_ATTRIBUTES;
+
+  if (Worker::settings()
+          .client_readers_flow_tracer_GSS_skip_remote_preemption_checks) {
+    flags |= SyncSequencerRequest::SKIP_REMOTE_PREEMPTION_CHECK;
+  }
+
   auto ssr = std::make_unique<SyncSequencerRequest>(
       owner_->log_id_,
-      SyncSequencerRequest::INCLUDE_TAIL_ATTRIBUTES,
+      flags,
       [weak_ref = ref_holder_.ref()](
           Status st,
           NodeID seq_node,
@@ -189,7 +313,7 @@ void ClientReadersFlowTracer::sendSyncSequencerRequest() {
         }
       },
       GetSeqStateRequest::Context::READER_MONITORING,
-      /*timeout=*/tracer_period_,
+      /*timeout=*/params_.tracer_period,
       GetSeqStateRequest::MergeType::GSS_MERGE_INTO_OLD);
   ssr->setThreadIdx(Worker::onThisThread()->idx_.val());
   std::unique_ptr<Request> req(std::move(ssr));
@@ -205,6 +329,7 @@ void ClientReadersFlowTracer::onSyncSequencerRequestResponse(
     NodeID seq_node,
     lsn_t next_lsn,
     std::unique_ptr<LogTailAttributes> attrs) {
+  last_sync_seq_request_result_ = st;
   if (st == E::OK && attrs) {
     auto tail_lsn_approx = attrs->last_released_real_lsn != LSN_INVALID
         ? attrs->last_released_real_lsn
@@ -242,6 +367,8 @@ void ClientReadersFlowTracer::onSyncSequencerRequestResponse(
     updateTimeStuck(LSN_INVALID, st);
   }
   updateTimeLagging(st);
+  traceReaderFlow(owner_->num_bytes_delivered_, owner_->num_records_delivered_);
+  bumpHistograms();
 }
 
 /**
@@ -276,7 +403,7 @@ void ClientReadersFlowTracer::updateTimeStuck(lsn_t tail_lsn, Status st) {
 }
 
 void ClientReadersFlowTracer::updateTimeLagging(Status st) {
-  int64_t cur_ts_lag;
+  std::chrono::milliseconds cur_ts_lag;
   auto& settings = Worker::settings();
   auto last_lag = estimateTimeLag();
   if (st == E::OK && last_lag.has_value()) {
@@ -306,11 +433,7 @@ void ClientReadersFlowTracer::updateTimeLagging(Status st) {
   }
 
   if (!should_track_) {
-    if (!time_lag_record_.full()) {
-      // if we have stale samples, let's go back to not be lagging because the
-      // client is purposefully not reading right now.
-      last_time_lagging_ = TimePoint::max();
-    }
+    last_time_lagging_ = TimePoint::max();
     maybeBumpStats();
     return;
   }
@@ -326,7 +449,7 @@ void ClientReadersFlowTracer::updateTimeLagging(Status st) {
   /* Should we record this sample?
    * We do this now so time_window computation has a nicer expression. */
   if ((sample_counter_++) % group_size == 0) {
-    int64_t new_time_lag_correction = 0;
+    std::chrono::milliseconds new_time_lag_correction{0};
     if (!should_track_) {
       /* consolidate lag correction on last bucket, and start tracking lag
        * correction on the new bucket */
@@ -341,16 +464,16 @@ void ClientReadersFlowTracer::updateTimeLagging(Status st) {
          .ttl = get_initial_ttl(group_size, num_groups)});
   }
 
-  const auto time_window = tracer_period_.count() *
+  const auto time_window = params_.tracer_period *
       (group_size * (num_groups - 1) + sample_counter_ % group_size);
 
-  int64_t correction = 0;
+  std::chrono::milliseconds correction{0};
   for (auto& x : time_lag_record_) {
     // accumulate corrections
     correction += x.time_lag_correction;
   }
 
-  bool is_catching_up = cur_ts_lag <= tracer_period_.count() ||
+  bool is_catching_up = cur_ts_lag <= params_.tracer_period ||
       !time_lag_record_.full() ||
       cur_ts_lag - time_lag_record_.front().time_lag - correction <=
           slope_threshold * time_window;
@@ -369,14 +492,16 @@ void ClientReadersFlowTracer::maybeBumpStats(bool force_healthy) {
   State state_to_report;
   auto& settings = Worker::settings();
 
-  if (last_time_stuck_ != TimePoint::max()
-          ? last_time_stuck_ + settings.reader_stuck_threshold <= now
-          : false) {
-    state_to_report = State::STUCK;
-  } else if ((last_time_lagging_ != TimePoint::max()
-                  ? last_time_lagging_ + settings.reader_lagging_threshold <=
-                      now
-                  : false) &&
+  if (force_healthy) {
+    state_to_report = State::HEALTHY;
+  } else if (last_time_stuck_ != TimePoint::max()
+                 ? last_time_stuck_ + settings.reader_stuck_threshold <= now
+                 : false) {
+    state_to_report = (last_sync_seq_request_result_ != E::OK &&
+                       owner_->next_lsn_to_deliver_ >= estimateTailLSN())
+        ? State::STUCK_WHILE_FAILING_SYNC_SEQ_REQ
+        : State::STUCK;
+  } else if ((last_time_lagging_ != TimePoint::max()) &&
              owner_->until_lsn_ == LSN_MAX) {
     // We won't consider a reader lagging if until_lsn is a fixed target because
     // we are not attempting to reach a moving tail.
@@ -385,32 +510,15 @@ void ClientReadersFlowTracer::maybeBumpStats(bool force_healthy) {
     state_to_report = State::HEALTHY;
   }
 
-  if (force_healthy) {
-    state_to_report = State::HEALTHY;
-  }
-
-  auto update_counter_for_state = [ignore_overload = this->ignore_overload_](
-                                      State state, int increment) {
-    if (state == State::STUCK) {
-      if (ignore_overload) {
-        WORKER_STAT_ADD(read_streams_stuck_ignoring_overload, increment);
-      } else {
-        WORKER_STAT_ADD(read_streams_stuck, increment);
-      }
-    } else if (state == State::LAGGING) {
-      if (ignore_overload) {
-        WORKER_STAT_ADD(read_streams_lagging_ignoring_overload, increment);
-      } else {
-        WORKER_STAT_ADD(read_streams_lagging, increment);
-      }
-    } else {
-      /* ignore */
-    }
-  };
-
   if (state_to_report != last_reported_state_) {
-    update_counter_for_state(last_reported_state_, -1);
-    update_counter_for_state(state_to_report, +1);
+    updateCountersForState(last_reported_state_,
+                           /*ignoring_overload=*/params_.ignore_overload,
+                           owner_->monitoring_tags_,
+                           -1);
+    updateCountersForState(state_to_report,
+                           /*ignoring_overload=*/params_.ignore_overload,
+                           owner_->monitoring_tags_,
+                           +1);
     last_reported_state_ = state_to_report;
   }
 }
@@ -420,6 +528,7 @@ std::string ClientReadersFlowTracer::lastReportedStatePretty() const {
     case State::HEALTHY:
       return "healthy";
     case State::STUCK:
+    case State::STUCK_WHILE_FAILING_SYNC_SEQ_REQ:
       return "stuck";
     case State::LAGGING:
       return "lagging";
@@ -432,7 +541,7 @@ std::string ClientReadersFlowTracer::lastTailInfoPretty() const {
   if (latest_tail_info_.has_value()) {
     return folly::sformat("OM={},TS={},LSN={}",
                           latest_tail_info_.value().offsets.toString().c_str(),
-                          latest_tail_info_.value().timestamp,
+                          latest_tail_info_.value().timestamp.count(),
                           lsn_to_string(latest_tail_info_.value().lsn_approx));
   } else {
     return "NONE";
@@ -443,34 +552,35 @@ std::string ClientReadersFlowTracer::timeLagRecordPretty() const {
   std::vector<std::string> entries_pretty;
   for (auto& s : time_lag_record_) {
     entries_pretty.push_back(folly::sformat("[ts_lag={},ts_lag_cor={},ttl={}]",
-                                            s.time_lag,
-                                            s.time_lag_correction,
+                                            s.time_lag.count(),
+                                            s.time_lag_correction.count(),
                                             s.ttl));
   }
   return folly::join(",", entries_pretty);
 }
 
-folly::Optional<int64_t> ClientReadersFlowTracer::estimateTimeLag() const {
-  if (latest_tail_info_.hasValue()) {
+folly::Optional<std::chrono::milliseconds>
+ClientReadersFlowTracer::estimateTimeLag() const {
+  if (latest_tail_info_.has_value()) {
     auto tail_lsn = latest_tail_info_->lsn_approx;
     auto tail_ts = latest_tail_info_->timestamp;
-    int64_t last_in_record_ts = owner_->last_in_record_ts_.count();
+    auto last_in_record_ts = owner_->last_in_record_ts_;
 
     if (tail_lsn < owner_->next_lsn_to_deliver_) {
       /* If we are at tail, we should report that we have no lag to avoid
        * reporting a reader that is at tail as lagging. This is our last resort
        * for readers that are racing the trim point and might miss the record
        * that was last appended. */
-      return 0;
-    } else if (last_in_record_ts > 0) {
-      return std::max(tail_ts - last_in_record_ts, static_cast<int64_t>(0));
+      return 0ms;
+    } else if (last_in_record_ts > 0ms) {
+      return std::max(tail_ts - last_in_record_ts, 0ms);
     }
   }
   return folly::none;
 }
 
 folly::Optional<int64_t> ClientReadersFlowTracer::estimateByteLag() const {
-  if (latest_tail_info_.hasValue()) {
+  if (latest_tail_info_.has_value()) {
     auto tail_lsn = latest_tail_info_->lsn_approx;
     int64_t tail_byte_offset =
         latest_tail_info_->offsets.getCounter(BYTE_OFFSET);
@@ -496,7 +606,7 @@ void ClientReadersFlowTracer::updateShouldTrack() {
   bool was_being_tracked = should_track_;
 
   auto overload_detector = Worker::overloadDetector();
-  const bool overloaded = (overload_detector && !ignore_overload_)
+  const bool overloaded = (overload_detector && !params_.ignore_overload)
       ? overload_detector->overloaded()
       : false;
 
@@ -517,12 +627,12 @@ void ClientReadersFlowTracer::updateShouldTrack() {
   /* check if we transitioned to tracking */
   if (was_being_tracked && !should_track_) {
     auto time_lag = estimateTimeLag();
-    if (!time_lag_record_.empty() && time_lag.hasValue()) {
+    if (!time_lag_record_.empty() && time_lag.has_value()) {
       time_lag_record_.back().time_lag_correction -= time_lag.value();
     }
   } else if (!was_being_tracked && should_track_) {
     auto time_lag = estimateTimeLag();
-    if (!time_lag_record_.empty() && time_lag.hasValue()) {
+    if (!time_lag_record_.empty() && time_lag.has_value()) {
       time_lag_record_.back().time_lag_correction += time_lag.value();
     }
   }
@@ -553,6 +663,30 @@ void ClientReadersFlowTracer::onWindowUpdateSent() {
   updateShouldTrack();
   if (tracer_ignoring_overload_) {
     tracer_ignoring_overload_->onWindowUpdateSent();
+  }
+}
+
+lsn_t ClientReadersFlowTracer::estimateTailLSN() const {
+  lsn_t latest_tail_approx = owner_->last_released_;
+  if (latest_tail_info_.has_value()) {
+    latest_tail_approx =
+        std::max(latest_tail_info_->lsn_approx, latest_tail_approx);
+  }
+  return latest_tail_approx;
+}
+
+void ClientReadersFlowTracer::bumpHistograms() {
+  auto time_stuck = std::max(usec_since(last_time_stuck_), 0l);
+  auto time_lag = estimateTimeLag();
+
+  TAGGED_HISTOGRAM_ADD(
+      Worker::stats(), time_stuck, owner_->monitoring_tags_, time_stuck);
+
+  if (time_lag.hasValue()) {
+    TAGGED_HISTOGRAM_ADD(Worker::stats(),
+                         time_lag,
+                         owner_->monitoring_tags_,
+                         to_usec(time_lag.value()).count());
   }
 }
 

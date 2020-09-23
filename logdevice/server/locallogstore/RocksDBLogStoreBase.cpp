@@ -10,6 +10,7 @@
 #include <rocksdb/iostats_context.h>
 
 #include "logdevice/common/stats/PerShardHistograms.h"
+#include "logdevice/server/locallogstore/RocksDBCustomiser.h"
 #include "logdevice/server/locallogstore/RocksDBMemTableRep.h"
 #include "logdevice/server/locallogstore/RocksDBSettings.h"
 #include "logdevice/server/locallogstore/RocksDBWriter.h"
@@ -27,11 +28,14 @@ RocksDBLogStoreBase::RocksDBLogStoreBase(uint32_t shard_idx,
                                          uint32_t num_shards,
                                          const std::string& path,
                                          RocksDBLogStoreConfig rocksdb_config,
+                                         RocksDBCustomiser* customiser,
                                          StatsHolder* stats_holder,
                                          IOTracing* io_tracing)
     : shard_idx_(shard_idx),
       num_shards_(num_shards),
       db_path_(path),
+      customiser_(customiser),
+      is_db_local_(customiser_->isDBLocal()),
       writer_(new RocksDBWriter(this, *rocksdb_config.getRocksDBSettings())),
       stats_(stats_holder),
       statistics_(rocksdb_config.options_.statistics),
@@ -436,6 +440,21 @@ int RocksDBLogStoreBase::updatePerEpochLogMetadata(
                                             getMetadataCFHandle());
 }
 
+int RocksDBLogStoreBase::getRebuildingRanges(RebuildingRangesMetadata& rrm,
+                                             RebuildingRangesVersion& version) {
+  rrm = RebuildingRangesMetadata();
+  version = RebuildingRangesVersion(0, 0);
+  return 0;
+}
+
+int RocksDBLogStoreBase::writeRebuildingRanges(
+    RebuildingRangesMetadata&,
+    RebuildingRangesVersion /*base_version*/,
+    RebuildingRangesVersion /*new_version*/) {
+  err = E::NOTSUPPORTED;
+  return -1;
+}
+
 int RocksDBLogStoreBase::deleteStoreMetadata(
     const StoreMetadataType type,
     const WriteOptions& write_options) {
@@ -515,9 +534,9 @@ RocksDBLogStoreBase::writeBatch(const rocksdb::WriteOptions& options,
     ld_check(!status.ok());
     RATELIMIT_ERROR(std::chrono::seconds(1),
                     1,
-                    "Returning injected error %s for shard %s.",
+                    "Returning injected error %s for shard %d.",
                     status.ToString().c_str(),
-                    getDBPath().c_str());
+                    getShardIdx());
     // Don't bump error stats for injected errors.
     enterFailSafeMode("Write()", "injected error");
   } else {
@@ -806,13 +825,74 @@ rocksdb::Status RocksDBIterator::getRocksdbStatus() {
     status = RocksDBLogStoreBase::FaultTypeToStatus(sim_error);
     RATELIMIT_ERROR(std::chrono::seconds(1),
                     2,
-                    "Returning injected error '%s' for shard '%s'.",
+                    "Returning injected error '%s' for shard %d.",
                     status.ToString().c_str(),
-                    rb_store->getDBPath().c_str());
+                    rb_store->getShardIdx());
   } else {
     status = iterator_->status();
   }
   return status;
+}
+
+int RocksDBLogStoreBase::traverseLogsMetadata(
+    LogMetadataType type,
+    LocalLogStore::TraverseLogsMetadataCallback cb) {
+  using RocksDBKeyFormat::LogMetaKey;
+
+  LogMetaKey first_key(type, logid_t(0));
+  rocksdb::ReadOptions read_options;
+  RocksDBIterator it = newIterator(read_options, getMetadataCFHandle());
+
+  it.Seek(rocksdb::Slice(
+      reinterpret_cast<const char*>(&first_key), sizeof(first_key)));
+
+  for (; it.status().ok() && it.Valid(); it.Next()) {
+    Status status = E::OK;
+    auto key = it.key();
+
+    if (!(key.size() > 0 && key[0] == LogMetaKey::getHeader(type))) {
+      break;
+    }
+    // Special handling is needed for LogMetadataType::SEAL. See T39174994.
+    if (type == LogMetadataType::SEAL &&
+        it.key().compare(
+            rocksdb::Slice(RocksDBLogStoreBase::OLD_SCHEMA_VERSION_KEY)) == 0) {
+      continue;
+    }
+    auto value = it.value();
+    if (!LogMetaKey::valid(type, key.data(), key.size())) {
+      RATELIMIT_CRITICAL(std::chrono::seconds(10),
+                         10,
+                         "Malformed metadata key. Key: %s, Value: %s",
+                         hexdump_buf(key.data(), key.size()).c_str(),
+                         hexdump_buf(value.data(), value.size()).c_str());
+
+      // If the key is malformed, we won't know the `log_id` for
+      // invoking the callback function. Hence, abandon this shard.
+      err = E::LOCAL_LOG_STORE_READ;
+      return -1;
+    }
+
+    logid_t log_id = LogMetaKey::getLogID(key.data());
+    auto meta = LogMetadataFactory::create(type);
+    if (meta->deserialize(Slice(value.data(), value.size())) != 0) {
+      RATELIMIT_CRITICAL(std::chrono::seconds(10),
+                         10,
+                         "Malformed metadata value: Key: %s, Value: %s",
+                         hexdump_buf(key.data(), key.size()).c_str(),
+                         hexdump_buf(value.data(), value.size()).c_str());
+      // If the value is malformed, we at least know the `log_id`. Let
+      // caller know about it.
+      status = E::MALFORMED_RECORD;
+    }
+    cb(log_id, status == E::OK ? std::move(meta) : nullptr, status);
+  }
+
+  if (!it.status().ok()) {
+    err = E::LOCAL_LOG_STORE_READ;
+    return -1;
+  }
+  return 0;
 }
 
 }} // namespace facebook::logdevice

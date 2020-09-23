@@ -15,6 +15,8 @@
 #include "logdevice/admin/maintenance/ClusterMaintenanceStateMachine.h"
 #include "logdevice/admin/maintenance/ClusterMaintenanceWrapper.h"
 #include "logdevice/admin/maintenance/EventLogWriter.h"
+#include "logdevice/admin/maintenance/MaintenanceLogWriter.h"
+#include "logdevice/admin/maintenance/MaintenanceManagerTracer.h"
 #include "logdevice/admin/maintenance/SafetyCheckScheduler.h"
 #include "logdevice/admin/maintenance/SequencerWorkflow.h"
 #include "logdevice/admin/maintenance/ShardWorkflow.h"
@@ -25,6 +27,7 @@
 #include "logdevice/common/configuration/nodes/NodesConfigurationAPI.h"
 #include "logdevice/common/event_log/EventLogRecord.h"
 #include "logdevice/common/event_log/EventLogStateMachine.h"
+#include "logdevice/common/settings/RebuildingSettings.h"
 #include "logdevice/common/work_model/SerialWorkContext.h"
 #include "logdevice/include/ConfigSubscriptionHandle.h"
 
@@ -53,14 +56,20 @@ class MaintenanceManagerDependencies {
   MaintenanceManagerDependencies(
       Processor* processor,
       UpdateableSettings<AdminServerSettings> admin_settings,
+      UpdateableSettings<RebuildingSettings> rebuilding_settings,
       ClusterMaintenanceStateMachine* cluster_maintenance_state_machine,
       EventLogStateMachine* event_log,
-      std::unique_ptr<SafetyCheckScheduler> safety_check_scheduler)
+      std::unique_ptr<SafetyCheckScheduler> safety_check_scheduler,
+      std::unique_ptr<MaintenanceLogWriter> maintenance_log_writer,
+      std::unique_ptr<MaintenanceManagerTracer> tracer)
       : processor_(processor),
         admin_settings_(std::move(admin_settings)),
+        rebuilding_settings_(std::move(rebuilding_settings)),
         cluster_maintenance_state_machine_(cluster_maintenance_state_machine),
         event_log_state_machine_(event_log),
-        safety_check_scheduler_(std::move(safety_check_scheduler)) {}
+        safety_check_scheduler_(std::move(safety_check_scheduler)),
+        maintenance_log_writer_(std::move(maintenance_log_writer)),
+        tracer_(std::move(tracer)) {}
 
   virtual ~MaintenanceManagerDependencies() {}
 
@@ -72,10 +81,17 @@ class MaintenanceManagerDependencies {
   /*
    * Posts safety check request
    *
-   * @param shard_wf Set of references to ShardWorkflow for
-   *                 the shards for which we need to run safety check
-   * @param seq_wf   Set of references to SequencerWorkflow for
-   *                 the sequencer nodes for which we need to run safety check
+   * @param maintenance_state Current ClusterMaintenanceWrapper
+   * @param status_map        Current ShardAuthoritativeStatusMap
+   * @param nodes_config      Current NodesConfiguration
+   * @param shard_wf          Set of references to ShardWorkflow for
+   *                          the shards for which we need to run safety check
+   * @param seq_wf            Set of references to SequencerWorkflow for
+   *                          the sequencer nodes for which we need to run
+   *                          safety check
+   * @param safe_shards       Set of shards that have already passed safety
+   *                          checks or skipped safety check and can go down
+   *                          anytime
    *
    * @return folly::SemiFuture<SafetyCheckResult> A future whose promise
    * is fulfiled once we have results for all workflows
@@ -87,7 +103,8 @@ class MaintenanceManagerDependencies {
       const std::shared_ptr<const configuration::nodes::NodesConfiguration>&
           nodes_config,
       const std::vector<const ShardWorkflow*>& shard_wf,
-      const std::vector<const SequencerWorkflow*>& seq_wf);
+      const std::vector<const SequencerWorkflow*>& seq_wf,
+      const ShardSet& safe_shards);
 
   // calls `update` on the NodesConfigManager
   virtual folly::SemiFuture<NCUpdateResult> postNodesConfigurationUpdate(
@@ -116,8 +133,20 @@ class MaintenanceManagerDependencies {
     return admin_settings_.get();
   }
 
+  std::shared_ptr<const RebuildingSettings> rebuildingSettings() const {
+    return rebuilding_settings_.get();
+  }
+
   virtual StatsHolder* getStats() const {
     return Worker::stats();
+  }
+
+  virtual MaintenanceLogWriter* getMaintenanceLogWriter() const {
+    return maintenance_log_writer_.get();
+  }
+
+  virtual MaintenanceManagerTracer* getTracer() const {
+    return tracer_.get();
   }
 
  private:
@@ -125,6 +154,8 @@ class MaintenanceManagerDependencies {
   Processor* processor_;
 
   UpdateableSettings<AdminServerSettings> admin_settings_;
+
+  UpdateableSettings<RebuildingSettings> rebuilding_settings_;
 
   // The MaintenanceManager instance this is attached to
   MaintenanceManager* owner_{nullptr};
@@ -149,6 +180,12 @@ class MaintenanceManagerDependencies {
 
   // Subscription handle for NodesConfig update
   std::unique_ptr<ConfigSubscriptionHandle> nodes_config_update_handle_;
+
+  // MaintenanceLogWriter used mainly to remove expired maintenances.
+  std::unique_ptr<MaintenanceLogWriter> maintenance_log_writer_;
+
+  // The tracer responsible for tracing maintenance manager events.
+  std::unique_ptr<MaintenanceManagerTracer> tracer_;
 };
 
 /*
@@ -236,8 +273,7 @@ class MaintenanceManager : public SerialWorkContext {
   folly::SemiFuture<folly::Expected<ShardOperationalState, Status>>
   getShardOperationalState(ShardID shard);
   // Getter that returns a SemiFuture with ShardDataHealth for the given shard
-  folly::SemiFuture<folly::Expected<ShardDataHealth, Status>>
-  getShardDataHealth(ShardID shard);
+  folly::SemiFuture<ShardDataHealth> getShardDataHealth(ShardID shard);
   // Getter that returns a SemiFuture with SequencingState for the gievn node
   folly::SemiFuture<folly::Expected<SequencingState, Status>>
   getSequencingState(node_index_t node);
@@ -271,12 +307,8 @@ class MaintenanceManager : public SerialWorkContext {
    *         as unrecoverable.
    *         Error status can be
    *            E::NOTREADY if MaintenanceManager is not fully ready yet
-   *            E::EMPTY  if there are no shards that are UNAVAILABLE
-   *            E::FAILED if all shards failed to be marked as unrecoverable
-   *          Note: if request succeeds partially(i.e some shards are marked
-   * successfully while some fail) the overall request itself is considered
-   * successful (i.e error wont be set) but the resultant value vector will be
-   * filled appropriately with succeeded and failed shards
+   * If all shards fail to be marked unrecoverable, the success list will be
+   * empty and the failure list will contain all these shards.
    */
   folly::SemiFuture<MarkAllShardsUnrecoverableResult>
   markAllShardsUnrecoverable(std::string user, std::string reason);
@@ -342,6 +374,10 @@ class MaintenanceManager : public SerialWorkContext {
       return WorkerType::BACKGROUND;
     }
     return WorkerType::GENERAL;
+  }
+
+  MaintenanceManagerTracer* getTracer() const {
+    return deps_->getTracer();
   }
 
  protected:
@@ -432,12 +468,10 @@ class MaintenanceManager : public SerialWorkContext {
    * Getter that returns ShardDataHealth for the given shard
    *
    * @param   shard ShardID for which to get ShardDataHealth
-   * @return  folly::Expected<ShardDataHealth, Status>
-   *          ShardDataHealth or E::NOTREADY if EventLogRebuildingSet
+   * @return  ShardDataHealth::UNKNOWN if EventLogRebuildingSet
    *          is not initalized
    */
-  folly::Expected<ShardDataHealth, Status>
-  getShardDataHealthInternal(ShardID shard) const;
+  ShardDataHealth getShardDataHealthInternal(ShardID shard) const;
   // Getter that returns SequencingState for the gievn node
   SequencingState getSequencingStateInternal(node_index_t node) const;
   /**
@@ -560,7 +594,7 @@ class MaintenanceManager : public SerialWorkContext {
   bool has_shards_to_enable_;
 
   // Returns the transition expected by shard workflow
-  virtual membership::StorageStateTransition
+  virtual folly::Optional<membership::StorageStateTransition>
   getExpectedStorageStateTransition(ShardID shard);
 
   // Returns the required conditions for given shard and transition
@@ -647,6 +681,18 @@ class MaintenanceManager : public SerialWorkContext {
 
   bool metadata_nodeset_update_in_flight_{false};
 
+  // Indicates that there's currently a delta issues by the maintenance manager
+  // to remove some maintenances in flight. This is used avoid send multiple
+  // deltas to remove the same maintenances.
+  std::atomic<bool> remove_maintenance_delta_in_flight_{false};
+
+  // A tracer sample to collect stats about the maintenance manager evaluation
+  // loop. It gets reseted in each evaluation loop.
+  // MaintenanceManager evaluation loop is single threaded, so no
+  // synchronization is needed here. This is a member variable to avoid
+  // polluting the MM API by passing the sample around.
+  MaintenanceManagerTracer::PeriodicStateSample state_tracer_sample_;
+
   virtual void activateReevaluationTimer();
 
   virtual void cancelReevaluationTimer();
@@ -671,6 +717,16 @@ class MaintenanceManager : public SerialWorkContext {
   // otherwise returns RebuildingMode::INVALID
   virtual RebuildingMode getCurrentRebuildingMode(ShardID shard);
 
+  // Returns true if the drain flag is set for this
+  // shard in the EventlogRebuildingSet
+  bool isShardDraining(const ShardID& shard) const;
+
+  // Returns true if the rebuilding is *not* authoritative by looking up
+  // the shard in EventLogRebuildingSet.
+  // Note: If the given shard does not exist in rebuilding set, this will
+  // return false
+  bool isRebuildingNonAuthoritative(const ShardID& shard) const;
+
   // Answers the question whether the current operational state of a shard meets
   // a target maintenance or not.
   static bool isTargetAchieved(ShardOperationalState current,
@@ -682,6 +738,16 @@ class MaintenanceManager : public SerialWorkContext {
   bool isBootstrappingCluster() const;
 
   folly::SemiFuture<Status> writeShardUnrecoverable(const ShardID& shard);
+
+  /**
+   * Writes to the maintenance log deltas removing:
+   *  - Maintenances where all of their nodes are not in the config anymore.
+   * This happens asynchronusly and its effect will then appear when MM detects
+   * the written delta.
+   */
+  void
+  purgeExpiredMaintenances(const std::vector<MaintenanceDefinition>&,
+                           const configuration::nodes::NodesConfiguration&);
 
   friend class MaintenanceManagerTest;
 };

@@ -88,10 +88,10 @@ std::shared_ptr<Sequencer> AllSequencers::findSequencer(logid_t logid) {
     return getMetaDataLogSequencer(logid);
   }
 
-  folly::SharedMutex::ReadHolder map_lock(map_mutex_);
+  folly::SharedMutex::ReadHolder map_lock(sequencer_map_mutex_);
   // data log id
-  auto it = map_.find(logid.val_);
-  if (it == map_.end()) {
+  auto it = sequencer_map_.find(logid.val_);
+  if (it == sequencer_map_.end()) {
     err = E::NOSEQUENCER;
     return nullptr;
   }
@@ -115,8 +115,7 @@ int AllSequencers::activateSequencer(
   ld_check(!MetaDataLog::isMetaDataLog(logid));
 
   std::shared_ptr<Configuration> cfg = updateable_config_->get();
-  const std::shared_ptr<LogsConfig::LogGroupNode> logcfg =
-      cfg->getLogGroupByIDShared(logid);
+  const auto logcfg = cfg->getLogGroupByIDShared(logid);
   if (!logcfg) {
     err = E::NOTFOUND;
     return -1;
@@ -128,9 +127,9 @@ int AllSequencers::activateSequencer(
     return -1;
   }
 
-  folly::SharedMutex::UpgradeHolder map_lock(map_mutex_);
-  auto it = map_.find(logid.val_);
-  if (it != map_.end()) {
+  folly::SharedMutex::UpgradeHolder map_lock(sequencer_map_mutex_);
+  auto it = sequencer_map_.find(logid.val_);
+  if (it != sequencer_map_.end()) {
     // Already have a Sequencer for this log, check state. In order to
     // avoid shutdown crashes all threads that may run activateSequencer()
     // must stop before this AllSequencers object (a subobject of Processor)
@@ -144,7 +143,8 @@ int AllSequencers::activateSequencer(
     // of the shared lock
     seq = createSequencer(logid, settings_);
     folly::SharedMutex::WriteHolder map_write_lock(std::move(map_lock));
-    auto insertion_result = map_.insert(std::make_pair(logid.val(), seq));
+    auto insertion_result =
+        sequencer_map_.insert(std::make_pair(logid.val(), seq));
 
     ld_check(insertion_result.second);
   }
@@ -194,6 +194,10 @@ int AllSequencers::getEpochMetaData(
                                   activation_reason,
                                   std::move(info),
                                   std::move(meta_properties));
+    ld_spew("[sequencer_activity_in_progress--] Got epoch metadata from epoch "
+            "store for log %lu",
+            _logid.val());
+    STAT_DECR(getStats(), sequencer_activity_in_progress);
   };
 
   // To verify metadata log being empty before provisioning the log, simply
@@ -235,6 +239,11 @@ int AllSequencers::getEpochMetaData(
     err = E::AGAIN;
     return -1;
   }
+
+  ld_spew("[sequencer_activity_in_progress++] Fetching epoch metadata from "
+          "epoch store for log %lu",
+          logid.val());
+  STAT_INCR(getStats(), sequencer_activity_in_progress);
 
   return 0;
 }
@@ -411,7 +420,7 @@ void AllSequencers::notifyWorkerActivationCompletion(logid_t logid, Status st) {
        worker->processor_->getWorkerCount(WorkerType::GENERAL);
        ++worker_idx.val_) {
     std::unique_ptr<Request> rq = std::make_unique<ActivationCompletionRequest>(
-        completion_callback, worker_idx, st, logid);
+        completion_callback, worker_idx, WorkerType::GENERAL, st, logid);
 
     int rv = worker->processor_->postWithRetrying(rq);
     if (rv != 0 && err != E::SHUTDOWN) {
@@ -451,8 +460,7 @@ void AllSequencers::onEpochMetaDataFromEpochStore(
 
   std::shared_ptr<Configuration> cfg = updateable_config_->get();
   ld_check(cfg != nullptr);
-  const std::shared_ptr<LogsConfig::LogGroupNode> logcfg =
-      cfg->getLogGroupByIDShared(logid);
+  const auto logcfg = cfg->getLogGroupByIDShared(logid);
   if (!logcfg) {
     ld_info(
         "Not activating sequencer for log %lu that was removed from config.",
@@ -673,7 +681,7 @@ void AllSequencers::notePreemption(logid_t logid,
                                    Sequencer* seq,
                                    const char* context) {
   ld_check(seq != nullptr);
-  if (!meta_props || !meta_props->last_writer_node_id.hasValue()) {
+  if (!meta_props || !meta_props->last_writer_node_id.has_value()) {
     RATELIMIT_WARNING(
         std::chrono::seconds(10),
         2,
@@ -929,7 +937,7 @@ void AllSequencers::notifyMetaDataLogWriterOnActivation(Sequencer* seq,
                                                         bool bypass_recovery) {
   ld_check(seq != nullptr);
   const logid_t logid = seq->getLogID();
-  auto meta_writer = seq->getMetaDataLogWriter();
+  MetaDataLogWriter* meta_writer = seq->getMetaDataLogWriter();
   // must be a data log sequencer
   ld_check(meta_writer);
   meta_writer->onDataSequencerReactivated(epoch);
@@ -957,16 +965,16 @@ void AllSequencers::notifyMetaDataLogWriterOnActivation(Sequencer* seq,
 void AllSequencers::noteConfigurationChanged() {
   if (!processor_->hasMyNodeID()) {
     // not a server node
-    ld_check(map_.empty());
+    ld_check(sequencer_map_.empty());
     return;
   }
   std::vector<logid_t> log_ids;
   {
     folly::stop_watch<std::chrono::milliseconds> watch;
-    folly::SharedMutex::ReadHolder map_lock(map_mutex_);
+    folly::SharedMutex::ReadHolder map_lock(sequencer_map_mutex_);
     uint64_t lock_ms = watch.lap().count();
-    for (auto const& x : map_) {
-      log_ids.push_back(logid_t(x.first));
+    for (auto const& [log_id, _] : sequencer_map_) {
+      log_ids.push_back(logid_t(log_id));
     }
     ld_info("Acquiring lock for sequencer map took %lums", lock_ms);
   }
@@ -977,29 +985,29 @@ void AllSequencers::noteConfigurationChanged() {
 }
 
 void AllSequencers::shutdown() {
-  folly::SharedMutex::ReadHolder map_lock(map_mutex_);
-  for (auto const& x : map_) {
-    x.second->shutdown();
+  folly::SharedMutex::ReadHolder map_lock(sequencer_map_mutex_);
+  for (auto const& [_, sequencer] : sequencer_map_) {
+    sequencer->shutdown();
   }
 }
 
 AllSequencers::Accessor::Accessor(AllSequencers* owner)
-    : owner_(owner), map_lock_(owner_->map_mutex_) {}
+    : owner_(owner), map_lock_(owner_->sequencer_map_mutex_) {}
 
 AllSequencers::Accessor AllSequencers::accessAll() {
   return Accessor(this);
 }
 AllSequencers::Accessor::Iterator AllSequencers::Accessor::begin() {
-  return Iterator(owner_->map_.begin());
+  return Iterator(owner_->sequencer_map_.begin());
 }
 AllSequencers::Accessor::Iterator AllSequencers::Accessor::end() {
-  return Iterator(owner_->map_.end());
+  return Iterator(owner_->sequencer_map_.end());
 }
 
 std::vector<std::shared_ptr<Sequencer>> AllSequencers::getAll() {
   std::vector<std::shared_ptr<Sequencer>> out;
-  folly::SharedMutex::ReadHolder map_lock(map_mutex_);
-  for (auto& p : map_) {
+  folly::SharedMutex::ReadHolder map_lock(sequencer_map_mutex_);
+  for (auto& p : sequencer_map_) {
     out.push_back(p.second);
   }
   return out;
@@ -1034,9 +1042,17 @@ AllSequencers::getMetaDataLogSequencer(logid_t datalog_id) {
 }
 
 void AllSequencers::disableAllSequencersDueToIsolation() {
-  folly::SharedMutex::ReadHolder map_lock(map_mutex_);
-  for (const auto& x : map_) {
-    x.second->onNodeIsolated();
+  folly::SharedMutex::ReadHolder map_lock(sequencer_map_mutex_);
+  for (const auto& [_, sequencer] : sequencer_map_) {
+    sequencer->onNodeIsolated();
   }
 }
+
+void AllSequencers::onSettingsUpdated() {
+  folly::SharedMutex::ReadHolder map_lock(sequencer_map_mutex_);
+  for (const auto& [_, sequencer] : sequencer_map_) {
+    sequencer->onSettingsUpdated();
+  }
+}
+
 }} // namespace facebook::logdevice

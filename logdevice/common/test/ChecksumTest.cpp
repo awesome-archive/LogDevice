@@ -12,8 +12,6 @@
 #include <folly/ScopeGuard.h>
 #include <gtest/gtest.h>
 
-#include "event2/buffer.h"
-#include "logdevice/common/libevent/compat.h"
 #include "logdevice/common/protocol/APPEND_Message.h"
 #include "logdevice/common/protocol/ProtocolReader.h"
 #include "logdevice/common/protocol/ProtocolWriter.h"
@@ -29,7 +27,7 @@ class ChecksumTest : public ::testing::Test {
   int verifyChecksum(const RECORD_Message& msg) {
     return msg.verifyChecksum();
   }
-  const Payload& getPayload(const RECORD_Message& msg) {
+  const PayloadHolder& getPayload(const RECORD_Message& msg) {
     return msg.payload_;
   }
 
@@ -37,7 +35,7 @@ class ChecksumTest : public ::testing::Test {
   // checksums:
   // (1) An APPEND message is created on the client with the client's payload
   //     ("123456789").
-  // (2) The APPEND message is serialized into an evbuffer, at which time the
+  // (2) The APPEND message is serialized into folly::IOBuf, at which time the
   //     checksum (if requested) is injected at the front of the payload.
   // (3) The APPEND message makes it to the server cluster, record gets stored.
   // (4) Later on, the client tries to reads the record.
@@ -46,10 +44,10 @@ class ChecksumTest : public ::testing::Test {
   // (6) A RECORD message is created on the server, serialized and
   //     deserialized on the client.
   // (7) The "received" RECORD message is returned by this method.
-  std::unique_ptr<RECORD_Message> roundTrip(
-      APPEND_flags_t checksum_flags,
-      std::function<void(RECORD_flags_t& checksum_flags, Payload& payload)>
-          mutation = nullptr);
+  std::unique_ptr<RECORD_Message>
+  roundTrip(APPEND_flags_t checksum_flags,
+            std::function<void(RECORD_flags_t& checksum_flags, Payload payload)>
+                mutation = nullptr);
 };
 
 // This test guards against the underlying checksum implementations changing
@@ -62,7 +60,7 @@ TEST_F(ChecksumTest, Invariable) {
 
 std::unique_ptr<RECORD_Message> ChecksumTest::roundTrip(
     APPEND_flags_t checksum_flags,
-    std::function<void(RECORD_flags_t&, Payload&)> mutation) {
+    std::function<void(RECORD_flags_t&, Payload)> mutation) {
   // Assert that parity of outgoing flags checks out
   bool expected_parity = bool(checksum_flags & APPEND_Header::CHECKSUM) ==
       bool(checksum_flags & APPEND_Header::CHECKSUM_64BIT);
@@ -74,29 +72,25 @@ std::unique_ptr<RECORD_Message> ChecksumTest::roundTrip(
   {
     APPEND_Header ap_send_hdr = {
         request_id_t(1), logid_t(1), EPOCH_INVALID, 0, checksum_flags};
-    PayloadHolder ph(Payload("123456789", 9), PayloadHolder::UNOWNED);
+    PayloadHolder ph = PayloadHolder::copyString("123456789");
     AppendAttributes attrs;
     attrs.optional_keys[KeyType::FINDKEY] = std::string("abcdefgh");
     ap_send_hdr.flags |= APPEND_Header::CUSTOM_KEY;
     APPEND_Message ap_send_msg(ap_send_hdr, LSN_INVALID, attrs, std::move(ph));
-    struct evbuffer* ap_send_evbuf = LD_EV(evbuffer_new)();
-    SCOPE_EXIT {
-      LD_EV(evbuffer_free)(ap_send_evbuf);
-    };
 
-    ProtocolWriter writer(ap_send_msg.type_,
-                          ap_send_evbuf,
-                          Compatibility::MAX_PROTOCOL_SUPPORTED);
+    std::unique_ptr<folly::IOBuf> buffer =
+        folly::IOBuf::create(IOBUF_ALLOCATION_UNIT);
+    ProtocolWriter writer(
+        ap_send_msg.type_, buffer.get(), Compatibility::MAX_PROTOCOL_SUPPORTED);
     ap_send_msg.serialize(writer);
     ssize_t ap_send_size = writer.result();
     ld_check(ap_send_size > 0);
-
+    buffer->coalesce();
     ProtocolReader reader(MessageType::APPEND,
-                          ap_send_evbuf,
-                          ap_send_size,
+                          std::move(buffer),
                           Compatibility::MAX_PROTOCOL_SUPPORTED);
     ap_recv_msg = checked_downcast<std::unique_ptr<APPEND_Message>>(
-        APPEND_Message::deserialize(reader, 1024).msg);
+        APPEND_Message::deserialize(reader).msg);
     ld_check(ap_recv_msg);
   }
 
@@ -106,31 +100,27 @@ std::unique_ptr<RECORD_Message> ChecksumTest::roundTrip(
   RECORD_flags_t flags = ap_recv_msg->header_.flags &
       (APPEND_Header::CHECKSUM | APPEND_Header::CHECKSUM_64BIT |
        APPEND_Header::CHECKSUM_PARITY);
-  Payload payload = ap_recv_payload.dup();
+  PayloadHolder payload = PayloadHolder::copyPayload(ap_recv_payload);
   if (mutation) {
-    mutation(flags, payload);
+    mutation(flags, payload.getPayload());
   }
 
   RECORD_Header record_send_hdr = {
       logid_t(1), read_stream_id_t(1), LSN_OLDEST, 0, flags};
 
   RECORD_Message record_send_msg(
-      record_send_hdr, TrafficClass::READ_TAIL, std::move(payload), nullptr);
-  struct evbuffer* record_send_evbuf = LD_EV(evbuffer_new)();
-  SCOPE_EXIT {
-    LD_EV(evbuffer_free)(record_send_evbuf);
-  };
-
+      record_send_hdr, TrafficClass::READ_TAIL, payload, nullptr);
+  std::unique_ptr<folly::IOBuf> buffer =
+      folly::IOBuf::create(IOBUF_ALLOCATION_UNIT);
   ProtocolWriter writer(record_send_msg.type_,
-                        record_send_evbuf,
+                        buffer.get(),
                         Compatibility::MAX_PROTOCOL_SUPPORTED);
   record_send_msg.serialize(writer);
   ssize_t record_send_size = writer.result();
   ld_check(record_send_size > 0);
-
+  buffer->coalesce();
   ProtocolReader reader(MessageType::RECORD,
-                        record_send_evbuf,
-                        record_send_size,
+                        std::move(buffer),
                         Compatibility::MAX_PROTOCOL_SUPPORTED);
   return checked_downcast<std::unique_ptr<RECORD_Message>>(
       RECORD_Message::deserialize(reader).msg);
@@ -166,8 +156,9 @@ TEST_F(ChecksumTest, RoundTripNoChecksumSuccess) {
 // there was a checksum
 
 static void payload_bit_flip(RECORD_flags_t& /*checksum_flags*/,
-                             Payload& payload) {
-  ((char*)payload.data())[payload.size() - 1] ^= 1 << 5;
+                             Payload payload) {
+  const_cast<char*>(reinterpret_cast<const char*>(
+      payload.data()))[payload.size() - 1] ^= 1 << 5;
 }
 
 TEST_F(ChecksumTest, RoundTrip32PayloadBitFlip) {
@@ -188,7 +179,7 @@ TEST_F(ChecksumTest, RoundTripNoChecksumPayloadBitFlip) {
 
 // If flags get corrupted (zeroed out), we should be able to detect that
 
-static void flags_zeroed(RECORD_flags_t& checksum_flags, Payload& /*payload*/) {
+static void flags_zeroed(RECORD_flags_t& checksum_flags, Payload /*payload*/) {
   checksum_flags &= ~(APPEND_Header::CHECKSUM | APPEND_Header::CHECKSUM_64BIT |
                       APPEND_Header::CHECKSUM_PARITY);
 }

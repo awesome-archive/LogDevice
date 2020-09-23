@@ -93,8 +93,6 @@ static std::set<std::string>& allowedStats() {
 }
 
 std::string StatsThroughput::getUsage() {
-  using namespace std::chrono;
-
   return "Reports estimated per-log-group append/read throughput over the "
          "specified "
          "time periods.  Result unit is B/s.  "

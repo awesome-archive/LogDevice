@@ -15,7 +15,6 @@ from ldops.const import ALL_SHARDS
 from ldops.exceptions import NodeNotFoundError
 from ldops.types.maintenance_view import MaintenanceView
 from ldops.types.node_view import NodeView
-from logdevice.admin.common.types import NodeID, ShardID
 from logdevice.admin.maintenance.types import MaintenanceDefinition, MaintenanceProgress
 from logdevice.admin.nodes.types import (
     NodeConfig,
@@ -23,6 +22,7 @@ from logdevice.admin.nodes.types import (
     SequencingState,
     ShardOperationalState,
 )
+from logdevice.common.types import NodeID, ShardID
 
 
 @dataclass
@@ -75,6 +75,7 @@ class ClusterView:
                     )
                 )
             )
+        # pyre-fixme[7]: Expected `Tuple[int, ...]` but got `Optional[Tuple[int, ...]]`.
         return self._node_indexes_tuple
 
     @property
@@ -83,6 +84,8 @@ class ClusterView:
             self._node_index_to_node_config_dict = {
                 nc.node_index: nc for nc in self.nodes_config
             }
+        # pyre-fixme[7]: Expected `Dict[int, NodeConfig]` but got
+        #  `Optional[Dict[int, NodeConfig]]`.
         return self._node_index_to_node_config_dict
 
     @property
@@ -91,6 +94,8 @@ class ClusterView:
             self._node_index_to_node_state_dict = {
                 ns.node_index: ns for ns in self.nodes_state
             }
+        # pyre-fixme[7]: Expected `Dict[int, NodeState]` but got `Optional[Dict[int,
+        #  NodeState]]`.
         return self._node_index_to_node_state_dict
 
     @property
@@ -113,10 +118,6 @@ class ClusterView:
                 )
                 for ni in nis:
                     if mnt.group_id is not None:
-                        # pyre-fixme[6]: Expected `int` for 1st param but got
-                        #  `Optional[int]`.
-                        # pyre-fixme[6]: Expected `str` for 1st param but got
-                        #  `Optional[str]`.
                         ni_to_mnt_ids[ni].append(mnt.group_id)
 
             self._node_index_to_maintenance_ids_dict = {
@@ -132,6 +133,7 @@ class ClusterView:
             self._maintenance_ids_tuple = tuple(
                 sorted(str(mnt.group_id) for mnt in self.maintenances)
             )
+        # pyre-fixme[7]: Expected `Tuple[str, ...]` but got `Optional[Tuple[str, ...]]`.
         return self._maintenance_ids_tuple
 
     @property
@@ -140,13 +142,13 @@ class ClusterView:
             self._maintenance_id_to_maintenance_dict = {
                 str(mnt.group_id): mnt for mnt in self.maintenances
             }
+        # pyre-fixme[7]: Expected `Dict[str, MaintenanceDefinition]` but got
+        #  `Optional[Dict[str, MaintenanceDefinition]]`.
         return self._maintenance_id_to_maintenance_dict
 
     @property
     def _maintenance_id_to_node_indexes(self) -> Dict[str, Tuple[int, ...]]:
         if self._maintenance_id_to_node_indexes_dict is None:
-            # pyre-fixme[8]: Attribute has type `Optional[Dict[str, Tuple[int,
-            #  ...]]]`; used as `Dict[Optional[str], Tuple[Optional[int], ...]]`.
             self._maintenance_id_to_node_indexes_dict = {
                 mnt.group_id: tuple(
                     sorted(
@@ -185,11 +187,13 @@ class ClusterView:
                 )
                 for mnt_id in self._maintenance_ids
             }
+        # pyre-fixme[7]: Expected `Dict[str, MaintenanceView]` but got
+        #  `Optional[Dict[str, MaintenanceView]]`.
         return self._maintenance_id_to_maintenance_view_dict
 
     @property
     def _node_index_to_maintenances(
-        self
+        self,
     ) -> Dict[int, Tuple[MaintenanceDefinition, ...]]:
         if self._node_index_to_maintenances_dict is None:
             self._node_index_to_maintenances_dict = {
@@ -199,6 +203,8 @@ class ClusterView:
                 )
                 for ni in self._node_indexes
             }
+        # pyre-fixme[7]: Expected `Dict[int, Tuple[MaintenanceDefinition, ...]]` but
+        #  got `Optional[Dict[int, Tuple[MaintenanceDefinition, ...]]]`.
         return self._node_index_to_maintenances_dict
 
     @property
@@ -212,6 +218,8 @@ class ClusterView:
                 )
                 for ni in self._node_indexes
             }
+        # pyre-fixme[7]: Expected `Dict[int, NodeView]` but got `Optional[Dict[int,
+        #  NodeView]]`.
         return self._node_index_to_node_view_dict
 
     @property
@@ -220,6 +228,8 @@ class ClusterView:
             self._node_name_to_node_view_dict = {
                 nv.node_name: nv for nv in self._node_index_to_node_view.values()
             }
+        # pyre-fixme[7]: Expected `Dict[str, NodeView]` but got `Optional[Dict[str,
+        #  NodeView]]`.
         return self._node_name_to_node_view_dict
 
     ### Public interface
@@ -263,6 +273,9 @@ class ClusterView:
             node_view = self.get_node_view(
                 node_index=shard.node.node_index, node_name=shard.node.name
             )
+            if not node_view.is_storage:
+                continue
+
             if shard.shard_index == ALL_SHARDS:
                 r = range(0, node_view.num_shards)
             else:
@@ -351,7 +364,7 @@ class ClusterView:
         elif by_node_name is not None:
             return by_node_name
         else:
-            assert False, "unreachable"  # pragma: nocover
+            raise AssertionError("unreachable")  # pragma: nocover
 
     def get_node_index(self, node_name: str) -> int:
         return self.get_node_view(node_name=node_name).node_index
@@ -413,20 +426,48 @@ class ClusterView:
         mvs = self.get_all_maintenance_views()
 
         if node_ids is not None:
-            sequencer_nodes = list(sequencer_nodes or []) + list(node_ids)
-            shards = list(shards or []) + [
-                ShardID(node=node_id, shard_index=ALL_SHARDS) for node_id in node_ids
-            ]
+            search_shards = self.expand_shards(
+                [ShardID(node=node_id, shard_index=ALL_SHARDS) for node_id in node_ids]
+            )
+
+            normalized_sequencer_node_indexes = tuple(
+                sorted(
+                    # pyre-fixme[6]: Expected `Iterable[Variable[_LT (bound to
+                    #  _SupportsLessThan)]]` for 1st param but got
+                    #  `Generator[Optional[int], None, None]`.
+                    self.normalize_node_id(node_id).node_index
+                    for node_id in node_ids
+                )
+            )
+
+            # Note that there might be maintenances on sequencer-only or
+            # storage-only nodes, we want the filter in this case to be OR-ed.
+            # If we don't have shards or sequencers to find then we return an
+            # empty generator.
+            mvs = (
+                mv
+                for mv in mvs
+                if (search_shards and self.expand_shards(mv.shards) == search_shards)
+                or (
+                    # NOTE: This relies on the assumption that
+                    # mv.affected_sequencer_node_indexes
+                    # is also sorted.
+                    normalized_sequencer_node_indexes
+                    and normalized_sequencer_node_indexes
+                    == mv.affected_sequencer_node_indexes
+                )
+            )
 
         if shards is not None:
             search_shards = self.expand_shards(shards)
+            # NOTE: This relies on the assumption that mv.shards is also sorted.
             mvs = (mv for mv in mvs if self.expand_shards(mv.shards) == search_shards)
-
-        if shard_target_state is not None:
-            mvs = (mv for mv in mvs if shard_target_state == mv.shard_target_state)
 
         if sequencer_nodes is not None:
             normalized_sequencer_node_indexes = tuple(
+                # pyre-fixme[6]: Expected `Iterable[Variable[_LT (bound to
+                #  _SupportsLessThan)]]` for 1st param but got
+                #  `Generator[Optional[int], None, None]`.
                 sorted(self.normalize_node_id(n).node_index for n in sequencer_nodes)
             )
             mvs = (
@@ -435,6 +476,9 @@ class ClusterView:
                 if normalized_sequencer_node_indexes
                 == mv.affected_sequencer_node_indexes
             )
+
+        if shard_target_state is not None:
+            mvs = (mv for mv in mvs if shard_target_state == mv.shard_target_state)
 
         if sequencer_target_state is not None:
             mvs = (

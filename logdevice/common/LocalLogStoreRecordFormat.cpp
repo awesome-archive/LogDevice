@@ -258,13 +258,13 @@ Slice formCopySetIndexEntry(uint32_t wave,
                             std::string* buf) {
   buf->clear();
 
-  if (!block_starting_lsn.hasValue()) {
+  if (!block_starting_lsn.has_value()) {
     // not writing copyset index entry
     return Slice(nullptr, 0);
   }
 
   // Writing single entry
-  ld_check(block_starting_lsn.hasValue());
+  ld_check(block_starting_lsn.has_value());
   ld_check_eq(block_starting_lsn.value(), LSN_INVALID);
   // TODO: block entry support (t9002309), will use the block starting lsn then
   size_t nbytes = sizeof(wave) + sizeof(flags) + sizeof(copyset_size) +
@@ -985,6 +985,7 @@ std::string flagsToString(flags_t flags) {
   FLAG(SHARD_ID)
   FLAG(OFFSET_MAP)
   FLAG(WRITE_STREAM)
+  FLAG(PAYLOAD_GROUP)
 
 #undef FLAG
 

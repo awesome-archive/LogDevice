@@ -58,14 +58,14 @@ struct StressTestLSNUpdatingThread : boost::noncopyable {
  * However, it is a useful stress test for the map's implementation.
  */
 TEST(LogStorageStateMapTest, StressTestLSNUpdating) {
-  LogStorageStateMap map(1);
+  LogStorageStateMap map(1, /*stats*/ nullptr, /*record cache*/ false);
 
   // Initialize LogStorageState instances for all logs
   for (int log_id = 1; log_id <= STRESS_TEST_LOGS; ++log_id) {
     LogStorageState* log_state = map.insertOrGet(logid_t(log_id), THIS_SHARD);
     ASSERT_NE(log_state, nullptr);
     auto lsn_state = log_state->getLastReleasedLSN();
-    ASSERT_FALSE(lsn_state.hasValue());
+    ASSERT_TRUE(lsn_state.value() == LSN_INVALID);
   }
 
   std::deque<StressTestLSNUpdatingThread> instances;
@@ -98,7 +98,6 @@ TEST(LogStorageStateMapTest, StressTestLSNUpdating) {
 
   for (int log_id = 1; log_id <= STRESS_TEST_LOGS; ++log_id) {
     auto state = map.get(logid_t(log_id), THIS_SHARD).getLastReleasedLSN();
-    ASSERT_TRUE(state.hasValue());
     EXPECT_EQ(lsn_t(STRESS_TEST_LSNS), state.value());
   }
 }
@@ -107,7 +106,7 @@ TEST(LogStorageStateMapTest, StressTestLSNUpdating) {
  * Basic test for worker subscriptions.
  */
 TEST(LogStorageStateMapTest, WorkerSubscriptions) {
-  LogStorageStateMap map(1);
+  LogStorageStateMap map(1, /*stats*/ nullptr, /*record_cache*/ false);
   LogStorageState log_state(logid_t(22), THIS_SHARD, &map);
   const int nworkers = 8;
 
@@ -131,7 +130,7 @@ TEST(LogStorageStateMapTest, WorkerSubscriptions) {
 }
 
 TEST(LogStorageStateMapTest, LastReleasedLSNSource) {
-  LogStorageStateMap map(1);
+  LogStorageStateMap map(1, /*stats*/ nullptr, /*record_cache*/ false);
   LogStorageState log_state(logid_t(42), THIS_SHARD, &map);
 
   int rv = log_state.updateLastReleasedLSN(
@@ -143,7 +142,6 @@ TEST(LogStorageStateMapTest, LastReleasedLSNSource) {
   ASSERT_EQ(0, rv);
 
   auto released_state = log_state.getLastReleasedLSN();
-  ASSERT_TRUE(released_state.hasValue());
   EXPECT_EQ(2, released_state.value());
   EXPECT_EQ(
       LogStorageState::LastReleasedSource::RELEASE, released_state.source());

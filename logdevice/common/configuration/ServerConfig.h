@@ -25,11 +25,9 @@
 #include "logdevice/common/configuration/LogsConfig.h"
 #include "logdevice/common/configuration/MetaDataLogsConfig.h"
 #include "logdevice/common/configuration/Node.h"
-#include "logdevice/common/configuration/NodesConfig.h"
 #include "logdevice/common/configuration/PrincipalsConfig.h"
 #include "logdevice/common/configuration/SecurityConfig.h"
 #include "logdevice/common/configuration/SequencersConfig.h"
-#include "logdevice/common/configuration/TraceLoggerConfig.h"
 #include "logdevice/common/configuration/TrafficShapingConfig.h"
 #include "logdevice/common/configuration/ZookeeperConfig.h"
 #include "logdevice/common/configuration/nodes/NodesConfiguration.h"
@@ -55,13 +53,10 @@ class ServerConfig {
       facebook::logdevice::configuration::MetaDataLogsConfig;
   using Node = facebook::logdevice::configuration::Node;
   using Nodes = facebook::logdevice::configuration::Nodes;
-  using NodesConfig = facebook::logdevice::configuration::NodesConfig;
   using NodesConfiguration = configuration::nodes::NodesConfiguration;
   using PrincipalsConfig = facebook::logdevice::configuration::PrincipalsConfig;
   using SecurityConfig = facebook::logdevice::configuration::SecurityConfig;
   using SequencersConfig = facebook::logdevice::configuration::SequencersConfig;
-  using TraceLoggerConfig =
-      facebook::logdevice::configuration::TraceLoggerConfig;
   using ShapingConfig = facebook::logdevice::configuration::ShapingConfig;
   using TrafficShapingConfig =
       facebook::logdevice::configuration::TrafficShapingConfig;
@@ -140,78 +135,12 @@ class ServerConfig {
     version_ = version;
   }
 
-  void setNodesConfigurationVersion(config_version_t version) {
-    nodesConfig_.setNodesConfigurationVersion(version);
-  }
-
   /**
    * Returns the version of this config
    */
   config_version_t getVersion() const {
     return version_;
   }
-
-  /**
-   * Gets all nodes.
-   */
-  const Nodes& getNodes() const {
-    return nodesConfig_.getNodes();
-  }
-
-  /**
-   * Returns a description of sequencer nodes in the cluster.
-   * NOTE: being DEPRECATED. Use NodesConfiguration::getSequencersConfig()
-   * instead.
-   */
-  const SequencersConfig& getSequencers_DEPRECATED() const {
-    return sequencersConfig_;
-  }
-
-  /**
-   * Looks up a node by index.
-   *
-   * @return On success, returns a pointer to a Node object contained in
-   *         this config.  On failure, returns nullptr and sets err to:
-   *           NOTFOUND       no node with given index appears in config
-   */
-  const Node* getNode(node_index_t index) const;
-
-  /**
-   * Looks up a node by NodeID. If id.generation() == 0, ignores generation in
-   * config, i.e. equivalent to getNode(id.index()).
-   *
-   * @return On success, returns a pointer to a Node object contained in
-   *         this config.  On failure, returns nullptr and sets err to:
-   *           INVALID_PARAM  node ID was invalid
-   *           NOTFOUND       no node with given ID appears in config
-   */
-  const Node* getNode(const NodeID& id) const;
-
-  /**
-   * Returns the NodeID of the server that this config was received from.
-   * Returns an invalid NodeID if the config did not originate from a server.
-   */
-  NodeID getServerOrigin() const {
-    return server_origin_;
-  }
-
-  void setServerOrigin(const NodeID& id) {
-    server_origin_ = id;
-  }
-
-  /**
-   * Looks up the sampling percentage for a certain tracer in the config
-   *
-   * @return Returns sampling percentage when an override has been found,
-   *         folly::none otherwise
-   */
-  folly::Optional<double>
-  getTracerSamplePercentage(const std::string& key) const;
-
-  /**
-   * @return the global default sampling percentage
-   */
-  double getDefaultSamplePercentage() const;
 
   /**
    * @return if unauthenticated connections are allowed
@@ -237,22 +166,13 @@ class ServerConfig {
   void setMainConfigMetadata(const ConfigMetadata& metadata) {
     main_config_metadata_ = metadata;
   }
-  void setIncludedConfigMetadata(const ConfigMetadata& metadata) {
-    included_config_metadata_ = metadata;
-  }
 
   /**
-   * Expose the metadata of the main config and included config (URI, hash,
-   * last modified, last loaded).
-   *
-   * If there is no included config, all fields in the included config metadata
-   * will be uninitialized.
+   * Expose the metadata of the main config (URI, hash, last modified, last
+   * loaded).
    */
   const ConfigMetadata& getMainConfigMetadata() const {
     return main_config_metadata_;
-  }
-  const ConfigMetadata& getIncludedConfigMetadata() const {
-    return included_config_metadata_;
   }
 
   /**
@@ -299,37 +219,17 @@ class ServerConfig {
     return metaDataLogsConfig_;
   }
 
-  const NodesConfig& getNodesConfig() const {
-    return nodesConfig_;
-  }
-
   /**
-   * Get the new representation of cluster nodes (i.e. NodesConfiguration
-   * class). reiterate the _FromServerConfigSource_ part to avoid confusion
-   * during NodesConfiguration migration.
-   */
-  const std::shared_ptr<const NodesConfiguration>&
-  getNodesConfigurationFromServerConfigSource() const {
-    return nodesConfig_.getNodesConfiguration();
-  }
-
-  /**
-   * Creates a ServerConfig object from existing cluster name,
-   * NodesConfig, LogsConfig, SecurityConfig instances.
-   *
-   * Note that it regenerates the new NodesConfiguration format from the
-   * existing NodesConfig and MetaDataLogsConfig. returns nullptr if the
-   * conversion failed.
+   * Creates a ServerConfig object from existing cluster name, LogsConfig,
+   * SecurityConfig instances.
    *
    * Public for testing.
    */
   static std::unique_ptr<ServerConfig> fromDataTest(
       std::string cluster_name,
-      NodesConfig nodes,
       MetaDataLogsConfig metadata_logs = MetaDataLogsConfig(),
       PrincipalsConfig = PrincipalsConfig(),
       SecurityConfig securityConfig = SecurityConfig(),
-      TraceLoggerConfig trace_config = TraceLoggerConfig(),
       TrafficShapingConfig = TrafficShapingConfig(),
       ShapingConfig =
           ShapingConfig(std::set<NodeLocationScope>{NodeLocationScope::NODE},
@@ -348,10 +248,11 @@ class ServerConfig {
   std::unique_ptr<ServerConfig> copy() const;
 
   /**
-   * Returns a clone of the ServerConfig object with the nodes section
-   * replaced by the parameter.
+   * Returns a clone of the ServerConfig object with the MetadataLogsConfig
+   * section replaced by the parameter.
    */
-  std::shared_ptr<ServerConfig> withNodes(NodesConfig) const;
+  std::shared_ptr<ServerConfig>
+      withMetaDataLogsConfig(MetaDataLogsConfig) const;
 
   /**
    * Returns a clone of the ServerConfig object with version replaced by the
@@ -365,6 +266,18 @@ class ServerConfig {
   std::shared_ptr<ServerConfig> withIncrementedVersion() const {
     return withVersion(config_version_t(getVersion().val_ + 1));
   }
+
+  /**
+   * Returns a clone of the ServerConfig object with new server settings.
+   */
+  std::shared_ptr<ServerConfig>
+  withServerSettings(SettingsConfig server_settings) const;
+
+  /**
+   * Returns a clone of the ServerConfig object with new client settings.
+   */
+  std::shared_ptr<ServerConfig>
+  withClientSettings(SettingsConfig client_settings) const;
 
   /**
    * Returns the maximum finite backlog duration of a log.
@@ -464,11 +377,9 @@ class ServerConfig {
   // and move facilities.
   //
   ServerConfig(std::string cluster_name,
-               NodesConfig nodesConfig,
                MetaDataLogsConfig metaDataLogsConfig,
                PrincipalsConfig principalConfig,
                SecurityConfig securityConfig,
-               TraceLoggerConfig traceLoggerConfig,
                TrafficShapingConfig trafficShapingConfig,
                ShapingConfig readIOShapingConfig,
                SettingsConfig serverSettingsConfig,
@@ -483,15 +394,13 @@ class ServerConfig {
   ServerConfig& operator=(ServerConfig&&) = delete;
 
   // Creates a ServerConfig object from existing cluster name,
-  // NodesConfig, LogsConfig, SecurityConfig and an optional ZookeeperConfig
+  // LogsConfig, SecurityConfig and an optional ZookeeperConfig
   // instances.
   static std::unique_ptr<ServerConfig> fromData(
       std::string cluster_name,
-      NodesConfig nodes,
       MetaDataLogsConfig metadata_logs = MetaDataLogsConfig(),
       PrincipalsConfig = PrincipalsConfig(),
       SecurityConfig securityConfig = SecurityConfig(),
-      TraceLoggerConfig trace_config = TraceLoggerConfig(),
       TrafficShapingConfig = TrafficShapingConfig(),
       ShapingConfig =
           ShapingConfig(std::set<NodeLocationScope>{NodeLocationScope::NODE},
@@ -507,14 +416,11 @@ class ServerConfig {
   std::string clusterName_;
   OptionalTimestamp clusterCreationTime_;
 
-  NodesConfig nodesConfig_;
   MetaDataLogsConfig metaDataLogsConfig_;
   PrincipalsConfig principalsConfig_;
   SecurityConfig securityConfig_;
-  SequencersConfig sequencersConfig_;
   TrafficShapingConfig trafficShapingConfig_;
   ShapingConfig readIOShapingConfig_;
-  TraceLoggerConfig traceLoggerConfig_;
   SettingsConfig serverSettingsConfig_;
   SettingsConfig clientSettingsConfig_;
   configuration::InternalLogs internalLogs_;
@@ -523,12 +429,6 @@ class ServerConfig {
 
   // version of this config
   config_version_t version_{1};
-
-  NodeID my_node_id_;
-
-  // The server this config was received from. This will be an invalid NodeID if
-  // the config did not originate at a server.
-  NodeID server_origin_;
 
   /**
    * Arbitrary fields that logdevice does not recognize
@@ -545,9 +445,8 @@ class ServerConfig {
   // The LogsConfig version at the last time toString() was called
   mutable uint64_t last_to_string_logs_config_version_{0};
 
-  // Metadata for the main config and included config
+  // Metadata for the main config
   ConfigMetadata main_config_metadata_;
-  ConfigMetadata included_config_metadata_;
 };
 
 }} // namespace facebook::logdevice

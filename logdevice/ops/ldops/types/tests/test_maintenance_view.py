@@ -16,18 +16,17 @@ from ldops.exceptions import NodeIsNotASequencerError
 from ldops.maintenance import apply_maintenance
 from ldops.testutil.async_test import async_test
 from ldops.testutil.mock_admin_api import MockAdminAPI
-from ldops.types.maintenance_overall_status import MaintenanceOverallStatus
 from ldops.types.maintenance_view import MaintenanceView
 from ldops.types.node_view import NodeView
 from ldops.types.sequencer_maintenance_progress import SequencerMaintenanceProgress
 from ldops.types.shard_maintenance_progress import ShardMaintenanceProgress
-from logdevice.admin.common.types import ShardID
-from logdevice.admin.maintenance.types import MaintenanceDefinition
+from logdevice.admin.maintenance.types import MaintenanceDefinition, MaintenanceProgress
 from logdevice.admin.nodes.types import (
     MaintenanceStatus,
     SequencingState,
     ShardOperationalState,
 )
+from logdevice.common.types import ShardID
 
 
 class TestMaintenanceView(TestCase):
@@ -136,29 +135,52 @@ class TestMaintenanceView(TestCase):
 
         self.assertListEqual(
             sorted(
-                ni.node_index for ni in maintenance_view.affected_sequencer_node_ids
+                # pyre-fixme[6]: Expected `Iterable[Variable[_LT (bound to
+                #  _SupportsLessThan)]]` for 1st param but got
+                #  `Generator[typing.Optional[int], None, None]`.
+                ni.node_index
+                for ni in maintenance_view.affected_sequencer_node_ids
             ),
+            # pyre-fixme[6]: Expected `Iterable[Variable[_LT (bound to
+            #  _SupportsLessThan)]]` for 1st param but got
+            #  `Generator[typing.Optional[int], None, None]`.
             sorted(sn.node_index for sn in maintenance.sequencer_nodes),
         )
 
         self.assertTupleEqual(
             maintenance_view.affected_sequencer_node_indexes,
+            # pyre-fixme[6]: Expected `Iterable[Variable[_LT (bound to
+            #  _SupportsLessThan)]]` for 1st param but got
+            #  `Generator[typing.Optional[int], None, None]`.
             tuple(sorted(sn.node_index for sn in maintenance.sequencer_nodes)),
         )
 
         self.assertListEqual(
+            # pyre-fixme[6]: Expected `Iterable[Variable[_LT (bound to
+            #  _SupportsLessThan)]]` for 1st param but got
+            #  `Generator[typing.Optional[int], None, None]`.
             sorted(ni.node_index for ni in maintenance_view.affected_storage_node_ids),
+            # pyre-fixme[6]: Expected `Iterable[Variable[_LT (bound to
+            #  _SupportsLessThan)]]` for 1st param but got `Set[typing.Optional[int]]`.
             sorted({shard.node.node_index for shard in maintenance.shards}),
         )
 
         self.assertTupleEqual(
             maintenance_view.affected_storage_node_indexes,
+            # pyre-fixme[6]: Expected `Iterable[Variable[_LT (bound to
+            #  _SupportsLessThan)]]` for 1st param but got `Set[typing.Optional[int]]`.
             tuple(sorted({shard.node.node_index for shard in maintenance.shards})),
         )
 
         self.assertListEqual(
+            # pyre-fixme[6]: Expected `Iterable[Variable[_LT (bound to
+            #  _SupportsLessThan)]]` for 1st param but got
+            #  `Generator[typing.Optional[int], None, None]`.
             sorted(ni.node_index for ni in maintenance_view.affected_node_ids),
             sorted(
+                # pyre-fixme[6]: Expected `Iterable[Variable[_LT (bound to
+                #  _SupportsLessThan)]]` for 1st param but got
+                #  `Set[typing.Optional[int]]`.
                 {sn.node_index for sn in maintenance.sequencer_nodes}.union(
                     {shard.node.node_index for shard in maintenance.shards}
                 )
@@ -169,6 +191,9 @@ class TestMaintenanceView(TestCase):
             maintenance_view.affected_node_indexes,
             tuple(
                 sorted(
+                    # pyre-fixme[6]: Expected `Iterable[Variable[_LT (bound to
+                    #  _SupportsLessThan)]]` for 1st param but got
+                    #  `Set[typing.Optional[int]]`.
                     {sn.node_index for sn in maintenance.sequencer_nodes}.union(
                         {shard.node.node_index for shard in maintenance.shards}
                     )
@@ -215,18 +240,19 @@ class TestMaintenanceView(TestCase):
         if maintenance.expires_on is None:
             self.assertIsNone(maintenance_view.expires_on)
         else:
-            assert maintenance_view.expires_on is not None
+            # pull these into local vars to appease pyre
+            view_expires_on = maintenance_view.expires_on
+            view_expires_in = maintenance_view.expires_in
+
+            assert view_expires_on is not None
             self.assertAlmostEqual(
-                maintenance_view.expires_on.timestamp() * 1000,
-                maintenance.expires_on,
-                1,
+                view_expires_on.timestamp() * 1000, maintenance.expires_on, 1
             )
 
-            assert maintenance_view.expires_in is not None
+            assert view_expires_in is not None
             self.assertAlmostEqual(
-                maintenance_view.expires_in.total_seconds(),
-                # pyre-fixme[16]: Optional type has no attribute `__sub__`.
-                (maintenance_view.expires_on - datetime.now()).total_seconds(),
+                view_expires_in.total_seconds(),
+                (view_expires_on - datetime.now()).total_seconds(),
                 1,
             )
 
@@ -243,7 +269,6 @@ class TestMaintenanceView(TestCase):
         for shard in maintenance.shards:
             assert shard.node.node_index is not None
             self.assertEqual(
-                # pyre-fixme[6]: Expected `int` for 1st param but got `Optional[int]`.
                 node_index_to_node_view[shard.node.node_index].shard_states[
                     shard.shard_index
                 ],
@@ -253,7 +278,6 @@ class TestMaintenanceView(TestCase):
         for sn in maintenance.sequencer_nodes:
             assert sn.node_index is not None
             self.assertEqual(
-                # pyre-fixme[6]: Expected `int` for 1st param but got `Optional[int]`.
                 node_index_to_node_view[sn.node_index].sequencer_state,
                 maintenance_view.get_sequencer_state(sn),
             )
@@ -279,11 +303,13 @@ class TestMaintenanceView(TestCase):
             shard = ShardID(
                 node=cv.get_node_view_by_node_index(0).node_id, shard_index=1
             )
-            await apply_maintenance(
+            mnts = await apply_maintenance(
                 client=client,
                 shards=[shard],
                 shard_target_state=ShardOperationalState.MAY_DISAPPEAR,
             )
+            self.assertEqual(len(mnts), 1)
+            mnt = mnts[0]
             cv = await get_cluster_view(client)
 
             # Just started
@@ -297,7 +323,8 @@ class TestMaintenanceView(TestCase):
             self.assertFalse(mv.is_blocked)
             self.assertFalse(mv.is_completed)
             self.assertTrue(mv.is_in_progress)
-            self.assertEqual(mv.overall_status, MaintenanceOverallStatus.IN_PROGRESS)
+            self.assertFalse(mv.is_internal)
+            self.assertEqual(mv.overall_status, MaintenanceProgress.IN_PROGRESS)
 
             # In progress
             client._set_shard_maintenance_progress(
@@ -321,7 +348,8 @@ class TestMaintenanceView(TestCase):
             self.assertFalse(mv.is_blocked)
             self.assertFalse(mv.is_completed)
             self.assertTrue(mv.is_in_progress)
-            self.assertEqual(mv.overall_status, MaintenanceOverallStatus.IN_PROGRESS)
+            self.assertFalse(mv.is_internal)
+            self.assertEqual(mv.overall_status, MaintenanceProgress.IN_PROGRESS)
 
             # Blocked
             client._set_shard_maintenance_progress(
@@ -334,6 +362,9 @@ class TestMaintenanceView(TestCase):
                     associated_group_ids=["johnsnow"],
                 ).to_thrift(),
             )
+            client._set_maintenance_progress(
+                mnt.group_id, MaintenanceProgress.BLOCKED_UNTIL_SAFE
+            )
             cv = await get_cluster_view(client)
             mv = list(cv.get_all_maintenance_views())[0]
             self.assertTrue(mv.is_blocked)
@@ -342,7 +373,7 @@ class TestMaintenanceView(TestCase):
             self.assertTrue(mv.is_blocked)
             self.assertFalse(mv.is_completed)
             self.assertFalse(mv.is_in_progress)
-            self.assertEqual(mv.overall_status, MaintenanceOverallStatus.BLOCKED)
+            self.assertEqual(mv.overall_status, MaintenanceProgress.BLOCKED_UNTIL_SAFE)
 
             # Done
             for sos in {
@@ -352,6 +383,9 @@ class TestMaintenanceView(TestCase):
                 ShardOperationalState.PROVISIONING,
             }:
                 client._set_shard_current_operational_state(shard, sos)
+                client._set_maintenance_progress(
+                    mnt.group_id, MaintenanceProgress.COMPLETED
+                )
                 cv = await get_cluster_view(client)
                 mv = list(cv.get_all_maintenance_views())[0]
                 self.assertEqual(
@@ -363,7 +397,7 @@ class TestMaintenanceView(TestCase):
                 self.assertFalse(mv.is_blocked)
                 self.assertTrue(mv.is_completed)
                 self.assertFalse(mv.is_in_progress)
-                self.assertEqual(mv.overall_status, MaintenanceOverallStatus.COMPLETED)
+                self.assertEqual(mv.overall_status, MaintenanceProgress.COMPLETED)
 
         ## DRAINED maintenance
         async with MockAdminAPI() as client:
@@ -415,7 +449,9 @@ class TestMaintenanceView(TestCase):
         async with MockAdminAPI() as client:
             cv = await get_cluster_view(client)
             node_id = cv.get_node_view(node_index=0).node_id
-            await apply_maintenance(client=client, sequencer_nodes=[node_id])
+            mnts = await apply_maintenance(client=client, sequencer_nodes=[node_id])
+            self.assertEqual(len(mnts), 1)
+            mnt = mnts[0]
 
             # Just started
             cv = await get_cluster_view(client)
@@ -431,7 +467,7 @@ class TestMaintenanceView(TestCase):
             self.assertFalse(mv.is_blocked)
             self.assertFalse(mv.is_completed)
             self.assertTrue(mv.is_in_progress)
-            self.assertEqual(mv.overall_status, MaintenanceOverallStatus.IN_PROGRESS)
+            self.assertEqual(mv.overall_status, MaintenanceProgress.IN_PROGRESS)
 
             # In progress
             client._set_sequencer_maintenance_progress(
@@ -455,7 +491,7 @@ class TestMaintenanceView(TestCase):
             self.assertFalse(mv.is_blocked)
             self.assertFalse(mv.is_completed)
             self.assertTrue(mv.is_in_progress)
-            self.assertEqual(mv.overall_status, MaintenanceOverallStatus.IN_PROGRESS)
+            self.assertEqual(mv.overall_status, MaintenanceProgress.IN_PROGRESS)
 
             # Blocked
             client._set_sequencer_maintenance_progress(
@@ -467,6 +503,9 @@ class TestMaintenanceView(TestCase):
                     last_updated_at=datetime.now(),
                     associated_group_ids=["johnsnow"],
                 ).to_thrift(),
+            )
+            client._set_maintenance_progress(
+                mnt.group_id, MaintenanceProgress.BLOCKED_UNTIL_SAFE
             )
             cv = await get_cluster_view(client)
             mv = list(cv.get_all_maintenance_views())[0]
@@ -480,17 +519,20 @@ class TestMaintenanceView(TestCase):
             self.assertTrue(mv.is_blocked)
             self.assertFalse(mv.is_completed)
             self.assertFalse(mv.is_in_progress)
-            self.assertEqual(mv.overall_status, MaintenanceOverallStatus.BLOCKED)
+            self.assertEqual(mv.overall_status, MaintenanceProgress.BLOCKED_UNTIL_SAFE)
 
             # Done
             client._set_sequencing_state(node_id, SequencingState.DISABLED)
+            client._set_maintenance_progress(
+                mnt.group_id, MaintenanceProgress.COMPLETED
+            )
             cv = await get_cluster_view(client)
             mv = list(cv.get_all_maintenance_views())[0]
             self.assertEqual(
                 mv.get_sequencer_maintenance_status(node_id),
                 MaintenanceStatus.COMPLETED,
             )
-            self.assertEqual(mv.overall_status, MaintenanceOverallStatus.COMPLETED)
+            self.assertEqual(mv.overall_status, MaintenanceProgress.COMPLETED)
 
     @async_test
     async def test_node_is_not_a_sequencer(self):
@@ -513,6 +555,31 @@ class TestMaintenanceView(TestCase):
 
         with self.assertRaises(NodeIsNotASequencerError):
             mv.get_sequencer_last_updated_at(node_id)
+
+    @async_test
+    async def test_node_is_sequencer_only(self):
+        async with MockAdminAPI(disaggregated=True, num_sequencer_nodes=1) as client:
+            cv = await get_cluster_view(client)
+            # A sequencers in MockAdminAPI start from the node_index >=
+            # num_storage_nodes
+            node_id = cv.get_node_view_by_node_index(client.num_storage_nodes).node_id
+            # We are applying a shard maintenance even that this node doesn't
+            # have shards (sequencer-only)
+            shard = ShardID(node=node_id, shard_index=1)
+            await apply_maintenance(
+                client=client,
+                shards=[shard],
+                # sequencer_nodes=[node_id],
+                shard_target_state=ShardOperationalState.DRAINED,
+            )
+            cv = await get_cluster_view(client)
+
+        mv = list(cv.get_all_maintenance_views())[0]
+        self.assertEqual(mv.get_shard_state(shard), None)
+        self.assertEqual(
+            mv.get_shard_maintenance_status(shard), MaintenanceStatus.COMPLETED
+        )
+        self.assertEqual(mv.get_shard_last_updated_at(shard), None)
 
     @async_test
     async def test_get_shard_last_updated_at(self):

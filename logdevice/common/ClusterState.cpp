@@ -64,6 +64,10 @@ class NodeStateUpdatedRequest : public Request {
   ClusterState::NodeState state_{ClusterState::NodeState::FULLY_STARTED};
 };
 
+bool ClusterState::isAnyNodeAlive() const {
+  return getFirstNodeAlive().has_value();
+}
+
 /**
  * Inserts a callback to the subscription list of the current worker
  * and inserts its worker id to the list of subscribers if not present already
@@ -106,28 +110,27 @@ void ClusterState::setBoycottedNodes(std::vector<node_index_t> boycotts) {
       std::make_shared<std::vector<node_index_t>>(std::move(boycotts)));
 }
 
-node_index_t ClusterState::getFirstNodeAlive() const {
-  folly::SharedMutex::ReadHolder read_lock(mutex_);
-  folly::Optional<node_index_t> first_node;
+folly::Optional<node_index_t> ClusterState::getFirstNodeAlive() const {
+  return getFirstNodeWithPred(
+      [this](node_index_t nid) { return isNodeAlive(nid); });
+}
 
-  for (node_index_t nid = 0; nid < cluster_size_; nid++) {
-    if (isNodeInConfig(nid)) {
-      if (isNodeAlive(nid)) {
-        return nid;
-      } else if (!first_node.hasValue()) {
-        first_node = nid;
-      }
+folly::Optional<node_index_t> ClusterState::getFirstNodeFullyStarted() const {
+  return getFirstNodeWithPred(
+      [this](node_index_t nid) { return isNodeFullyStarted(nid); });
+}
+
+folly::Optional<node_index_t> ClusterState::getFirstNodeWithPred(
+    folly::Function<bool(node_index_t)> pred) const {
+  size_t cluster_size = cluster_size_.load();
+
+  for (node_index_t nid = 0; nid < cluster_size; ++nid) {
+    if (isNodeInConfig(nid) && pred(nid)) {
+      return nid;
     }
   }
 
-  if (!first_node.hasValue()) {
-    RATELIMIT_WARNING(
-        std::chrono::seconds{5}, 1, "No node in service discovery config.");
-    first_node = 0;
-  }
-
-  // If all nodes are seen as dead, return first node.
-  return first_node.value();
+  return folly::none;
 }
 
 void ClusterState::postUpdateToWorkers(node_index_t node_id, NodeState state) {
@@ -143,31 +146,100 @@ void ClusterState::postUpdateToWorkers(node_index_t node_id, NodeState state) {
 void ClusterState::setNodeState(node_index_t idx,
                                 ClusterState::NodeState state) {
   ld_check(idx >= 0);
-
   folly::SharedMutex::ReadHolder read_lock(mutex_);
-  if (idx < cluster_size_) {
-    ClusterState::NodeState prev = node_state_list_[idx].exchange(state);
-    if ((prev != state) && processor_) {
-      if (!processor_->settings()->server) {
-        // this is a client stats
-        WORKER_STAT_INCR(client.cluster_state_updates);
-      }
-      RATELIMIT_INFO(std::chrono::seconds(1),
-                     10,
-                     "State of N%d changed from %s to %s",
-                     idx,
-                     getNodeStateString(prev),
-                     getNodeStateString(state));
-
-      postUpdateToWorkers(idx, state);
-    }
+  auto node_state = node_state_map_.find(idx);
+  if (node_state == node_state_map_.end()) {
+    return;
   }
+  ClusterState::NodeState prev = node_state->second->exchange(state);
+  if ((prev != state) && processor_) {
+    if (!processor_->settings()->server) {
+      // this is a client stats
+      WORKER_STAT_INCR(client.cluster_state_updates);
+    }
+    RATELIMIT_INFO(std::chrono::seconds(1),
+                   10,
+                   "State of N%d changed from %s to %s",
+                   idx,
+                   getNodeStateString(prev),
+                   getNodeStateString(state));
+
+    postUpdateToWorkers(idx, state);
+  }
+}
+void ClusterState::setNodeStatus(node_index_t idx, NodeHealthStatus status) {
+  ld_check(idx >= 0);
+  folly::SharedMutex::ReadHolder read_lock(mutex_);
+  auto node_status = node_status_map_.find(idx);
+  if (node_status == node_status_map_.end()) {
+    return;
+  }
+  NodeHealthStatus prev = node_status->second->exchange(status);
+  if ((prev != status) && processor_) {
+    RATELIMIT_INFO(std::chrono::seconds(1),
+                   10,
+                   "Status of N%d changed from %s to %s",
+                   idx,
+                   toString(prev).c_str(),
+                   toString(status).c_str());
+  }
+}
+
+std::vector<std::pair<node_index_t, uint16_t>>
+ClusterState::getWholeClusterStatus() {
+  folly::SharedMutex::ReadHolder read_lock(mutex_);
+  std::vector<std::pair<node_index_t, uint16_t>> vector{};
+  for (auto& n : node_status_map_) {
+    vector.emplace_back(std::make_pair(n.first, n.second->load()));
+  }
+  std::sort(vector.begin(), vector.end());
+  return vector;
+}
+
+std::vector<std::pair<node_index_t, uint16_t>>
+ClusterState::getWholeClusterState() {
+  folly::SharedMutex::ReadHolder read_lock(mutex_);
+  std::vector<std::pair<node_index_t, uint16_t>> vector{};
+  for (auto& n : node_state_map_) {
+    vector.emplace_back(std::make_pair(n.first, n.second->load()));
+  }
+  std::sort(vector.begin(), vector.end());
+  return vector;
+}
+
+bool ClusterState::isClusterSeqHealthAboveThreshold() {
+  folly::SharedMutex::ReadHolder read_lock(mutex_);
+  auto sequencer_membership =
+      Worker::onThisThread()->getNodesConfiguration()->getSequencerMembership();
+  auto num_sequencers = sequencer_membership->numNodes();
+  if (num_sequencers > 0) {
+    double maximum_number_unhealthy =
+        processor_->settings()->maximum_percent_unhealthy_seq_nodes *
+        num_sequencers;
+    auto num_unhealthy = 0;
+    for (auto& n : node_status_map_) {
+      if (n.second->load() == NodeHealthStatus::UNHEALTHY &&
+          sequencer_membership->hasNode(n.first)) {
+        num_unhealthy++;
+        if (num_unhealthy >= maximum_number_unhealthy) {
+          return false;
+          RATELIMIT_INFO(std::chrono::seconds(1),
+                         10,
+                         "Maximum acceptable percent of unhealthy sequencer "
+                         "nodes exceeded.");
+        }
+      }
+    }
+    return true;
+  }
+  return false;
 }
 
 void ClusterState::onGetClusterStateDone(
     Status status,
-    const std::vector<uint8_t>& nodes_state,
-    std::vector<node_index_t> boycotted_nodes) {
+    const std::vector<std::pair<node_index_t, uint16_t>>& nodes_state,
+    std::vector<node_index_t> boycotted_nodes,
+    std::vector<std::pair<node_index_t, uint16_t>> nodes_status) {
   SCOPE_EXIT {
     notifyRefreshComplete();
   };
@@ -188,11 +260,13 @@ void ClusterState::onGetClusterStateDone(
     ld_error("Unable to refresh cluster state: %s", error_description(status));
   } else {
     std::vector<std::string> dead;
-    for (int i = 0; i < nodes_state.size(); i++) {
-      setNodeState(i, static_cast<ClusterState::NodeState>(nodes_state[i]));
-      if (nodes_configuration->isNodeInServiceDiscoveryConfig(i) &&
-          nodes_state[i] == ClusterState::NodeState::DEAD) {
-        dead.push_back("N" + std::to_string(i));
+    for (auto& node : nodes_state) {
+      auto [node_idx, new_state] =
+          static_cast<std::pair<node_index_t, uint16_t>>(node);
+      setNodeState(node_idx, static_cast<ClusterState::NodeState>(new_state));
+      if (nodes_configuration->isNodeInServiceDiscoveryConfig(node_idx) &&
+          new_state == ClusterState::NodeState::DEAD) {
+        dead.emplace_back("N" + std::to_string(node_idx));
       }
     }
 
@@ -201,15 +275,27 @@ void ClusterState::onGetClusterStateDone(
     for (auto index : boycotted_nodes) {
       boycotted_tostring.emplace_back("N" + std::to_string(index));
     }
-
     setBoycottedNodes(std::move(boycotted_nodes));
 
+    std::vector<std::string> unhealthy_tostring;
+    for (auto& node : nodes_status) {
+      auto [node_idx, new_status] =
+          static_cast<std::pair<node_index_t, uint16_t>>(node);
+      setNodeStatus(node_idx, static_cast<NodeHealthStatus>(new_status));
+      if (nodes_configuration->isNodeInServiceDiscoveryConfig(node_idx) &&
+          new_status == NodeHealthStatus::UNHEALTHY) {
+        unhealthy_tostring.emplace_back("N" + std::to_string(node_idx));
+      }
+    }
+
     ld_info("Cluster state received with %lu dead nodes (%s) and %lu boycotted "
-            "nodes (%s)",
+            "nodes (%s) and %lu unhealthy nodes (%s).",
             dead.size(),
             folly::join(',', dead).c_str(),
             boycotted_tostring.size(),
-            folly::join(',', boycotted_tostring).c_str());
+            folly::join(',', boycotted_tostring).c_str(),
+            unhealthy_tostring.size(),
+            folly::join(',', unhealthy_tostring).c_str());
 
     // notify workers of the update so they can take any action
     auto cb = [&](Worker& w) {
@@ -229,31 +315,47 @@ void ClusterState::onGetClusterStateDone(
 void ClusterState::resizeClusterState(size_t new_size, bool notifySubscribers) {
   folly::SharedMutex::WriteHolder write_lock(mutex_);
   if (cluster_size_ != new_size) {
-    auto new_list = new std::atomic<ClusterState::NodeState>[new_size];
+    auto new_state_map = folly::F14FastMap<
+        node_index_t,
+        std::unique_ptr<std::atomic<ClusterState::NodeState>>>{};
+    auto new_status_map =
+        folly::F14FastMap<node_index_t,
+                          std::unique_ptr<std::atomic<NodeHealthStatus>>>{};
     bool have_failure_detector =
         processor_ && processor_->isFailureDetectorRunning();
     for (int i = 0; i < new_size; i++) {
       if (i < cluster_size_) {
-        new_list[i].store(node_state_list_[i].load());
+        new_state_map.insert({i, std::move(node_state_map_.at(i))});
+        new_status_map.insert({i, std::move(node_status_map_.at(i))});
       } else {
         /* If we have failure detector, mark new nodes as dead by default;
          * the failure detector will then change their state as needed.
-         * Otherwise, treat nodes as fully started by default,
+         * Otherwise, treat nodes as UNKNOWN by default,
          * so that HashBasedSequencerLocator can hash to an
          * actual node and not return E::NOTFOUND
          */
-        auto state = have_failure_detector
-            ? ClusterState::NodeState::DEAD
-            : ClusterState::NodeState::FULLY_STARTED;
-        new_list[i].store(state);
+        auto state = have_failure_detector ? ClusterState::NodeState::DEAD
+                                           : ClusterState::NodeState::UNKNOWN;
+        new_state_map.insert(
+            {i, std::make_unique<std::atomic<ClusterState::NodeState>>(state)});
+        // If we have failure detector, mark new nodes as unhealthy by default;
+        // FD will change their state as needed. Otherwise, treat nodes as
+        // healthy by default. This maintains consistency with the way node
+        // state is treated.
+        auto status = have_failure_detector ? NodeHealthStatus::UNHEALTHY
+                                            : NodeHealthStatus::HEALTHY;
+        new_status_map.insert(
+            {i, std::make_unique<std::atomic<NodeHealthStatus>>(status)});
         if (processor_ && notifySubscribers) {
           postUpdateToWorkers(i, state);
         }
       }
     }
-    ld_info(
-        "Cluster state size updated from %lu to %lu", cluster_size_, new_size);
-    node_state_list_.reset(new_list);
+    ld_info("Cluster state size updated from %lu to %lu",
+            cluster_size_.load(),
+            new_size);
+    node_state_map_.swap(new_state_map);
+    node_status_map_.swap(new_status_map);
     cluster_size_ = new_size;
   }
 }
@@ -312,9 +414,13 @@ void ClusterState::refreshClusterStateAsync() {
   }
 
   auto cb = [&](Status status,
-                std::vector<uint8_t> node_states,
-                std::vector<node_index_t> boycotted_nodes) {
-    onGetClusterStateDone(status, node_states, std::move(boycotted_nodes));
+                std::vector<std::pair<node_index_t, uint16_t>> node_states,
+                std::vector<node_index_t> boycotted_nodes,
+                std::vector<std::pair<node_index_t, uint16_t>> nodes_status) {
+    onGetClusterStateDone(status,
+                          node_states,
+                          std::move(boycotted_nodes),
+                          std::move(nodes_status));
   };
 
   std::unique_ptr<Request> req = std::make_unique<GetClusterStateRequest>(

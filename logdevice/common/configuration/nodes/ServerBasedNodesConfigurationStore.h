@@ -24,6 +24,7 @@ namespace configuration { namespace nodes {
 // is fetched from random servers in the cluster.
 class ServerBasedNodesConfigurationStore : public NodesConfigurationStore {
  public:
+  ServerBasedNodesConfigurationStore();
   ~ServerBasedNodesConfigurationStore() override = default;
 
   // Enqueues a ConfigurationFetchRequest request of type NodesConfiguration on
@@ -53,13 +54,13 @@ class ServerBasedNodesConfigurationStore : public NodesConfigurationStore {
   // This is a read only NodesConfigStore. Updates are not supported.
   // It will unconditionally throw a runtime_error.
   void updateConfig(std::string value,
-                    folly::Optional<version_t> base_version,
+                    Condition base_version,
                     write_callback_t cb = {}) override;
 
   // This is a read-only NodesConfigStore. Updates are not supported.
   // It will unconditionally throw a runtime_error.
   Status updateConfigSync(std::string value,
-                          folly::Optional<version_t> base_version,
+                          Condition base_version,
                           version_t* version_out = nullptr,
                           std::string* value_out = nullptr) override;
 
@@ -67,6 +68,7 @@ class ServerBasedNodesConfigurationStore : public NodesConfigurationStore {
 
  private:
   std::atomic<bool> shutdown_signaled_{false};
+  folly::Optional<u_int32_t> node_order_seed_;
 
   // helper utility to generate a polling option based on processor
   // settings and existing nodes configuration

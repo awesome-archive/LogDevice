@@ -24,16 +24,21 @@
 namespace facebook { namespace logdevice { namespace configuration {
 namespace nodes {
 
+ServerBasedNodesConfigurationStore::ServerBasedNodesConfigurationStore()
+    : node_order_seed_{folly::Random::rand32()} {}
+
 class NodesConfigurationOneTimePollRequest : public FireAndForgetRequest {
  public:
   NodesConfigurationOneTimePollRequest(
       NodesConfigurationPoller::Poller::Options options,
       NodesConfigurationStore::value_callback_t cb,
-      folly::Optional<NodesConfigurationStore::version_t> base_version)
+      folly::Optional<NodesConfigurationStore::version_t> base_version,
+      folly::Optional<u_int32_t> node_order_seed)
       : FireAndForgetRequest(RequestType::NODES_CONFIGURATION_ONETIME_POLL),
         options_(std::move(options)),
         cb_(std::move(cb)),
-        base_version_(base_version) {}
+        base_version_(base_version),
+        node_order_seed_(node_order_seed) {}
 
   void executionBody() override {
     poller_ = std::make_unique<NodesConfigurationPoller>(
@@ -44,6 +49,7 @@ class NodesConfigurationOneTimePollRequest : public FireAndForgetRequest {
                folly::Optional<std::string> config_str) {
           onPollerCallback(st, std::move(config_str));
         },
+        node_order_seed_,
         base_version_);
     poller_->start();
   }
@@ -56,7 +62,7 @@ class NodesConfigurationOneTimePollRequest : public FireAndForgetRequest {
                      "NodesConfiguration polling got a partial response.");
       st = Status::OK;
     }
-    if (st == Status::OK && !config_str.hasValue()) {
+    if (st == Status::OK && !config_str.has_value()) {
       RATELIMIT_DEBUG(std::chrono::seconds(10),
                       2,
                       "NodesConfiguration polling no-op: UPTODATE");
@@ -71,6 +77,7 @@ class NodesConfigurationOneTimePollRequest : public FireAndForgetRequest {
   NodesConfigurationStore::value_callback_t cb_;
   const folly::Optional<NodesConfigurationStore::version_t> base_version_;
   std::unique_ptr<NodesConfigurationPoller> poller_;
+  folly::Optional<u_int32_t> node_order_seed_;
 };
 
 /*static*/
@@ -106,19 +113,15 @@ void ServerBasedNodesConfigurationStore::getConfig(
   }
 
   auto worker = Worker::onThisThread();
-  // TODO T44484704: genPollerOptions is currently using the NodesConfiguration
-  // from the ServerConfig, later this will be switched to use the
-  // NodesConfiguration maintained by NCM, and we need to make sure such NC is
-  // always available, even in the special bootstrapping processor
   std::unique_ptr<Request> rq =
       std::make_unique<NodesConfigurationOneTimePollRequest>(
           genPollerOptions(
               NodesConfigurationPoller::Poller::Mode::ONE_TIME,
               *worker->processor_->settings(),
-              *worker->processor_->config_->getServerConfig()
-                   ->getNodesConfigurationFromServerConfigSource()),
+              *worker->processor_->config_->getNodesConfiguration()),
           std::move(callback),
-          base_version);
+          base_version,
+          node_order_seed_);
   worker->processor_->postRequest(rq);
 }
 
@@ -140,14 +143,14 @@ void ServerBasedNodesConfigurationStore::readModifyWriteConfig(
 }
 void ServerBasedNodesConfigurationStore::updateConfig(
     std::string /* value */,
-    folly::Optional<version_t> /* base_version */,
+    Condition /* base_version */,
     write_callback_t /* callback */) {
   throw std::runtime_error("unsupported");
 }
 
 Status ServerBasedNodesConfigurationStore::updateConfigSync(
     std::string /* value */,
-    folly::Optional<version_t> /* base_version */,
+    Condition /* base_version */,
     version_t* /* version_out */,
     std::string* /* value_out */) {
   throw std::runtime_error("unsupported");

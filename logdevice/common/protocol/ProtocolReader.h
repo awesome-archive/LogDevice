@@ -20,13 +20,11 @@
 #include "logdevice/common/protocol/MessageType.h"
 #include "logdevice/include/Err.h"
 
-struct evbuffer;
-
 namespace facebook { namespace logdevice {
 
 /**
  * @file Utility class for reading bytes of an object (e.g., message) bytes
- * off the a buffer source (e.g., network evbuffer). For messages it also
+ * off the a buffer source (e.g., network buffer). For messages it also
  * support parsing them to form Message subclasses.  Simplifies of a lot of
  * boilerplate like handling protocol errors, protocol versions etc.
  *
@@ -35,9 +33,9 @@ namespace facebook { namespace logdevice {
  * when it is ready to construct a message.
  *
  * If ProtocolReader encounters an error (such as running out of bytes in the
- * input evbuffer), it moves into an error state which makes subsequent read()
- * calls no-ops.  The error is reported to the socket later, when result*() is
- * called.
+ * input buffer), it moves into an error state which makes subsequent read()
+ * calls no-ops.  The error is reported to the Connection later, when result*()
+ * is called.
  *
  * Note that the error-swallowing/deferring comes with caveats.  For example,
  * after read(&x), `x' may not contain a valid value (if an error was
@@ -70,12 +68,19 @@ class ProtocolReader {
      */
     virtual int read(void* dest, size_t to_read, size_t nread) = 0;
 
-    /**
-     * Similar to read() except the destination is an evbuffer so that copy
-     * could be avoided in certain source types. For sources that do not support
-     * such type of reading, return -1 with err set to E::NOTSUPPORTED.
-     */
-    virtual int readEvbuffer(evbuffer* dest, size_t to_read, size_t nread) = 0;
+    virtual int readIOBuf(folly::IOBuf* dest, size_t to_read, size_t nread) {
+      // Default implementation just allocates an IOBuf and copies into it.
+
+      *dest = folly::IOBuf(folly::IOBuf::CREATE, to_read);
+      int rv = read(dest->writableTail(), to_read, nread);
+      if (rv < 0) {
+        return rv;
+      }
+      dest->append(rv);
+      ld_check_eq(to_read, static_cast<size_t>(rv));
+      ld_check_eq(dest->length(), to_read);
+      return rv;
+    }
 
     /**
      * Remove @param to_drain number of bytes from the beginning of the source
@@ -172,12 +177,7 @@ class ProtocolReader {
     }
   }
 
-  /**
-   * Reads into an evbuffer (for zero-copy reads of larger amounts of data).
-   * Wraps evbuffer_remove_buffer() from libevent.
-   */
-  void readEvbuffer(evbuffer* out, size_t to_read);
-  std::unique_ptr<folly::IOBuf> readIntoIOBuf(size_t to_read);
+  void readIOBuf(folly::IOBuf* out, size_t to_read);
 
   uint64_t computeChecksum(size_t msglen) {
     return src_ ? src_->computeChecksum(msglen) : 0;
@@ -255,7 +255,7 @@ class ProtocolReader {
 
   /**
    * Gate all subsequent read*() calls to protocol `proto' or newer.  If the
-   * socket protocol is older, subsequent read*() calls will be no-ops, with
+   * Connection protocol is older, subsequent read*() calls will be no-ops, with
    * zero side effects.
    */
   void protoGate(uint16_t proto) {
@@ -286,7 +286,7 @@ class ProtocolReader {
   }
 
   /**
-   * Creates a MessageReadResult for the socket layer.
+   * Creates a MessageReadResult for the Connection layer.
    *
    * If the reader has not encountered an error, invokes the given callback to
    * create a Message subclass.  The callback must return a Message*,
@@ -294,7 +294,7 @@ class ProtocolReader {
    * std::unique_ptr<DerivedMessage>.
    *
    * If there was an error during message reading, the callback is not
-   * invoked and the error is propagated to the socket layer through `err'.
+   * invoked and the error is propagated to the Connection layer through `err'.
    * Possible errors:
    *      BADMSG    message is too small (ran out of bytes on the wire)
    *      INTERNAL  `src' had fewer than `to_read' bytes available (see ctor)
@@ -339,14 +339,14 @@ class ProtocolReader {
   }
 
   bool isProtoSet() const {
-    return proto_.hasValue();
+    return proto_.has_value();
   }
   uint16_t proto() const {
-    ld_assert(proto_.hasValue());
+    ld_assert(proto_.has_value());
     return proto_.value();
   }
   bool isProtoVersionAllowed() {
-    if (!proto_.hasValue()) {
+    if (!proto_.has_value()) {
       setError(E::PROTO); // protocol version must be set
       return false;
     } else if (proto_.value() < proto_gate_) {
@@ -372,7 +372,7 @@ class ProtocolReader {
 
   /**
    * By default, `result()' fails with E::TOOBIG if there are bytes left
-   * unconsumed in the evbuffer.  If this is called, the extra bytes will be
+   * unconsumed in the buffer.  If this is called, the extra bytes will be
    * warned about and discarded, but message construction will be allowed to
    * succeed.
    */
@@ -394,13 +394,12 @@ class ProtocolReader {
                  const char* context,
                  folly::Optional<uint16_t> proto = folly::none);
 
-  ProtocolReader(MessageType type,
-                 struct evbuffer* src,
-                 size_t to_read,
-                 folly::Optional<uint16_t> proto = folly::none);
-
   ProtocolReader(Slice src,
                  std::string context,
+                 folly::Optional<uint16_t> proto = folly::none);
+
+  ProtocolReader(MessageType type,
+                 std::unique_ptr<folly::IOBuf> src,
                  folly::Optional<uint16_t> proto = folly::none);
 
   ProtocolReader(const ProtocolReader&) = delete;
@@ -420,7 +419,7 @@ class ProtocolReader {
   // Points to either context_owned_ or to an unowned string.
   const char* context_;
 
-  // Socket protocol
+  // Connection protocol
   folly::Optional<uint16_t> proto_;
 
   size_t src_left_;

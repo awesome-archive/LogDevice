@@ -52,6 +52,9 @@ struct AdminServerSettings : public SettingsBundle {
   bool read_metadata_from_sequencers;
   bool enable_safety_check_periodic_metadata_update;
   std::chrono::milliseconds safety_check_metadata_update_period;
+  // A transitional setting that will be used in the rollout of the
+  // FORCE_RESTORE flag in rebuilding.
+  bool use_force_restore_rebuilding_flag;
 
   // If true, start maintenance manager
   bool enable_maintenance_manager;
@@ -62,7 +65,14 @@ struct AdminServerSettings : public SettingsBundle {
 
   // How often to check if Metadata Nodeset needs to be updated
   std::chrono::milliseconds maintenance_manager_metadata_nodeset_update_period;
-  ;
+
+  /// ** Used ONLY for experimentation and testing
+  bool block_maintenance_rsm;
+
+  // Safety margin for medium-priority maintenances
+  size_t safety_margin_medium_pri_scopes;
+  // Safety margin for low-priority maintenances
+  size_t safety_margin_low_pri_scopes;
 
  private:
   // Only UpdateableSettings can create this bundle.

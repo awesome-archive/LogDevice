@@ -8,18 +8,25 @@
     ],
     "Configuration": [
         "FirstCluster",
+        "Kubernetes",
         "Config",
         "Settings",
         "Logs"
     ],
       "Administration": [
-          "LDShell",
-          "LDQuery"
+          "administration/AdminServer",
+          "administration/LDShell",
+          "administration/LDQuery",
+          "administration/ClusterMaintenance",
+          "administration/SafetyChecker"
       ],
       "Concepts": [
           "Writepath",
           "ReadPath",
-          "Terminology"
+          "Terminology",
+          "Consensus",
+          "AdminServer",
+          "SafetyChecker"
         ],
       "Designs": [
           "FailureDetection",

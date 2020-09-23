@@ -46,12 +46,7 @@ void OverwriteRequestData::onDestruction() {
     return;
   }
   NodesConfigurationTracer::Sample sample;
-  sample.nc_update_gen_ = [configuration = nc_]() mutable {
-    // TODO: we don't have NodesConfiguration::toString(), so we use
-    // the debug JSON string instead. This could likely be more
-    // efficient.
-    return NodesConfigurationCodec::debugJsonString(*configuration);
-  };
+
   // Note that nc is the published nc only if status is OK
   sample.published_nc_ = std::move(nc_);
   sample.source_ = NodesConfigurationTracer::Source::NCM_OVERWRITE;
@@ -214,7 +209,7 @@ void Dependencies::overwrite(OverwriteContext ctx,
 
     auto current_version_opt =
         NodesConfigurationCodec::extractConfigVersion(current_serialized);
-    if (current_version_opt.hasValue()) {
+    if (current_version_opt.has_value()) {
       auto current_version = current_version_opt.value();
       if (current_version >= ctx.data_.nc_->getVersion()) {
         auto current_config =
@@ -240,7 +235,9 @@ void Dependencies::overwrite(OverwriteContext ctx,
     auto serialized_initial_config = std::move(ctx.data_.serialized_nc_);
     ncm_ptr->deps()->store_->updateConfig(
         std::move(serialized_initial_config),
-        /* base_version = */ current_version_opt,
+        /* base_version = */ current_version_opt.has_value()
+            ? current_version_opt.value()
+            : NodesConfigurationStore::Condition::overwrite(),
         [callback = std::move(callback), ncm = ncm, ctx = std::move(ctx)](
             Status update_status,
             NodesConfigurationStore::version_t version,
@@ -339,7 +336,15 @@ void Dependencies::readFromStore(bool should_do_consistent_config_fetch) {
   if (should_do_consistent_config_fetch) {
     store_->getLatestConfig(std::move(data_cb));
   } else {
-    store_->getConfig(std::move(data_cb));
+    // Do a conditional getConfig. If our version is greater than or equal the
+    // version in the NCS, we will get an UPTODATE response.
+    folly::Optional<NodesConfigurationStore::version_t> current_version;
+    if (auto ncm = ncm_.lock(); ncm) {
+      if (auto nc = ncm->getConfig(); nc) {
+        current_version = nc->getVersion();
+      }
+    }
+    store_->getConfig(std::move(data_cb), std::move(current_version));
   }
 }
 
@@ -403,38 +408,6 @@ void Dependencies::reportEvent(NCMReportType type) {
   // no need to be on NCM thread
   auto req = makeNCMRequest<ReportRequest>(type);
   processor_->postWithRetrying(req);
-}
-
-void Dependencies::checkAndReportConsistency() {
-  const auto& server_nc =
-      processor_->getNodesConfigurationFromServerConfigSource();
-  const auto& ncm_nc = processor_->getNodesConfigurationFromNCMSource();
-
-  auto diverged = !ncm_nc->equalWithTimestampAndVersionIgnored(*server_nc);
-  auto same_version = server_nc->getVersion() == ncm_nc->getVersion();
-
-  STAT_SET(
-      getStats(), nodes_configuration_server_config_diverged, diverged ? 1 : 0);
-
-  STAT_SET(getStats(),
-           nodes_configuration_server_config_diverged_with_same_version,
-           diverged && same_version ? 1 : 0);
-
-  if (diverged) {
-    RATELIMIT_ERROR(
-        std::chrono::seconds(300),
-        1,
-        "NCM NC and ServerConfig NC diverged: NCM NC version %lu, "
-        "SC NC version %lu, is_same_version %d. \n"
-        "====begin NCM NC====\n%s\n====end NCM NC====\n"
-        "====begin ServerConfig NC====\n%s\n"
-        "====end ServerConfig NC====\n",
-        ncm_nc->getVersion().val(),
-        server_nc->getVersion().val(),
-        same_version,
-        NodesConfigurationCodec::debugJsonString(*ncm_nc).c_str(),
-        NodesConfigurationCodec::debugJsonString(*server_nc).c_str());
-  }
 }
 
 }}}}} // namespace facebook::logdevice::configuration::nodes::ncm

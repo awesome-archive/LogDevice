@@ -14,8 +14,7 @@
 #include "logdevice/common/debug.h"
 #include "logdevice/common/types_internal.h"
 
-namespace facebook { namespace logdevice { namespace configuration {
-namespace nodes {
+namespace facebook::logdevice::configuration::nodes {
 
 namespace {
 template <typename F>
@@ -32,21 +31,55 @@ bool isFieldValid(const F& field, folly::StringPiece name) {
 }
 
 template <typename F>
+bool isMapFieldValid(const F& field, folly::StringPiece name) {
+  for (const auto& [k, v] : field) {
+    if (!isFieldValid(v, name)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+template <typename F>
 bool isOptionalFieldValid(const F& field, folly::StringPiece name) {
   return !field.hasValue() || isFieldValid(field.value(), name);
 }
 
 } // namespace
 
+std::string NodeServiceDiscovery::networkPriorityToString(
+    const NodeServiceDiscovery::ClientNetworkPriority& priority) {
+  using ClientNetworkPriority = NodeServiceDiscovery::ClientNetworkPriority;
+  switch (priority) {
+    case ClientNetworkPriority::HIGH:
+      return "H";
+    case ClientNetworkPriority::MEDIUM:
+      return "M";
+    case ClientNetworkPriority::LOW:
+      return "L";
+  }
+  ld_check(false);
+  folly::assume_unreachable();
+}
+
 const Sockaddr& NodeServiceDiscovery::getGossipAddress() const {
-  return gossip_address.hasValue() ? gossip_address.value() : address;
+  return gossip_address.has_value() ? gossip_address.value()
+                                    : default_client_data_address;
 }
 
 bool NodeServiceDiscovery::isValid() const {
-  if (!isFieldValid(address, "address") ||
+  if (!isFieldValid(
+          default_client_data_address, "default_client_data_address") ||
       !isOptionalFieldValid(gossip_address, "gossip_address") ||
       !isOptionalFieldValid(ssl_address, "ssl_address") ||
-      !isOptionalFieldValid(admin_address, "admin_address")) {
+      !isOptionalFieldValid(admin_address, "admin_address") ||
+      !isOptionalFieldValid(
+          server_to_server_address, "server_to_server_address") ||
+      !isOptionalFieldValid(
+          server_thrift_api_address, "server_thrift_api_address") ||
+      !isOptionalFieldValid(
+          client_thrift_api_address, "client_thrift_api_address") ||
+      !isMapFieldValid(addresses_per_priority, "addresses_per_priority")) {
     return false;
   }
 
@@ -55,6 +88,16 @@ bool NodeServiceDiscovery::isValid() const {
                     5,
                     "no role is set. expect at least one role.");
     return false;
+  }
+
+  if (!addresses_per_priority.empty()) {
+    if (!addresses_per_priority.count(ClientNetworkPriority::MEDIUM)) {
+      RATELIMIT_ERROR(std::chrono::seconds(10),
+                      5,
+                      "If an address for any priority is defined, the config "
+                      "should also contain the MEDIUM priority address.");
+      return false;
+    }
   }
 
   std::string name_invalid_reason;
@@ -73,6 +116,15 @@ bool NodeServiceDiscovery::isValid() const {
 
 bool NodeServiceDiscovery::isValidForReset(
     const NodeServiceDiscovery& current) const {
+  // The proposed version can't be less than the current one
+  if (current.version > version) {
+    ld_error("A node can't decrease its version. Current value: %lu, "
+             "requested update: %lu",
+             current.version,
+             version);
+    return false;
+  }
+
   // Roles are immutable
   if (current.roles != roles) {
     ld_error("Node's roles are assumed to be immutable. Current value: '%s', "
@@ -82,64 +134,62 @@ bool NodeServiceDiscovery::isValidForReset(
     return false;
   }
 
-  // Storage nodes can't change their location, but sequencer-only nodes can.
-  if (current.location != location && hasRole(NodeRole::STORAGE)) {
+  // The node can't change its location if it's a storage node AND its version
+  // remains the same.
+  // TODO(T57564225): Agree on location string update policy
+  if (current.version == version && current.location != location &&
+      hasRole(NodeRole::STORAGE)) {
     ld_error(
         "Storage nodes' location is assumed to be immutable to maintain the "
         "correctness of the replication property of the historical nodesets. "
         "Current value: '%s', requested update: '%s'",
-        current.location.hasValue() ? current.location->toString().c_str() : "",
-        location.hasValue() ? location->toString().c_str() : "");
+        current.location.has_value() ? current.location->toString().c_str()
+                                     : "",
+        location.has_value() ? location->toString().c_str() : "");
     return false;
   }
 
-  // All other fields can be mutated freely.
+  // If we reached this point, all the eligible fields can be mutated freely.
   return true;
 }
 
 std::string NodeServiceDiscovery::toString() const {
-  return folly::sformat(
-      "[{} => A:{},G:{},S:{},AA:{}L:{},R:{}]",
-      name,
-      address.toString(),
-      gossip_address.hasValue() ? gossip_address->toString() : "",
-      ssl_address.hasValue() ? ssl_address->toString() : "",
-      admin_address.hasValue() ? admin_address->toString() : "",
-      location.hasValue() ? location->toString() : "",
-      logdevice::toString(roles));
-}
-
-const Sockaddr&
-NodeServiceDiscovery::getSockaddr(SocketType type,
-                                  ConnectionType conntype) const {
-  switch (type) {
-    case SocketType::GOSSIP:
-      return getGossipAddress();
-
-    case SocketType::DATA:
-      if (conntype == ConnectionType::SSL) {
-        if (!ssl_address.hasValue()) {
-          return Sockaddr::INVALID;
-        }
-        return ssl_address.value();
-      } else {
-        return address;
-      }
-
-    default:
-      RATELIMIT_CRITICAL(
-          std::chrono::seconds(1), 2, "Unexpected Socket Type:%d!", (int)type);
-      ld_check(false);
+  std::vector<std::string> addresses_strs;
+  for (const auto& [priority, sock_addr] : addresses_per_priority) {
+    addresses_strs.push_back(folly::sformat(
+        "{}:{}", networkPriorityToString(priority), sock_addr.toString()));
   }
 
-  return Sockaddr::INVALID;
+  return folly::sformat(
+      "[{} => "
+      "A:{},G:{},S:{},AA:{},S2SA:{},STA:{},CTA:{},APNP:{{{}}},L:{},R:{},V:{},T:"
+      "{}]",
+      name,
+      default_client_data_address.toString(),
+      gossip_address.has_value() ? gossip_address->toString() : "",
+      ssl_address.has_value() ? ssl_address->toString() : "",
+      admin_address.has_value() ? admin_address->toString() : "",
+      server_to_server_address.has_value()
+          ? server_to_server_address->toString()
+          : "",
+      server_thrift_api_address.has_value()
+          ? server_thrift_api_address->toString()
+          : "",
+      client_thrift_api_address.has_value()
+          ? client_thrift_api_address->toString()
+          : "",
+      folly::join(",", addresses_strs),
+      location.has_value() ? location->toString() : "",
+      logdevice::toString(roles),
+      version,
+      logdevice::toString(tags));
 }
 
 namespace {
 bool validateAddressUniqueness(ServiceDiscoveryConfig::MapType node_states) {
   std::unordered_map<Sockaddr, node_index_t, Sockaddr::Hash> seen_addresses;
   for (const auto& kv : node_states) {
-    if (!kv.second.address.valid()) {
+    if (!kv.second.default_client_data_address.valid()) {
       // This should have been caught in a better check, but let's avoid
       // crashing in the following lines by returning false here.
       RATELIMIT_CRITICAL(
@@ -150,10 +200,11 @@ bool validateAddressUniqueness(ServiceDiscoveryConfig::MapType node_states) {
           "been caught in an earlier validation on the ServiceDiscoveryConfig "
           "struct.",
           kv.first);
-      ld_assert(kv.second.address.valid());
+      ld_assert(kv.second.default_client_data_address.valid());
       return false;
     }
-    auto res = seen_addresses.emplace(kv.second.address, kv.first);
+    auto res =
+        seen_addresses.emplace(kv.second.default_client_data_address, kv.first);
     if (!res.second) {
       RATELIMIT_ERROR(std::chrono::seconds(10),
                       5,
@@ -195,4 +246,4 @@ bool ServiceDiscoveryConfig::attributeSpecificValidate() const {
       validateNameUniqueness(node_states_);
 }
 
-}}}} // namespace facebook::logdevice::configuration::nodes
+} // namespace facebook::logdevice::configuration::nodes

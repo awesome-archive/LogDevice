@@ -69,7 +69,7 @@ class BufferedWriterCallback : public BufferedWriter::AppendCallback {
     // Handle the error if needed. For example, collect the
     // failed payloads to retry them later.
     for (auto& ctx : contexts) {
-      payloadsFailed.push_back(std::move(ctx.second));
+      payloadsFailed.push_back(std::move(std::get<std::string>(ctx.second)));
     }
     appendsAckd += contexts.size();
     cv.notify_all();
@@ -159,7 +159,6 @@ int main(int argc, const char* argv[]) {
 }
 
 void parse_command_line(int argc, const char** argv) {
-  using boost::program_options::bool_switch;
   using boost::program_options::value;
   namespace style = boost::program_options::command_line_style;
   try {

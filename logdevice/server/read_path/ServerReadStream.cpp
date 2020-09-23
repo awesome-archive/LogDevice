@@ -255,19 +255,19 @@ void ServerReadStream::getDebugInfo(InfoReadersTable& table) const {
       .set<23>(csid_)
       .set<24>(id_.val());
 
-  if (last_released_lsn.hasValue()) {
-    table.set<9>(last_released_lsn.value());
-  }
+  table.set<9>(last_released_lsn.value());
 
   table.set<14>(last_batch_status_);
-  table.set<15>(toSystemTimestamp(created_).toMilliseconds());
+  table.set<15>(created_.approximateSystemTimestamp().toMilliseconds());
 
   if (last_enqueued_time_ != std::chrono::steady_clock::time_point::min()) {
-    table.set<16>(toSystemTimestamp(last_enqueued_time_).toMilliseconds());
+    table.set<16>(
+        last_enqueued_time_.approximateSystemTimestamp().toMilliseconds());
   }
   if (last_batch_started_time_ !=
       std::chrono::steady_clock::time_point::min()) {
-    table.set<17>(toSystemTimestamp(last_batch_started_time_).toMilliseconds());
+    table.set<17>(
+        last_batch_started_time_.approximateSystemTimestamp().toMilliseconds());
   }
 
   table.set<18>(storage_task_in_flight_);
@@ -281,6 +281,10 @@ void ServerReadStream::getDebugInfo(InfoReadersTable& table) const {
 
   size_t current_meter_level = getCurrentMeterLevel();
   table.set<22>(current_meter_level);
+
+  ssize_t send_buf_occupancy =
+      worker->sender().getTcpSendBufOccupancyForClient(client_id_);
+  table.set<25>(send_buf_occupancy);
 }
 
 void ServerReadStream::addReleasedRecords(
@@ -316,7 +320,7 @@ void ServerReadStream::noteSent(StatsHolder* stats,
       break;
   }
 
-  if (last_sent_source_.hasValue() && source == last_sent_source_.value()) {
+  if (last_sent_source_.has_value() && source == last_sent_source_.value()) {
     return;
   }
 
@@ -408,8 +412,7 @@ std::string ServerReadStream::toString() const {
       lsn_to_string(last_delivered_record_) +
       ","
       "last_released=" +
-      (last_released_lsn.hasValue() ? lsn_to_string(last_released_lsn.value())
-                                    : "none") +
+      lsn_to_string(last_released_lsn.value()) +
       ","
       "window_high=" +
       lsn_to_string(window_high_) +
@@ -433,19 +436,19 @@ std::string ServerReadStream::toString() const {
       logdevice::toString(sent_state) +
       ","
       "created=" +
-      logdevice::toString(toSystemTimestamp(created_)) +
+      created_.toString() +
       ","
       "last_rewind=" +
-      logdevice::toString(toSystemTimestamp(last_rewind_time_)) +
+      last_rewind_time_.toString() +
       ","
       "last_queued=" +
-      logdevice::toString(toSystemTimestamp(last_enqueued_time_)) +
+      last_enqueued_time_.toString() +
       ","
       "last_batch_staus=" +
       std::string(last_batch_status_) +
       ","
       "last_batch_time=" +
-      logdevice::toString(toSystemTimestamp(last_batch_started_time_)) +
+      last_batch_started_time_.toString() +
       ","
       "storage_task=" +
       logdevice::toString(storage_task_in_flight_) + "}";

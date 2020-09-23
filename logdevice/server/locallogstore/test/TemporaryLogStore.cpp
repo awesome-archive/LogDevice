@@ -10,6 +10,7 @@
 #include "logdevice/common/debug.h"
 #include "logdevice/common/test/TestUtil.h"
 #include "logdevice/server/locallogstore/PartitionedRocksDBStore.h"
+#include "logdevice/server/locallogstore/RocksDBCustomiser.h"
 #include "logdevice/server/locallogstore/RocksDBLocalLogStore.h"
 #include "logdevice/server/locallogstore/WriteOps.h"
 #include "rocksdb/db.h"
@@ -19,7 +20,7 @@ namespace facebook { namespace logdevice {
 TemporaryLogStore::TemporaryLogStore(factory_func_t factory,
                                      bool open_right_away)
     : factory_(factory) {
-  temp_dir_ = createTemporaryDir("TemporaryLogStore", /*keep_data=*/false);
+  temp_dir_ = std::make_unique<TemporaryDirectory>("TemporaryLogStore");
   ld_check(temp_dir_);
 
   if (open_right_away) {
@@ -151,6 +152,18 @@ int TemporaryLogStore::updatePerEpochLogMetadata(
       log_id, epoch, metadata, seal_preempt, write_options);
 }
 
+int TemporaryLogStore::getRebuildingRanges(RebuildingRangesMetadata& rrm,
+                                           RebuildingRangesVersion& version) {
+  return db_->getRebuildingRanges(rrm, version);
+}
+
+int TemporaryLogStore::writeRebuildingRanges(
+    RebuildingRangesMetadata& rrm,
+    RebuildingRangesVersion base_version,
+    RebuildingRangesVersion new_version) {
+  return db_->writeRebuildingRanges(rrm, base_version, new_version);
+}
+
 int TemporaryLogStore::isEmpty() const {
   return db_->isEmpty();
 }
@@ -231,12 +244,14 @@ TemporaryRocksDBStore::TemporaryRocksDBStore(bool read_find_time_index)
             settings, rebuilding_settings, nullptr, nullptr, nullptr);
         rocksdb_config.createMergeOperator(shard_idx);
 
-        return std::make_unique<RocksDBLocalLogStore>(shard_idx,
-                                                      1,
-                                                      path,
-                                                      std::move(rocksdb_config),
-                                                      /* stats */ nullptr,
-                                                      /* io_tracing */ nullptr);
+        return std::make_unique<RocksDBLocalLogStore>(
+            shard_idx,
+            1,
+            path,
+            std::move(rocksdb_config),
+            RocksDBCustomiser::defaultInstance(),
+            /* stats */ nullptr,
+            /* io_tracing */ nullptr);
       }) {}
 
 class TemporaryPartitionedStoreImpl : public PartitionedRocksDBStore {
@@ -252,6 +267,7 @@ class TemporaryPartitionedStoreImpl : public PartitionedRocksDBStore {
                                 path,
                                 std::move(rocksdb_config),
                                 config,
+                                RocksDBCustomiser::defaultInstance(),
                                 stats,
                                 io_tracing,
                                 DeferInit::YES),
@@ -339,7 +355,7 @@ int TemporaryPartitionedStore::putRecord(
       &csi_entry_buf);
 
   std::string payload_buf;
-  if (!payload.hasValue()) {
+  if (!payload.has_value()) {
     payload_buf = toString(log.val()) + lsn_to_string(lsn);
     payload = Slice::fromString(payload_buf);
   }
@@ -384,6 +400,12 @@ std::vector<size_t> TemporaryPartitionedStore::getNumLogsPerPartition() {
     ++res[idx];
   }
   return res;
+}
+
+int TemporaryLogStore::traverseLogsMetadata(
+    LogMetadataType type,
+    LocalLogStore::TraverseLogsMetadataCallback cb) {
+  return db_->traverseLogsMetadata(type, cb);
 }
 
 }} // namespace facebook::logdevice

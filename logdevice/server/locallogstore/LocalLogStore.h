@@ -136,11 +136,11 @@ class LocalLogStore : boost::noncopyable {
    *
    * Note about filtering in seek() and next() (typically implmented using
    * copyset index):
-   * If non-null `ReadFilter` and `ReadStats` are provided, the operation calls
+   * If non-null `ReadFilter` is provided, the operation calls
    * `ReadFilter::operator()` on every record it encounters to determine which
-   * record should the iterator end up at. `ReadFilter` and `ReadStats` must
-   * either both be nullptr or both non-nullptr. `ReadStats` is used
-   * for accounting for records that have been read during an operation.
+   * record should the iterator end up at. `ReadStats` is used for accounting
+   * for records that have been read during an operation, as well as for
+   * additional stopping conditions, like byte limit.
    * There are 3 possible outcomes of a filtered operation:
    * 1) iterator positioned on a record that passes the filter:
    *    state() == AT_RECORD, or
@@ -225,13 +225,10 @@ class LocalLogStore : boost::noncopyable {
   // The order of logs and records within each of the 3 groups is undefined.
   // For LogsDB, the iteration happens in order of increasing
   // tuple <partition, log, LSN>, i.e. we read partitions one by one, reading
-  // sequentially inside each partition.
-  //
-  // Records of different logs can interleave, but records of each log are
-  // almost always visited in order of increasing LSN. It's safe to ignore the
-  // the records that have LSN below the max previously seen LSN for the log.
-  // TODO (#T24665001):
-  //   There's one corner case when it's not safe: T22197755. Fix it.
+  // sequentially inside each partition. If new_to_old = true, then the order of
+  // partitions is reversed, but inside each partition we still go in order of
+  // increasing <log, LSN> pair, so the records of each log arrive in a sawtooth
+  // pattern.
   //
   // The iterator may or may not see records that were written after the
   // iterator was created. (It may also see some but not others, or see
@@ -269,11 +266,12 @@ class LocalLogStore : boost::noncopyable {
     }
 
     // The filtering works the same way as in ReadIterator; see comment above.
+    // `filter` can be null. `stats` can be null if `data_logs_filter` passed
+    // to readAllLogs() was an empty map.
     virtual void seek(const Location& location,
-                      ReadFilter* filter = nullptr,
-                      ReadStats* stats = nullptr) = 0;
-    virtual void next(ReadFilter* filter = nullptr,
-                      ReadStats* stats = nullptr) = 0;
+                      ReadFilter* filter,
+                      ReadStats* stats) = 0;
+    virtual void next(ReadFilter* filter, ReadStats* stats) = 0;
 
     // To read everything, seek to minLocation() and iterate
     // until state() == AT_END.
@@ -335,9 +333,22 @@ class LocalLogStore : boost::noncopyable {
     // data.
     bool csi_data_only = false;
 
-    // Whether to inject a synthetic latency in read requests; Makes sense only
+    // Whether to inject a synthetic latency in read requests. Makes sense only
     // if blocking I/O is allowed.
     bool inject_latency = false;
+
+    // Only affects AllLogsIterator. If set to true, iterate over partitions
+    // in reverse order. Inside each partition, still go in order of
+    // *increasing* pair [log ID, LSN], and metadata+internal logs still go
+    // before data logs.
+    // (We don't move in reverse inside partition because
+    //   (a) it doesn't seem useful, especially since the iteration order inside
+    //       partition is not chronological anyway,
+    //   (b) rocksdb's Iterator::Prev() is slow,
+    //   (c) it would require a bunch more code in CSIWrapper
+    //       and PartitionedAllLogsIterator,
+    //   (d) it would require a little more code RebuildingReadStorageTask.)
+    bool new_to_old = false;
   };
 
   // Stats and limits of an iterator read. Passed to filtered iterator
@@ -374,6 +385,7 @@ class LocalLogStore : boost::noncopyable {
         LSN_MAX};
 
     // Max timestamp to read. Not supported by AllLogsIterator.
+    // Currently unused, although the iterators fully support it.
     std::chrono::milliseconds stop_reading_after_timestamp{
         std::chrono::milliseconds::max()};
 
@@ -383,6 +395,7 @@ class LocalLogStore : boost::noncopyable {
     // Lower bound of max timestamp read. This is only filled by the
     // partitioned iterator from the partition directory, and doesn't
     // necessarily reflect the max timestamp of all records that were read.
+    // Not supported by AllLogsIterator.
     folly::Optional<std::chrono::milliseconds> max_read_timestamp_lower_bound;
 
     // True if we went outside the requested range of records, either by
@@ -414,7 +427,7 @@ class LocalLogStore : boost::noncopyable {
     // (which usually comes from logsdb partition boundaries), not the exact
     // record timestamps.
     bool maxTimestampReached() const {
-      return max_read_timestamp_lower_bound.hasValue() &&
+      return max_read_timestamp_lower_bound.has_value() &&
           *max_read_timestamp_lower_bound > stop_reading_after_timestamp;
     }
 
@@ -496,6 +509,11 @@ class LocalLogStore : boost::noncopyable {
     // This may seem a bit useless :) but there were members here before.
     // Delete if no new options are added for a while.
   };
+
+  // @return Whether this local log store is in fail safe mode.
+  virtual bool inFailSafeMode() const {
+    return false;
+  }
 
   // Place the store into a persistent read-only mode due to an error.
   // @return  false if the store was already in fail-safe mode.
@@ -632,26 +650,37 @@ class LocalLogStore : boost::noncopyable {
 
   /**
    * Creates a new AllLogsIterator.
-   * May wait for blocking IO, don't call from worker threads.
-   * @param logs
-   *    If not folly::none, read only the given LSN ranges of the given logs
-   *    and use shouldProcessRecordRange() to filter out groups of records.
-   *    Current implementation has some limitations:
-   *     1. If `logs` is not folly::none, all calls to seek() and next()
-   *        require non-null `filter` and `stats` arguments.
-   *     2. Nonempty `logs` may make readAllLogs() call somewhat slow because it
-   *        makes a copy of the logsdb directory, locking per-log mutexes along
-   *        the way.
-   *     3. The set of logs and LSN ranges are just a hint. The iterator may
-   *        still return records for logs that are not on the list or for LSNs
-   *        that are outside the range. Use ReadFilter to filter out records
-   *        of undesired logs.
+   * May wait for blocking IO; don't call from worker threads.
+   *
+   * There a few ways to use this:
+   *  - Use data_logs_filter = empty map (not folly::none). Then the iterator
+   *    will visit only internal logs and metadata logs.
+   *    ReadFilter and ReadStats are not required in this case.
+   *  - Use data_logs_filter = folly::none. Then the iterator will visit all
+   *    logs. For an awkward implementation reason, ReadStats is required for
+   *    all seek() and next() calls (even if you're not interested in any
+   *    stats), and the ReadStats object passed to next() calls must be the
+   *    same as the one passed to the preceding seek() call.
+   *    (This mode is not currently used anywhere. It only
+   *    exists because it was easy to implement, and speculatively might be
+   *    useful you want to dump all records without knowing the set of logs in
+   *    advance. Feel free to remove if needed.)
+   *  - Use nonempty data_logs_filter. Then the iterator will visit the given
+   *    logs and LSN ranges, but may also visit other logs/LSNs.
+   *    I.e. data_logs_filter is only a hint; you can use ReadFilter to filter
+   *    out unneeded logs and records. ReadStats is required.
+   *
+   * For PartitionedRocksDBStore (logsdb), if data_logs_filter is big
+   * or folly::none, readAllLogs() call may be slow because it makes a copy of
+   * the logsdb directory, locking all per-log mutexes one at a time.
+   * The iterator then uses ReadFilter::shouldProcessRecordRange() (if provided)
+   * to skip groups of records during iteration.
    */
   virtual std::unique_ptr<AllLogsIterator>
   readAllLogs(const ReadOptions& options,
               const folly::Optional<
-                  std::unordered_map<logid_t, std::pair<lsn_t, lsn_t>>>& logs =
-                  folly::none) const = 0;
+                  std::unordered_map<logid_t, std::pair<lsn_t, lsn_t>>>&
+                  data_logs_filter) const = 0;
 
   /**
    * Reads per-store or per-log metadata.
@@ -695,6 +724,50 @@ class LocalLogStore : boost::noncopyable {
                                       PerEpochLogMetadata* metadata,
                                       bool find_last_available = false,
                                       bool allow_blocking_io = true) const = 0;
+
+  /**
+   * Fetches per-store rebuilding dirty range metadata
+   *
+   * @param rrm      The RebuildingRangesMetadata object to fill.
+   * @param version  The returned, in-core, version of the metadata.
+   *
+   * @return On success, returns 0. On failure, returns -1 and sets err to
+   *         LOCAL_LOG_STORE_READ.
+   */
+  virtual int getRebuildingRanges(RebuildingRangesMetadata& rrm,
+                                  RebuildingRangesVersion& version) = 0;
+  /**
+   * Conditionally stores a new version of per-store rebuilding dirty
+   * range metadata
+   *
+   * @param rrm           The RebuildingRangesMetadata to store.
+   * @param base_version  The expected, current metadata version.
+   * @param new_version   The new metadata version to apply along with rrm.
+   *
+   * @return On success, returns 0. On failure, returns -1 and sets err to
+   *         STALE                 if base_version does not match the current
+   *                               version of the metadata
+   *         LOCAL_LOG_STORE_READ  on any other error
+   */
+  virtual int writeRebuildingRanges(RebuildingRangesMetadata& rrm,
+                                    RebuildingRangesVersion base_version,
+                                    RebuildingRangesVersion new_version) = 0;
+
+  using TraverseLogsMetadataCallback =
+      std::function<void(logid_t, std::unique_ptr<LogMetadata>, Status)>;
+  /**
+   * Traverse logs metadata records of given `type` and call a callback
+   * function.
+   *
+   * @param type  The type of metadata to traverse
+   * @param cb    A callback function called for each metadata record of type
+   *		  `type` encountered.
+   *
+   * @return  On success, returns 0. On failure, returns -1 with `err` set to
+   *	      the actual error.
+   */
+  virtual int traverseLogsMetadata(LogMetadataType type,
+                                   TraverseLogsMetadataCallback cb) = 0;
 
   /**
    * Write global or per-log metadata.

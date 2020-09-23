@@ -21,6 +21,8 @@
 #include "logdevice/common/test/DigestTestUtil.h"
 #include "logdevice/common/test/MockBackoffTimer.h"
 #include "logdevice/common/test/MockTimer.h"
+#include "logdevice/common/test/NodesConfigurationTestUtil.h"
+#include "logdevice/common/test/SenderTestProxy.h"
 #include "logdevice/common/test/TestUtil.h"
 
 #define N0 ShardID(0, 0)
@@ -63,6 +65,7 @@ class EpochRecoveryTest : public ::testing::Test {
       NodeID::Hash>
       on_close_cb_map_;
 
+  std::unordered_map<ShardID, ClusterStateNodeState> node_state_map_;
   read_stream_id_t rsid_{0};
 
   // epoch recovery instance to be tested
@@ -82,17 +85,13 @@ class EpochRecoveryTest : public ::testing::Test {
        TailRecordHeader::CHECKSUM_PARITY,
        {}},
       OffsetMap({{BYTE_OFFSET, 237419}}),
-      std::shared_ptr<PayloadHolder>()};
+      PayloadHolder()};
 
   StorageSet all_shards_{N0, N1, N2, N3, N4, N5, N6};
 
   // nodeset and replication property of the log
   StorageSet storage_set_{N1, N2, N3};
   ReplicationProperty rep_{{NodeLocationScope::NODE, 2}};
-
-  // Shards that are in draining mode. they are fully authoritative and will be
-  // digested, but not writable so should not be included in mutation set
-  std::set<ShardID> draining_shards_;
 
   struct Result {
     Status st;
@@ -112,8 +111,8 @@ class EpochRecoveryTest : public ::testing::Test {
   void initConfig();
   void setUp();
 
-  std::shared_ptr<const NodesConfiguration> getNodesConfiguration() const {
-    return updateable_config_->getNodesConfiguration();
+  void setNodeState(ShardID shard, ClusterStateNodeState state) {
+    node_state_map_[shard] = state;
   }
 
   void checkRecoveryState(ERMState expect_state);
@@ -194,10 +193,6 @@ class MockEpochRecoveryDependencies : public EpochRecoveryDependencies {
 
   void onShardRemovedFromConfig(ShardID) override {}
 
-  bool canMutateShard(ShardID shard) const override {
-    return test_->draining_shards_.count(shard) == 0;
-  }
-
   NodeID getMyNodeID() const override {
     return test_->my_node_;
   }
@@ -226,7 +221,8 @@ class MockEpochRecoveryDependencies : public EpochRecoveryDependencies {
     return std::move(timer);
   }
 
-  int registerOnSocketClosed(const Address& addr, SocketCallback& cb) override {
+  int registerOnConnectionClosed(const Address& addr,
+                                 SocketCallback& cb) override {
     test_->on_close_cb_map_[addr.asNodeID()].push_back(cb);
     return 0;
   }
@@ -273,6 +269,10 @@ class MockEpochRecoveryDependencies : public EpochRecoveryDependencies {
     return test_->LOG_ID;
   }
 
+  bool isShardAlive(ShardID shard) const override {
+    return ClusterState::isAliveState(test_->node_state_map_[shard]);
+  }
+
  private:
   EpochRecoveryTest* const test_;
 };
@@ -288,39 +288,31 @@ void EpochRecoveryTest::initConfig() {
   // init cluster config
   configuration::Nodes nodes;
   for (ShardID shard : all_shards_) {
-    Configuration::Node& node = nodes[shard.node()];
-    node.address = Sockaddr("::1", folly::to<std::string>(4440 + shard.node()));
-    node.generation = 1;
-    node.addSequencerRole();
-    node.addStorageRole();
-
+    std::string loc;
     auto it = node_locations_.find(shard.node());
     if (it != node_locations_.end()) {
-      NodeLocation loc;
-      int rv = loc.fromDomainString(it->second);
-      ASSERT_EQ(0, rv);
-      node.location = std::move(loc);
+      loc = it->second;
     }
+    nodes[shard.node()] = configuration::Node::withTestDefaults(shard.node())
+                              .setLocation(loc)
+                              .setIsMetadataNode(true);
+    node_state_map_[shard] = ClusterStateNodeState::FULLY_STARTED;
   }
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes), ReplicationProperty{{NodeLocationScope::NODE, 3}});
 
-  logsconfig::LogAttributes log_attrs;
   // we won't use these
-  log_attrs.set_replicationFactor(2);
-  Configuration::NodesConfig nodes_config(std::move(nodes));
+  auto log_attrs = logsconfig::LogAttributes().with_replicationFactor(2);
   auto logs_config = std::make_shared<configuration::LocalLogsConfig>();
   logs_config->insert(boost::icl::right_open_interval<logid_t::raw_type>(
                           LOG_ID.val_, LOG_ID.val_ + 1),
                       "log",
                       log_attrs);
 
-  // metadata stored on all nodes with max replication factor 3
-  Configuration::MetaDataLogsConfig meta_config =
-      createMetaDataLogsConfig(nodes_config, nodes_config.getNodes().size(), 3);
-
   updateable_config_->updateableServerConfig()->update(
-      ServerConfig::fromDataTest(__FILE__, nodes_config, meta_config));
+      ServerConfig::fromDataTest(__FILE__));
   updateable_config_->updateableNodesConfiguration()->update(
-      updateable_config_->getNodesConfigurationFromServerConfigSource());
+      std::move(nodes_configuration));
   updateable_config_->updateableLogsConfig()->update(std::move(logs_config));
 }
 
@@ -330,12 +322,13 @@ void EpochRecoveryTest::setUp() {
 
   const EpochMetaData metadata(storage_set_, rep_);
   auto deps = std::make_unique<MockEpochRecoveryDependencies>(this);
-  erm_ = std::make_unique<EpochRecovery>(LOG_ID,
-                                         epoch_,
-                                         metadata,
-                                         getNodesConfiguration(),
-                                         std::move(deps),
-                                         tail_optimized_);
+  erm_ = std::make_unique<EpochRecovery>(
+      LOG_ID,
+      epoch_,
+      metadata,
+      updateable_config_->updateableNodesConfiguration(),
+      std::move(deps),
+      tail_optimized_);
 }
 
 void EpochRecoveryTest::checkRecoveryState(ERMState expected_state) {
@@ -363,11 +356,13 @@ void EpochRecoveryTest::checkRecoveryState(ERMState expected_state) {
       ASSERT_EQ(
           erm_->mutationSetSize(), rs.countShardsInState(NState::MUTATABLE));
       {
-        // mutation set should not intersect w/ shards in draining
+        // mutation set should not intersect w/ non writable shards
+        auto storage_mem =
+            updateable_config_->getNodesConfiguration()->getStorageMembership();
         auto mutation_set = rs.getNodesInState(NState::MUTATABLE);
         bool intersect = std::any_of(
-            draining_shards_.begin(), draining_shards_.end(), [&](ShardID s) {
-              return mutation_set.count(s) > 0;
+            mutation_set.begin(), mutation_set.end(), [&](ShardID s) {
+              return !storage_mem->canWriteToShard(s);
             });
         ASSERT_FALSE(intersect);
       }
@@ -396,11 +391,10 @@ void EpochRecoveryTest::checkRecoveryState(ERMState expected_state) {
     ASSERT_EQ(set, std::set<ShardID>({__VA_ARGS__}));           \
   } while (0)
 
-std::unique_ptr<DataRecordOwnsPayload>
-mockRecord(lsn_t lsn,
-           uint64_t ts,
-           size_t payload_size = 128,
-           OffsetMap offsets = OffsetMap()) {
+std::unique_ptr<RawDataRecord> mockRecord(lsn_t lsn,
+                                          uint64_t ts,
+                                          size_t payload_size = 128,
+                                          OffsetMap offsets = OffsetMap()) {
   return create_record(EpochRecoveryTest::LOG_ID,
                        lsn,
                        RecordType::NORMAL,
@@ -410,7 +404,7 @@ mockRecord(lsn_t lsn,
                        std::move(offsets));
 }
 
-std::unique_ptr<DataRecordOwnsPayload>
+std::unique_ptr<RawDataRecord>
 mockWriteStreamRecord(lsn_t lsn,
                       uint64_t ts,
                       size_t payload_size = 128,
@@ -424,10 +418,10 @@ mockWriteStreamRecord(lsn_t lsn,
                        std::move(offsets));
 }
 
-std::unique_ptr<DataRecordOwnsPayload> mockRecord(lsn_t lsn,
-                                                  RecordType type,
-                                                  uint32_t wave_or_seal_epoch,
-                                                  uint64_t ts = 1) {
+std::unique_ptr<RawDataRecord> mockRecord(lsn_t lsn,
+                                          RecordType type,
+                                          uint32_t wave_or_seal_epoch,
+                                          uint64_t ts = 1) {
   return create_record(EpochRecoveryTest::LOG_ID,
                        lsn,
                        type,
@@ -996,13 +990,21 @@ TEST_F(EpochRecoveryTest, UnexpectedHolePlugBelowLNG) {
 }
 
 TEST_F(EpochRecoveryTest, MutationSetShouldNotContainDrainingNodes) {
-  // N2 is draining and cannot store copies, but is able to participate
+  // N2 is READ_ONLY and cannot store copies, but is able to participate
   // in digest
   storage_set_ = {N1, N2, N3};
   rep_.assign({{NodeLocationScope::NODE, 2}});
-  draining_shards_ = {N2};
 
   setUp();
+
+  {
+    auto nc = updateable_config_->getNodesConfiguration();
+    nc = nc->applyUpdate(NodesConfigurationTestUtil::setStorageMembershipUpdate(
+        *nc, {N2}, membership::StorageState::READ_ONLY, folly::none));
+    ld_check(nc);
+    updateable_config_->updateableNodesConfiguration()->update(std::move(nc));
+  }
+
   OffsetMap om;
   om.setCounter(BYTE_OFFSET, 19);
   // N3 will be absent in the beginning, causing recovery to get stuck
@@ -1256,6 +1258,82 @@ TEST_F(EpochRecoveryTest, correctByteOffset) {
   OffsetMap expected_offsets =
       OffsetMap::mergeOffsets(prev_tail_.offsets_map_, offsets_to_add);
   ASSERT_EQ(expected_offsets, lce_tail_.offsets_map_);
+}
+// similar to the basic test, the recovery state machine is restarted if a node
+// dies while in mutation or cleaning state.
+TEST_F(EpochRecoveryTest, RestartWhenClusterStateChanges) {
+  setUp();
+  OffsetMap om;
+  om.setCounter(BYTE_OFFSET, 19);
+  erm_->onSealed(N1, esn_t(1), esn_t(1), om, folly::none);
+  checkRecoveryState(ERMState::SEAL_OR_INACTIVE);
+  erm_->activate(prev_tail_);
+  erm_->onSealed(N2, esn_t(1), esn_t(1), om, folly::none);
+  checkRecoveryState(ERMState::DIGEST);
+  ASSERT_NODE_STATE(NState::DIGESTING, N1, N2);
+  ASSERT_NODE_STATE(NState::SEALING, N3);
+  erm_->onMessageSent(N1, MessageType::START, E::OK, read_stream_id_t(1));
+  erm_->onMessageSent(N2, MessageType::START, E::OK, read_stream_id_t(2));
+  erm_->onDigestStreamStarted(N1, read_stream_id_t(1), lsn(epoch_, 1), E::OK);
+  erm_->onDigestStreamStarted(N2, read_stream_id_t(2), lsn(epoch_, 1), E::OK);
+  erm_->onDigestRecord(N1, read_stream_id_t(1), mockRecord(lsn(epoch_, 1), 9));
+  erm_->onDigestRecord(N2, read_stream_id_t(2), mockRecord(lsn(epoch_, 1), 9));
+  erm_->onDigestGap(
+      N1,
+      mockGap(N1, lsn(epoch_, 2), lsn(epoch_, ESN_MAX), read_stream_id_t(1)));
+  erm_->onDigestGap(
+      N2,
+      mockGap(N2, lsn(epoch_, 2), lsn(epoch_, ESN_MAX), read_stream_id_t(2)));
+
+  // N1, N2 became DIGESTED then MUTATABLE
+  ASSERT_NODE_STATE(NState::MUTATABLE, N1, N2);
+  ASSERT_NODE_STATE(NState::SEALING, N3);
+  ASSERT_TRUE(erm_->getGracePeriodTimer()->isActive());
+  static_cast<MockTimer*>(erm_->getGracePeriodTimer())->trigger();
+  checkRecoveryState(ERMState::MUTATION);
+
+  // N2 disconnects and recovery should be restarted.
+  setNodeState(N2, ClusterStateNodeState::DEAD);
+  erm_->onRecoveryNodeFailure(N2);
+
+  ASSERT_NODE_STATE(NState::DIGESTING, N1, N2);
+  ASSERT_NODE_STATE(NState::SEALING, N3);
+  checkRecoveryState(ERMState::DIGEST);
+
+  // Restore mutation stage.
+  setNodeState(N2, ClusterStateNodeState::FULLY_STARTED);
+
+  erm_->onMessageSent(N1, MessageType::START, E::OK, read_stream_id_t(3));
+  erm_->onMessageSent(N2, MessageType::START, E::OK, read_stream_id_t(4));
+  erm_->onDigestStreamStarted(N1, read_stream_id_t(3), lsn(epoch_, 1), E::OK);
+  erm_->onDigestStreamStarted(N2, read_stream_id_t(4), lsn(epoch_, 1), E::OK);
+  erm_->onDigestRecord(N1, read_stream_id_t(3), mockRecord(lsn(epoch_, 1), 9));
+  erm_->onDigestRecord(N2, read_stream_id_t(4), mockRecord(lsn(epoch_, 1), 9));
+  erm_->onDigestGap(
+      N1,
+      mockGap(N1, lsn(epoch_, 2), lsn(epoch_, ESN_MAX), read_stream_id_t(3)));
+  erm_->onDigestGap(
+      N2,
+      mockGap(N2, lsn(epoch_, 2), lsn(epoch_, ESN_MAX), read_stream_id_t(4)));
+
+  // N1, N2 became DIGESTED then MUTATABLE
+  ASSERT_NODE_STATE(NState::MUTATABLE, N1, N2);
+  ASSERT_NODE_STATE(NState::SEALING, N3);
+  ASSERT_TRUE(erm_->getGracePeriodTimer()->isActive());
+  static_cast<MockTimer*>(erm_->getGracePeriodTimer())->trigger();
+  checkRecoveryState(ERMState::MUTATION);
+
+  // mutator is done
+  erm_->onMutationComplete(esn_t(2), E::OK, ShardID());
+  checkRecoveryState(ERMState::CLEAN);
+
+  // N2 disconnects and recovery should be restarted.
+  setNodeState(N2, ClusterStateNodeState::DEAD);
+  erm_->onRecoveryNodeFailure(N2);
+
+  ASSERT_NODE_STATE(NState::DIGESTING, N1, N2);
+  ASSERT_NODE_STATE(NState::SEALING, N3);
+  checkRecoveryState(ERMState::DIGEST);
 }
 
 } // anonymous namespace

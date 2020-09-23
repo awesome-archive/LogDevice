@@ -9,11 +9,8 @@
 
 #include <folly/io/IOBuf.h>
 
-#include "event2/buffer.h"
-#include "event2/event.h"
 #include "logdevice/common/Checksum.h"
 #include "logdevice/common/debug.h"
-#include "logdevice/common/libevent/compat.h"
 #include "logdevice/common/protocol/MessageTypeNames.h"
 
 namespace facebook { namespace logdevice {
@@ -42,6 +39,7 @@ class IOBufDestination : public ProtocolWriter::Destination {
       prev_buf->append(nbytes);
     };
 
+    ld_check(nbytes > 0);
     auto avail = iobuf_->prev()->tailroom();
     auto nadd = std::min(nbytes, avail);
     if (avail == 0) {
@@ -73,9 +71,24 @@ class IOBufDestination : public ProtocolWriter::Destination {
   int writeWithoutCopy(const void* src,
                        size_t nbytes,
                        size_t /*nwritten*/) override {
+    ld_check(nbytes > 0);
     auto new_iobuf =
         folly::IOBuf::wrapBuffer(static_cast<const void*>(src), nbytes);
     iobuf_->prependChain(std::move(new_iobuf));
+    return 0;
+  }
+
+  // This behaves nicer than what ProtocolWriter requires:
+  //
+  // Writes a clone of the provided IOBuf chain. This increments refcount for
+  // the buffer's data, so it's ok to destroy the original IOBuf after this
+  // call. However, it's not ok to *modify* the IOBuf's contents after the
+  // call, as the clone points to the same data.
+  int writeWithoutCopy(const folly::IOBuf* buffer,
+                       size_t /* nwritten */) override {
+    ld_check(buffer->computeChainDataLength());
+    auto clone = buffer->clone();
+    iobuf_->prependChain(std::move(clone));
     return 0;
   }
 
@@ -108,62 +121,6 @@ class IOBufDestination : public ProtocolWriter::Destination {
   folly::IOBuf* const iobuf_;
 };
 
-class EvbufferDestination : public ProtocolWriter::Destination {
- public:
-  int write(const void* src, size_t nbytes, size_t /*nwritten*/) override {
-    // caller should check and shouldn't call this when dest isNull
-    ld_check(!isNull());
-    int rv = LD_EV(evbuffer_add)(dest_evbuf_, src, nbytes);
-    if (rv != 0) {
-      err = E::INTERNAL;
-      ld_check(false);
-    }
-    return rv;
-  }
-
-  int writeWithoutCopy(const void* src,
-                       size_t nbytes,
-                       size_t /*nwritten*/) override {
-    ld_check(!isNull());
-    int rv = LD_EV(evbuffer_add_reference)(
-        dest_evbuf_, src, nbytes, nullptr, nullptr);
-    if (rv != 0) {
-      err = E::INTERNAL;
-      ld_check(false);
-    }
-    return rv;
-  }
-
-  uint64_t computeChecksum() override {
-    uint64_t checksum = 0;
-    ld_check(dest_evbuf_);
-
-    const size_t len = LD_EV(evbuffer_get_length)(dest_evbuf_);
-    std::string data(len, 0);
-    ev_ssize_t nbytes = LD_EV(evbuffer_copyout)(dest_evbuf_, &data[0], len);
-    ld_check(nbytes == len);
-    Slice slice(&data[0], nbytes);
-    checksum_bytes(slice, 64, (char*)&checksum);
-
-    return checksum;
-  }
-
-  const char* identify() const override {
-    return "evbuffer destination";
-  }
-
-  bool isNull() const override {
-    return dest_evbuf_ == nullptr;
-  }
-
-  explicit EvbufferDestination(evbuffer* dest) : dest_evbuf_(dest) {}
-
-  ~EvbufferDestination() override {}
-
- private:
-  struct evbuffer* const dest_evbuf_;
-};
-
 class LinearBufferDestinationBase : public ProtocolWriter::Destination {
  public:
   static int writeBuffer(const void* src,
@@ -192,9 +149,13 @@ class LinearBufferDestinationBase : public ProtocolWriter::Destination {
   int writeWithoutCopy(const void* src,
                        size_t nbytes,
                        size_t nwritten) override {
-    // currently zero copy is *not* support in linear buffer destination
-    // fallback to copy
+    // Currently zero copy is not supported in linear buffer destination.
+    // Fall back to copy.
     return write(src, nbytes, nwritten);
+  }
+
+  int writeWithoutCopy(const folly::IOBuf* buffer, size_t nwritten) override {
+    return writeWithoutCopy(buffer->data(), buffer->length(), nwritten);
   }
 
   /* unused */
@@ -269,16 +230,6 @@ ProtocolWriter::ProtocolWriter(Destination* dest,
 }
 
 ProtocolWriter::ProtocolWriter(MessageType type,
-                               struct evbuffer* dest,
-                               folly::Optional<uint16_t> proto)
-    : dest_owned_(true),
-      dest_(new (dest_space_) EvbufferDestination(dest)),
-      context_(messageTypeNames()[type].c_str()),
-      proto_(proto) {
-  static_assert(sizeof(dest_space_) >= sizeof(EvbufferDestination), "");
-}
-
-ProtocolWriter::ProtocolWriter(MessageType type,
                                folly::IOBuf* iobuf,
                                folly::Optional<uint16_t> proto)
     : dest_(new (dest_space_) IOBufDestination(iobuf)),
@@ -349,6 +300,16 @@ void ProtocolWriter::writeWithoutCopy(const void* data, size_t nbytes) {
         [&] { return dest_->writeWithoutCopy(data, nbytes, nwritten_); });
   }
   nwritten_ += nbytes;
+}
+
+void ProtocolWriter::writeWithoutCopy(const folly::IOBuf* buffer) {
+  if (!isProtoVersionAllowed()) {
+    return;
+  }
+  if (!dest_->isNull() && ok()) {
+    writeImplCb([&] { return dest_->writeWithoutCopy(buffer, nwritten_); });
+  }
+  nwritten_ += buffer->length();
 }
 
 }} // namespace facebook::logdevice

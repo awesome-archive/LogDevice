@@ -17,7 +17,6 @@
 #include "logdevice/common/MetaDataLogReader.h"
 #include "logdevice/common/NoopTraceLogger.h"
 #include "logdevice/common/PermissionChecker.h"
-#include "logdevice/common/PrincipalParser.h"
 #include "logdevice/common/Processor.h"
 #include "logdevice/common/SequencerLocator.h"
 #include "logdevice/common/Worker.h"
@@ -39,35 +38,60 @@ using namespace facebook::logdevice;
 
 namespace {
 struct SeqReactivationStats {
-  uint64_t scheduled = 0;
-  uint64_t completed = 0;
+  uint64_t activity = 0;
   uint64_t delayed = 0;
   uint64_t delayCompleted = 0;
   uint64_t reactivations = 0;
+  uint64_t activations = 0;
 
-  bool statsMatch() {
-    return ((scheduled == completed) && (delayed == delayCompleted));
+  bool areReactivationsDone() {
+    return activity == 0 && delayed == delayCompleted;
   }
 };
 
-SeqReactivationStats getSeqReactivationStats(
-    const std::unique_ptr<IntegrationTestUtils::Cluster>& cluster) {
+void addSeqStats(IntegrationTestUtils::Node& node,
+                 SeqReactivationStats& stats) {
+  auto nodeStats = node.stats();
+  stats.activity += nodeStats.at("sequencer_activity_in_progress");
+
+  stats.delayed += nodeStats.at("sequencer_reactivations_delayed");
+  stats.delayCompleted +=
+      nodeStats.at("sequencer_reactivations_delay_completed");
+  stats.reactivations +=
+      nodeStats.at("sequencer_reactivations_for_metadata_update");
+
+  stats.activations += nodeStats.at("sequencer_activations");
+}
+
+SeqReactivationStats
+getSeqStats(const std::unique_ptr<IntegrationTestUtils::Cluster>& cluster) {
   SeqReactivationStats stats;
   for (const auto& it : cluster->getNodes()) {
-    auto nodeStats = it.second->stats();
-    stats.scheduled +=
-        nodeStats["background_sequencer_reactivation_checks_scheduled"];
-    stats.completed +=
-        nodeStats["background_sequencer_reactivation_checks_completed"];
-
-    stats.delayed += nodeStats["sequencer_reactivations_delayed"];
-    stats.delayCompleted +=
-        nodeStats["sequencer_reactivations_delay_completed"];
-    stats.reactivations +=
-        nodeStats["sequencer_reactivations_for_metadata_update"];
+    addSeqStats(*it.second, stats);
   }
   return stats;
 }
+
+void waitForReactivations(
+    const std::unique_ptr<IntegrationTestUtils::Cluster>& cluster) {
+  for (const auto& it : cluster->getNodes()) {
+    wait_until(folly::sformat("reactivation complete on N{}", it.first).c_str(),
+               [&]() {
+                 SeqReactivationStats stats;
+                 addSeqStats(*it.second, stats);
+                 ld_info("activity: %lu, delayed: %lu, delayCompleted: %lu, "
+                         "reactivations: "
+                         "%lu, activations: %lu",
+                         stats.activity,
+                         stats.delayed,
+                         stats.delayCompleted,
+                         stats.reactivations,
+                         stats.activations);
+                 return stats.areReactivationsDone();
+               });
+  }
+}
+
 } // namespace
 
 class SequencerIntegrationTest : public IntegrationTestBase {};
@@ -115,7 +139,7 @@ TEST_F(SequencerIntegrationTest, SequencerReactivationTest) {
     previous_lsn = lsn;
   }
 
-  cluster->waitForRecovery();
+  cluster->waitUntilAllSequencersQuiescent();
 
   auto it = lsn_map.cbegin();
   bool has_payload = true;
@@ -173,22 +197,18 @@ TEST_F(SequencerIntegrationTest, SequencerReactivationTest) {
 // sequencer-reactivation-delay-secs is set to a high value.
 TEST_F(SequencerIntegrationTest,
        SequencerReactivationReplFactorChangeDelayTest) {
-  Configuration::Nodes nodes;
   size_t num_nodes = 5;
-  for (int i = 0; i < num_nodes; ++i) {
-    auto& node = nodes[i];
-    node.generation = 1;
-    node.addSequencerRole();
-    node.addStorageRole();
-  }
 
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(2);
-  log_attrs.set_nodeSetSize(10);
+  auto nodes_configuration = createSimpleNodesConfig(num_nodes, 1, true);
+
+  auto log_attrs =
+      logsconfig::LogAttributes().with_replicationFactor(2).with_nodeSetSize(
+          10);
+
   uint32_t numLogs = 32;
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
-          .setNodes(nodes)
+          .setNodes(nodes_configuration)
           .useHashBasedSequencerAssignment(100, "10s")
           .enableMessageErrorInjection()
           .setLogGroupName("test_range")
@@ -200,8 +220,7 @@ TEST_F(SequencerIntegrationTest,
           .setNumLogs(numLogs)
           .create(num_nodes);
 
-  for (const auto& it : nodes) {
-    node_index_t idx = it.first;
+  for (const auto& [idx, _] : *nodes_configuration->getServiceDiscovery()) {
     cluster->waitUntilGossip(/* alive */ true, idx);
   }
 
@@ -217,16 +236,7 @@ TEST_F(SequencerIntegrationTest,
     } while (lsn == LSN_INVALID);
   }
 
-  auto get_activations = [&]() {
-    size_t activations = 0;
-    for (const auto& it : nodes) {
-      auto stats = cluster->getNode(it.first).stats();
-      activations += stats["sequencer_activations"];
-    }
-    return activations;
-  };
-
-  const size_t initial_activations = get_activations();
+  const size_t initial_activations = getSeqStats(cluster).activations;
   EXPECT_GE(initial_activations, numLogs);
 
   // Update the config by changing the replication factor
@@ -252,40 +262,22 @@ TEST_F(SequencerIntegrationTest,
       log_in_directory.getFullyQualifiedName(),
       log_in_directory.log_group->withLogAttributes(new_attrs)));
 
-  uint64_t scheduled_before = getSeqReactivationStats(cluster).scheduled;
-
   cluster->writeConfig(
       full_config->serverConfig().get(), logs_config_changed.get());
+  // TODO (#54730512): wait for servers to *fully* process config update.
   cluster->waitForServersToPartiallyProcessConfigUpdate();
-  cluster->waitForRecovery();
 
-  // Wait until more reactivations are scheduled and completed, presumably
-  // triggered by the config update. There can also be spurious checks caused
-  // by previous events, which may cause this wait to end too early, making this
-  // test case weaker but not causing it to fail spuriously.
-  wait_until("more reactivation checks are scheduled and completed", [&]() {
-    auto stats = getSeqReactivationStats(cluster);
-    ld_info("reactivations: scheduled: %lu, completed: %lu, "
-            "delayed: %lu, delayCompleted: %lu, reactivations: %lu",
-            stats.scheduled,
-            stats.completed,
-            stats.delayed,
-            stats.delayCompleted,
-            stats.reactivations);
-    return stats.scheduled > scheduled_before && stats.statsMatch();
-  });
+  waitForReactivations(cluster);
 
   // Check that reactivations completed without waiting for the specified delay
   // in the settings.
   auto delay = RecordTimestamp::now().toSeconds() - start;
   EXPECT_LT(delay.count(), 1200);
 
-  auto stats = getSeqReactivationStats(cluster);
+  auto stats = getSeqStats(cluster);
   EXPECT_EQ(stats.delayed, 0);
   EXPECT_EQ(stats.delayCompleted, 0);
-
-  size_t num_activations_after_config_change = get_activations();
-  EXPECT_GE(num_activations_after_config_change - initial_activations, numLogs);
+  EXPECT_GE(stats.activations - initial_activations, numLogs);
 }
 
 // Sequencer activation may be performed immediately or postponed
@@ -298,20 +290,14 @@ TEST_F(SequencerIntegrationTest,
 // of the sequencer options like the window size changes, even though
 // sequencer-reactivation-delay-secs is set to a high value.
 TEST_F(SequencerIntegrationTest, WinSizeChangeDelayTest) {
-  Configuration::Nodes nodes;
   size_t num_nodes = 5;
-  for (int i = 0; i < num_nodes; ++i) {
-    auto& node = nodes[i];
-    node.generation = 1;
-    node.addSequencerRole();
-    node.addStorageRole();
-  }
+  auto nodes = createSimpleNodesConfig(num_nodes, 1, true);
 
-  logsconfig::LogAttributes log_attrs =
+  auto log_attrs =
       IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(
-          num_nodes);
-  // window size is initially 200
-  log_attrs.set_maxWritesInFlight(200);
+          num_nodes)
+          // window size is initially 200
+          .with_maxWritesInFlight(200);
   uint32_t numLogs = 32;
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
@@ -327,8 +313,7 @@ TEST_F(SequencerIntegrationTest, WinSizeChangeDelayTest) {
           .setNumLogs(numLogs)
           .create(num_nodes);
 
-  for (const auto& it : nodes) {
-    node_index_t idx = it.first;
+  for (const auto& [idx, _] : *nodes->getServiceDiscovery()) {
     cluster->waitUntilGossip(/* alive */ true, idx);
   }
   auto client = cluster->createClient();
@@ -342,16 +327,7 @@ TEST_F(SequencerIntegrationTest, WinSizeChangeDelayTest) {
     } while (lsn == LSN_INVALID);
   }
 
-  auto get_activations = [&]() {
-    size_t activations = 0;
-    for (const auto& it : nodes) {
-      auto stats = cluster->getNode(it.first).stats();
-      activations += stats["sequencer_activations"];
-    }
-    return activations;
-  };
-
-  const size_t initial_activations = get_activations();
+  const size_t initial_activations = getSeqStats(cluster).activations;
   EXPECT_GE(initial_activations, numLogs);
 
   // change the sequencer window size in config
@@ -375,37 +351,21 @@ TEST_F(SequencerIntegrationTest, WinSizeChangeDelayTest) {
           log_in_directory.log_group->attrs().with_maxWritesInFlight(300)));
   ASSERT_TRUE(rv);
 
-  uint64_t scheduled_before = getSeqReactivationStats(cluster).scheduled;
-
   cluster->writeConfig(
       full_config->serverConfig().get(), logs_config_changed.get());
   cluster->waitForServersToPartiallyProcessConfigUpdate();
-  cluster->waitForRecovery();
 
-  // Wait until the scheduled activations are completed
-  wait_until("more reactivation checks are scheduled and completed", [&]() {
-    auto stats = getSeqReactivationStats(cluster);
-    ld_info("reactivations: scheduled: %lu, completed: %lu, "
-            "delayed: %lu, delayCompleted: %lu, reactivations: %lu",
-            stats.scheduled,
-            stats.completed,
-            stats.delayed,
-            stats.delayCompleted,
-            stats.reactivations);
-    return stats.scheduled > scheduled_before && stats.statsMatch();
-  });
+  waitForReactivations(cluster);
 
   // Check that reactivations completed without waiting for the specified delay
   // in the settings.
   auto delay = RecordTimestamp::now().toSeconds() - start;
   EXPECT_LT(delay.count(), 1200);
 
-  auto stats = getSeqReactivationStats(cluster);
+  auto stats = getSeqStats(cluster);
   EXPECT_EQ(stats.delayed, 0);
   EXPECT_EQ(stats.delayCompleted, 0);
-
-  size_t num_activations_after_config_change = get_activations();
-  EXPECT_GE(num_activations_after_config_change - initial_activations, numLogs);
+  EXPECT_GE(stats.activations - initial_activations, numLogs);
 }
 
 // Sequencer activation may be performed immediately or postponed
@@ -431,12 +391,14 @@ TEST_F(SequencerIntegrationTest, StorageStateChangeDelayTest) {
     }
   }
 
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_nodeSetSize(3);
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes));
+
+  auto log_attrs =
+      logsconfig::LogAttributes().with_replicationFactor(3).with_nodeSetSize(3);
   uint32_t numLogs = 1;
   auto cluster = IntegrationTestUtils::ClusterFactory()
-                     .setNodes(nodes)
+                     .setNodes(nodes_configuration)
                      .useHashBasedSequencerAssignment(100, "10s")
                      .enableMessageErrorInjection()
                      .setLogGroupName("test_range")
@@ -448,8 +410,7 @@ TEST_F(SequencerIntegrationTest, StorageStateChangeDelayTest) {
                      .setNumLogs(numLogs)
                      .create(num_nodes);
 
-  for (const auto& it : nodes) {
-    node_index_t idx = it.first;
+  for (const auto& [idx, _] : *nodes_configuration->getServiceDiscovery()) {
     cluster->waitUntilGossip(/* alive */ true, idx);
   }
 
@@ -465,39 +426,10 @@ TEST_F(SequencerIntegrationTest, StorageStateChangeDelayTest) {
     } while (lsn == LSN_INVALID);
   }
 
-  auto get_activations = [&]() {
-    size_t activations = 0;
-    for (const auto& it : nodes) {
-      auto stats = cluster->getNode(it.first).stats();
-      activations += stats["sequencer_activations"];
-    }
-    return activations;
-  };
+  cluster->waitUntilAllSequencersQuiescent();
 
-  const size_t initial_activations = get_activations();
+  const size_t initial_activations = getSeqStats(cluster).activations;
   EXPECT_GE(initial_activations, numLogs);
-
-  // Wait for sequencers to become quiescent. This is stupidly difficult to
-  // do correctly, and we're *not* doing it correctly here. But currently this
-  // seems good enough to avoid flakiness in practice.
-  //
-  // As far as I can tell, things currently work like this:
-  //  1. Our appendSync() triggers a sequencer activation. The newly activated
-  //     sequencer takes and completes our append.
-  //  2. The sequencer activation kicks off a recovery and a metadata log write.
-  //  3. When metadata log write completes, it triggers a sequencer
-  //     reactivation, for bad arcane reasons. For even more bad reasons,
-  //     that reactivation may fail and be retried using an exponential backoff
-  //     timer. There's no easy way to tell whether such a retry is currently
-  //     pending (the timer is of fire-and-forget kind); neither
-  //     waitForRecovery() nor waitForMetaDataLogWrites() waits for such
-  //     reactivations.
-  //  4. If we update config while sequencer reactivation is in progress, the
-  //     reactivation may apply the config changes along the way, and we'll
-  //     never see delayed reactivations or reactivations triggered by config
-  //     updates.
-  cluster->waitForRecovery();
-  cluster->waitForMetaDataLogWrites();
 
   // Pick any node from the nodeset of log 1 and disable it. This should
   // regenerate the nodeset for the written log.
@@ -524,33 +456,22 @@ TEST_F(SequencerIntegrationTest, StorageStateChangeDelayTest) {
             toString(info).c_str());
   }
 
-  EXPECT_EQ(0, getSeqReactivationStats(cluster).delayed);
+  EXPECT_EQ(0, getSeqStats(cluster).delayed);
 
   ld_info("Set the weight of N%hu to 0.", to_disable);
   auto start = RecordTimestamp::now().toSeconds();
   cluster->updateNodeAttributes(
       to_disable, configuration::StorageState::DISABLED, 1);
   cluster->waitForServersToPartiallyProcessConfigUpdate();
-  cluster->waitForRecovery();
 
-  // Wait for some delayed reactivations to happen.
-  wait_until("background activations completed", [&]() {
-    auto stats = getSeqReactivationStats(cluster);
-    ld_info("reactivations: scheduled: %lu, completed: %lu, "
-            "delayed: %lu, delayCompleted: %lu, reactivations: %lu",
-            stats.scheduled,
-            stats.completed,
-            stats.delayed,
-            stats.delayCompleted,
-            stats.reactivations);
-    return stats.delayed != 0 && stats.statsMatch();
-  });
+  waitForReactivations(cluster);
 
   // The delayed reactivatins must result in actual reactivations
-  auto stats = getSeqReactivationStats(cluster);
+  auto stats = getSeqStats(cluster);
   uint64_t activations_after_state_change =
-      stats.reactivations - initial_activations;
+      stats.activations - initial_activations;
   EXPECT_GE(activations_after_state_change, stats.delayCompleted);
+  EXPECT_GE(stats.delayed, 1);
 
   // Check that reactivations completed after waiting for the specified delay in
   // the settings.
@@ -568,19 +489,15 @@ TEST_F(SequencerIntegrationTest, StorageStateChangeDelayTest) {
 // sequencer-reactivation-delay-secs if the nodeset is changed
 // due to an expand or shrink operation.
 TEST_F(SequencerIntegrationTest, ExpandShrinkReactivationDelayTest) {
-  Configuration::Nodes nodes;
-  size_t num_nodes = 10;
-  for (int i = 0; i < num_nodes; ++i) {
-    auto& node = nodes[i];
-    node.generation = 1;
-    node.addSequencerRole();
-    node.addStorageRole();
-  }
+  bool expand = folly::Random::rand32() % 2 == 0; // otherwise shrink
+
+  size_t num_nodes = expand ? 4 : 6;
+
+  auto nodes = createSimpleNodesConfig(num_nodes, 1, true);
 
   shard_size_t num_shards = 1;
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_nodeSetSize(5);
+  auto log_attrs =
+      logsconfig::LogAttributes().with_replicationFactor(3).with_nodeSetSize(4);
   uint32_t numLogs = 32;
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .setNodes(nodes)
@@ -596,8 +513,7 @@ TEST_F(SequencerIntegrationTest, ExpandShrinkReactivationDelayTest) {
                      .setNumLogs(numLogs)
                      .create(num_nodes);
 
-  for (const auto& it : nodes) {
-    node_index_t idx = it.first;
+  for (const auto& [idx, _] : *nodes->getServiceDiscovery()) {
     cluster->waitUntilGossip(/* alive */ true, idx);
   }
 
@@ -608,272 +524,43 @@ TEST_F(SequencerIntegrationTest, ExpandShrinkReactivationDelayTest) {
   // for log 1..numLogs, send a write to activate the sequencer
   for (logid_t::raw_type logid_r = 1; logid_r <= numLogs; ++logid_r) {
     lsn_t lsn;
-    do {
+    while (true) {
       lsn = client->appendSync(logid_t(logid_r), "dummy");
-    } while (lsn == LSN_INVALID);
+      if (lsn != LSN_INVALID) {
+        break;
+      }
+      ld_debug("Apend for log %lu failed: %s", logid_r, error_name(err));
+    }
   }
 
-  auto get_activations = [&]() {
-    size_t activations = 0;
-    for (const auto& it : nodes) {
-      auto stats = cluster->getNode(it.first).stats();
-      activations += stats["sequencer_activations"];
-    }
-    return activations;
-  };
+  waitForReactivations(cluster);
 
-  const size_t initial_activations = get_activations();
-  EXPECT_GE(initial_activations, numLogs);
-
-  // Wait until all the scheduled activations are completed
-  wait_until("background activations completed", [&]() {
-    auto stats = getSeqReactivationStats(cluster);
-    ld_info("reactivations: scheduled: %lu, completed: %lu, "
-            "delayed: %lu, delayCompleted: %lu, reactivations: %lu",
-            stats.scheduled,
-            stats.completed,
-            stats.delayed,
-            stats.delayCompleted,
-            stats.reactivations);
-    return stats.statsMatch();
-  });
-
-  auto stats = getSeqReactivationStats(cluster);
+  auto stats = getSeqStats(cluster);
+  EXPECT_GE(stats.activations, numLogs);
   EXPECT_EQ(stats.delayed, 0);
-  // Randomly chose to expand or shrink the cluster
+
   auto start = RecordTimestamp::now().toSeconds();
-  size_t numExpandNodes = 5;
-  size_t numShrinkNodes = 4;
-  if ((folly::Random::rand32() % 2) == 0) {
+  if (expand) {
     ld_info("test expanding cluster");
-    cluster->expand(numExpandNodes, true);
-    num_nodes += numExpandNodes;
+    cluster->expand(2, true);
   } else {
     ld_info("test shrinking cluster");
-    cluster->shrink(numShrinkNodes);
-    num_nodes -= numShrinkNodes;
+    cluster->shrink(2);
   }
 
-  // Wait until the scheduled activations are completed
-  wait_until("background activations completed", [&]() {
-    auto latest_stats = getSeqReactivationStats(cluster);
-    EXPECT_GT(latest_stats.scheduled, 0);
-    ld_info("reactivations: scheduled: %lu, completed: %lu, "
-            "delayed: %lu, delayCompleted: %lu, reactivations: %lu",
-            stats.scheduled,
-            stats.completed,
-            stats.delayed,
-            stats.delayCompleted,
-            stats.reactivations);
-    return latest_stats.statsMatch();
-  });
+  waitForReactivations(cluster);
 
-  // We are done processing all the scheduled activations so those that need to
-  // be postponed must also be scheduled by now.
-  wait_until("Delayed activations completed", [&]() {
-    auto latest_stats = getSeqReactivationStats(cluster);
-    EXPECT_GT(latest_stats.delayed, 0);
-    ld_info("reactivations: scheduled: %lu, completed: %lu, "
-            "delayed: %lu, delayCompleted: %lu, reactivations: %lu",
-            stats.scheduled,
-            stats.completed,
-            stats.delayed,
-            stats.delayCompleted,
-            stats.reactivations);
-    return latest_stats.statsMatch();
-  });
-
-  // The delayed reactivations must result in actual reactivations
-  stats = getSeqReactivationStats(cluster);
-  uint64_t activations_after_size_change =
-      stats.reactivations - initial_activations;
-  EXPECT_GE(activations_after_size_change, stats.delayCompleted);
+  // At least some of the delayed reactivations must result in actual
+  // reactivations. Not all of them will because sequencer might move away from
+  // the node while waiting for reactivation.
+  stats = getSeqStats(cluster);
+  EXPECT_GE(stats.reactivations, 1);
+  EXPECT_GE(stats.delayed, 1);
 
   // Check that reactivations completed after waiting for the specified delay in
   // the settings.
   auto delay = RecordTimestamp::now().toSeconds() - start;
   EXPECT_GE(delay.count(), 6);
-}
-
-// Sequencer activation may be performed immediately or postponed
-// based on the information that is changing. Changes to important
-// information like a logs config parameters need to be updated
-// immediately while a change in the nodeset due to changes to
-// the storage state can be applied after a delay.
-//
-// Test that the sequencer reactivation occurs immediately if one
-// of the sequencer options like the window size, or config params
-// like the replication factor, change in combination with the storage
-// state. Just the storage state change related reactivation could be
-// delayed but not in combination with other important information changing.
-TEST_F(SequencerIntegrationTest, ConfigParamsAndStorageStateChangeDelayTest) {
-  Configuration::Nodes nodes;
-  size_t num_nodes = 7;
-  // 2 sequencer nodes and 5 storage nodes
-  for (int i = 0; i < num_nodes; ++i) {
-    auto& node = nodes[i];
-    node.generation = 1;
-    if (i < 2) {
-      node.addSequencerRole();
-    } else {
-      node.addStorageRole();
-    }
-  }
-
-  logsconfig::LogAttributes log_attrs =
-      IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(
-          num_nodes);
-  // window size is initially 200 and repl factor is initally 2.
-  log_attrs.set_maxWritesInFlight(200);
-  log_attrs.set_replicationFactor(2);
-  log_attrs.set_nodeSetSize(3);
-
-  uint32_t numLogs = 1;
-  auto cluster =
-      IntegrationTestUtils::ClusterFactory()
-          .setNodes(nodes)
-          .useHashBasedSequencerAssignment(100, "10s")
-          .enableMessageErrorInjection()
-          .setLogGroupName("test_range")
-          .setLogAttributes(log_attrs)
-          .setParam("--sequencer-reactivation-delay-secs", "1200s..2000s")
-          .setParam("--nodeset-adjustment-period", "0s")
-          .setParam("--nodeset-adjustment-min-window", "1s")
-          .setParam("--nodeset-size-adjustment-min-factor", "0")
-          .setNumLogs(numLogs)
-          .create(num_nodes);
-
-  for (const auto& it : nodes) {
-    node_index_t idx = it.first;
-    cluster->waitUntilGossip(/* alive */ true, idx);
-  }
-
-  auto client = cluster->createClient();
-  ld_info("starting test...");
-
-  // Append some records
-  // for log 1..numLogs, send a write to activate the sequencer
-  for (logid_t::raw_type logid_r = 1; logid_r <= numLogs; ++logid_r) {
-    lsn_t lsn;
-    do {
-      lsn = client->appendSync(logid_t(logid_r), "dummy");
-    } while (lsn == LSN_INVALID);
-  }
-
-  auto get_activations = [&]() {
-    size_t activations = 0;
-    for (const auto& it : nodes) {
-      auto stats = cluster->getNode(it.first).stats();
-      activations += stats["sequencer_activations"];
-    }
-    return activations;
-  };
-
-  const size_t initial_activations = get_activations();
-  EXPECT_GE(initial_activations, numLogs);
-
-  // Find node with most STOREs. Don't disable it yet but when we do it should
-  // regenerate the nodeset for the written log.
-  std::unordered_map<node_index_t, size_t> stores;
-  node_index_t to_disable = 1;
-  for (node_index_t n = 2; n <= 6; ++n) {
-    stores[n] = cluster->getNode(n).stats()["message_received.STORE"];
-    if (stores[n] > stores[to_disable]) {
-      to_disable = n;
-    }
-  }
-
-  auto full_config = cluster->getConfig()->get();
-  ld_check(full_config);
-  auto logs_config_changed = full_config->localLogsConfig()->copy();
-  auto local_logs_config_changed =
-      checked_downcast<configuration::LocalLogsConfig*>(
-          logs_config_changed.get());
-
-  auto& logs = const_cast<logsconfig::LogMap&>(
-      checked_downcast<configuration::LocalLogsConfig*>(
-          logs_config_changed.get())
-          ->getLogMap());
-  auto log_in_directory = logs.begin()->second;
-
-  // With some probability, update the config by changing the replication
-  // factor. This test depends on at least one of those changing so make sure
-  // that happens.
-  bool config_changed = false;
-  while (!config_changed) {
-    if ((folly::Random::rand32() % 2) == 0) {
-      ld_info("changing replication factor from 2 to 1");
-      auto& attrs = log_in_directory.log_group->attrs();
-      ASSERT_EQ(ReplicationProperty({{NodeLocationScope::NODE, 2}}).toString(),
-                ReplicationProperty::fromLogAttributes(attrs).toString());
-      auto new_attrs = attrs.with_replicationFactor(1);
-      ASSERT_TRUE(local_logs_config_changed->replaceLogGroup(
-          log_in_directory.getFullyQualifiedName(),
-          log_in_directory.log_group->withLogAttributes(new_attrs)));
-      config_changed = true;
-    }
-
-    // With some probability, change the window size
-    if ((folly::Random::rand32() % 2) == 0) {
-      // changing window size to 300 for the whole log group
-      ld_info("changing window size from 200 to 300");
-      bool rv = local_logs_config_changed->replaceLogGroup(
-          log_in_directory.getFullyQualifiedName(),
-          log_in_directory.log_group->withLogAttributes(
-              log_in_directory.log_group->attrs().with_maxWritesInFlight(300)));
-      ASSERT_TRUE(rv);
-      config_changed = true;
-    }
-  }
-
-  // Now disable the node then write out the new config that contains changes
-  // about the change to storage state as well as the window size and or
-  // replication factor.
-  Configuration::Nodes tmp_nodes = full_config->serverConfig()->getNodes();
-  const auto& node_disable = nodes[to_disable];
-  ld_check(node_disable.storage_attributes != nullptr);
-  node_disable.storage_attributes->state =
-      configuration::StorageState::DISABLED;
-
-  auto start = RecordTimestamp::now().toSeconds();
-  Configuration::NodesConfig new_nodes_config(std::move(tmp_nodes));
-  std::shared_ptr<ServerConfig> new_server_config =
-      full_config->serverConfig()
-          ->withNodes(std::move(new_nodes_config))
-          ->withIncrementedVersion();
-
-  uint64_t scheduled_before = getSeqReactivationStats(cluster).scheduled;
-
-  cluster->writeConfig(new_server_config.get(), logs_config_changed.get());
-  cluster->waitForServersToPartiallyProcessConfigUpdate();
-  cluster->waitForRecovery();
-  ld_info("Set the weight of N%hu to 0.", to_disable);
-
-  // Wait until some activations are scheduled and completed
-  wait_until("background activations completed", [&]() {
-    auto stats = getSeqReactivationStats(cluster);
-    ld_info("reactivations: scheduled: %lu, completed: %lu, "
-            "delayed: %lu, delayCompleted: %lu, reactivations: %lu",
-            stats.scheduled,
-            stats.completed,
-            stats.delayed,
-            stats.delayCompleted,
-            stats.reactivations);
-    return stats.scheduled > scheduled_before && stats.statsMatch();
-  });
-
-  // We are done processing all the scheduled activations so those that need to
-  // be postponed must also be scheduled by now. Check that reactivations
-  // completed without waiting for the specified delay in the settings.
-  auto delay = RecordTimestamp::now().toSeconds() - start;
-  EXPECT_LT(delay.count(), 1200);
-
-  auto stats = getSeqReactivationStats(cluster);
-  EXPECT_EQ(stats.delayed, 0);
-  EXPECT_EQ(stats.delayCompleted, 0);
-
-  size_t num_activations_after_config_change = get_activations();
-  EXPECT_GE(num_activations_after_config_change - initial_activations, numLogs);
 }
 
 TEST_F(SequencerIntegrationTest, SequencerIsolation) {
@@ -909,22 +596,21 @@ TEST_F(SequencerIntegrationTest, SequencerIsolation) {
     nodes[i].addStorageRole(/*num_shards*/ 2);
   }
 
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes));
+
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
-          .setNodes(nodes)
+          .setNodes(std::move(nodes_configuration))
           .setParam("--isolated-sequencer-ttl", "5s")
           .useHashBasedSequencerAssignment()
           .enableMessageErrorInjection()
-          .oneConfigPerNode()
           .doPreProvisionEpochMetaData() // prevents spurious sequencer
                                          // reactivations due to metadata log
                                          // writes
           .create(NNODES);
 
-  for (const auto& it : nodes) {
-    node_index_t idx = it.first;
-    cluster->getNode(idx).waitUntilAvailable();
-  }
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
 
   auto client = cluster->createClient();
   lsn_t lsn1 = client->appendSync(logid_t(1), "foo");
@@ -950,13 +636,8 @@ TEST_F(SequencerIntegrationTest, SequencerIsolation) {
 // succeed and cause a new node to bring up a sequencer.
 TEST_F(SequencerIntegrationTest, SequencerReactivationOnFailure) {
   const int NNODES = 4;
-  Configuration::Nodes nodes;
-  for (node_index_t i = 0; i < NNODES; ++i) {
-    auto& node = nodes[i];
-    node.generation = 1;
-    node.addSequencerRole();
-    node.addStorageRole(/*num_shards*/ 2);
-  }
+
+  auto nodes = createSimpleNodesConfig(NNODES, 2, true);
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
           .setNodes(nodes)
@@ -967,10 +648,7 @@ TEST_F(SequencerIntegrationTest, SequencerReactivationOnFailure) {
                                          // writes
           .create(NNODES);
 
-  for (const auto& it : nodes) {
-    node_index_t idx = it.first;
-    cluster->getNode(idx).waitUntilAvailable();
-  }
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
 
   auto client = cluster->createClient();
   lsn_t lsn1 = client->appendSync(logid_t(1), "foo");
@@ -1020,13 +698,7 @@ TEST_F(SequencerIntegrationTest, SequencerReactivationOnFailure) {
 //      (prior to fix D3033233, secondary would send a preempted redirect
 //       to dead primary)
 TEST_F(SequencerIntegrationTest, SequencerReactivationPreemptorDead) {
-  Configuration::Nodes nodes;
-  for (node_index_t i = 0; i < 4; ++i) {
-    auto& node = nodes[i];
-    node.generation = 1;
-    node.addSequencerRole();
-    node.addStorageRole(/*num_shards*/ 2);
-  }
+  auto nodes = createSimpleNodesConfig(4, 2, true);
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
           .setNodes(nodes)
@@ -1035,11 +707,9 @@ TEST_F(SequencerIntegrationTest, SequencerReactivationPreemptorDead) {
           .doPreProvisionEpochMetaData() // prevents spurious sequencer
                                          // reactivations due to metadata log
                                          // writes
-          .create(nodes.size());
+          .create(nodes->clusterSize());
 
-  for (const auto& it : nodes) {
-    cluster->waitUntilGossip(/* alive */ true, it.first);
-  }
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
 
   auto client = cluster->createClient();
   lsn_t lsn1 = client->appendSync(logid_t(1), "foo");
@@ -1118,21 +788,21 @@ TEST_F(SequencerIntegrationTest, SequencerReactivationRedirectedNotAlive) {
     auto& node = nodes[i];
     node.generation = 1;
     node.addStorageRole(/*num_shards*/ 2);
-    weights[i] = node.getSequencerWeight();
-    ASSERT_EQ(weights[i], 0);
+    weights[i] = 0;
   }
   // 2 sequencer-only nodes
   for (node_index_t i = 4; i < 6; ++i) {
     auto& node = nodes[i];
     node.generation = 1;
-    node.addSequencerRole();
-    weights[i] = node.getSequencerWeight();
-    ASSERT_EQ(weights[i], 1.0);
+    node.addSequencerRole(true, 1);
+    weights[i] = 1;
   }
 
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes));
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
-          .setNodes(nodes)
+          .setNodes(nodes_configuration)
           .useHashBasedSequencerAssignment(100, "10s")
           .enableMessageErrorInjection()
           .setParam("--sticky-copysets-block-size", "1")
@@ -1140,11 +810,9 @@ TEST_F(SequencerIntegrationTest, SequencerReactivationRedirectedNotAlive) {
           .doPreProvisionEpochMetaData() // prevents spurious sequencer
                                          // reactivations due to metadata log
                                          // writes
-          .create(nodes.size());
+          .create(nodes_configuration->clusterSize());
 
-  for (const auto& it : nodes) {
-    cluster->waitUntilGossip(/* alive */ true, it.first);
-  }
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
 
   auto client = cluster->createClient(
       DEFAULT_TEST_TIMEOUT,
@@ -1231,14 +899,14 @@ TEST_F(SequencerIntegrationTest, SeenEpochReactivation) {
   // message.
   class MockAppendRequest : public AppendRequest {
    public:
-    MockAppendRequest(std::string payload,
+    MockAppendRequest(const std::string& payload,
                       epoch_t seen_epoch,
                       append_callback_t callback,
                       std::chrono::milliseconds timeout)
         : AppendRequest(nullptr,
                         logid_t(1),
                         AppendAttributes(),
-                        std::move(payload),
+                        PayloadHolder::copyString(payload),
                         timeout,
                         std::move(callback)),
           seen_epoch_(seen_epoch) {
@@ -1309,14 +977,7 @@ TEST_F(SequencerIntegrationTest, SeenEpochReactivation) {
 //          so the clients fails with NOTINCONFIG and retries sending to the
 //          primary forcing reactivation, which succeeds.
 TEST_F(SequencerIntegrationTest, SequencerReactivationPreemptorNotInConfig) {
-  dbg::parseLoglevelOption("debug");
-  Configuration::Nodes nodes;
-  for (node_index_t i = 0; i < 4; ++i) {
-    auto& node = nodes[i];
-    node.generation = 1;
-    node.addSequencerRole();
-    node.addStorageRole(/*num_shards*/ 2);
-  }
+  auto nodes = createSimpleNodesConfig(4, 2, true);
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
           // If some reactivations are delayed they still complete quickly
@@ -1326,11 +987,9 @@ TEST_F(SequencerIntegrationTest, SequencerReactivationPreemptorNotInConfig) {
           .doPreProvisionEpochMetaData() // prevents spurious sequencer
                                          // reactivations due to metadata log
                                          // writes
-          .create(nodes.size());
+          .create(nodes->clusterSize());
 
-  for (size_t idx = 0; idx < nodes.size(); ++idx) {
-    cluster->waitUntilGossip(/* alive */ true, idx);
-  }
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
 
   auto client = cluster->createClient();
   lsn_t lsn1 = client->appendSync(logid_t(1), "foo");
@@ -1362,7 +1021,7 @@ TEST_F(SequencerIntegrationTest, SequencerReactivationPreemptorNotInConfig) {
   cluster->waitUntilGossip(/* alive */ true, primary);
 
   // replace secondary node to up its generation number
-  cluster->bumpGeneration(secondary);
+  cluster->replace(secondary);
 
   // write into the log again - this should succeed after internally retrying
   // due to: primary PREEMPTED --> secondary NOTINCONFIG -->
@@ -1408,30 +1067,23 @@ TEST_F(SequencerIntegrationTest, SequencerReactivationPreemptorZeroWeight) {
     if (i != secondary) {
       // Don't put secondary sequencer node in metadata logs nodeset because
       // we're going to turn it into a non-storage node.
-      metadata_nodes[i] = configuration::Node(node);
+      node.metadata_node = true;
     }
     nodes[i] = std::move(node);
   }
-
-  Configuration::MetaDataLogsConfig meta_config =
-      createMetaDataLogsConfig(ServerConfig::NodesConfig(metadata_nodes),
-                               metadata_nodes.size() - 1,
-                               /*replication=*/3,
-                               NodeLocationScope::NODE);
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes), ReplicationProperty{{NodeLocationScope::NODE, 3}});
 
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
           .doPreProvisionEpochMetaData() // prevents spurious sequencer
                                          // reactivations due to metadata log
                                          // writes
-          .setNodes(nodes)
-          .setMetaDataLogsConfig(meta_config)
+          .setNodes(nodes_configuration)
           .useHashBasedSequencerAssignment(100, "10s")
-          .create(nodes.size());
+          .create(nodes_configuration->clusterSize());
 
-  for (size_t idx = 0; idx < nodes.size(); ++idx) {
-    cluster->waitUntilGossip(/* alive */ true, idx);
-  }
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
 
   auto client = cluster->createClient();
   lsn_t lsn1 = client->appendSync(logid_t(1), "foo");
@@ -1473,20 +1125,15 @@ TEST_F(SequencerIntegrationTest, SequencerReactivationPreemptorZeroWeight) {
 
 // Start a cluster with lazy sequencer placement on all nodes.
 std::unique_ptr<IntegrationTestUtils::Cluster> createClusterFromNodes(
-    Configuration::Nodes& nodes,
     size_t num_nodes,
     std::vector<IntegrationTestUtils::ParamSpec> extra_params) {
-  for (int i = 0; i < num_nodes; ++i) {
-    nodes[i].generation = 1;
-    nodes[i].addSequencerRole();
-    nodes[i].addStorageRole(/*num_shards*/ 2);
-  }
+  auto nodes = createSimpleNodesConfig(num_nodes, 2, true);
 
-  logsconfig::LogAttributes log_attrs =
+  auto log_attrs =
       IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(
-          num_nodes);
-  log_attrs.set_replicationFactor(num_nodes - 1);
-  log_attrs.set_extraCopies(1);
+          num_nodes)
+          .with_replicationFactor(num_nodes - 1)
+          .with_extraCopies(1);
 
   auto factory = IntegrationTestUtils::ClusterFactory()
                      .setNodes(nodes)
@@ -1537,13 +1184,14 @@ uint64_t sequencerNode(IntegrationTestUtils::Cluster& cluster,
                        const std::vector<uint64_t>& down_nodes,
                        uint64_t logid = 1,
                        bool verify_by_querying_node = true) {
-  const Configuration::Nodes& nodes =
-      cluster.getConfig()->get()->serverConfig()->getNodes();
+  auto nodes_config = cluster.getConfig()->getNodesConfiguration();
 
-  std::vector<double> weights(nodes.size());
+  std::vector<double> weights(nodes_config->clusterSize());
 
-  for (const auto& n : nodes) {
-    weights[n.first] = n.second.getSequencerWeight();
+  for (const auto& [nid, _] : *nodes_config->getServiceDiscovery()) {
+    weights[nid] =
+        nodes_config->getSequencerMembership()->getEffectiveSequencerWeight(
+            nid);
   }
   for (uint64_t idx : down_nodes) {
     weights[idx] = 0.0;
@@ -1604,11 +1252,8 @@ void rejoinNode(node_index_t node_id, IntegrationTestUtils::Cluster& cluster) {
 
 TEST_F(SequencerIntegrationTest, SoftSeal) {
   // Start a cluster with lazy sequencer placement on all nodes.
-
-  Configuration::Nodes nodes;
-
   // Tell all nodes to not do recovery (including sealing).
-  auto cluster = createClusterFromNodes(nodes, 3, {{"--test-bypass-recovery"}});
+  auto cluster = createClusterFromNodes(3, {{"--test-bypass-recovery"}});
 
   auto client = cluster->createClient(
       DEFAULT_TEST_TIMEOUT,
@@ -1678,17 +1323,12 @@ TEST_F(SequencerIntegrationTest, SoftSeal) {
 TEST_F(SequencerIntegrationTest, AutoLogProvisioning) {
   // Test that the sequencer provisions its own metadata
 
-  Configuration::Nodes nodes;
   size_t num_nodes = 3;
-  for (int i = 0; i < 3; ++i) {
-    nodes[i].generation = 1;
-    nodes[i].addSequencerRole();
-    nodes[i].addStorageRole(/*num_shards*/ 1);
-  }
+  auto nodes = createSimpleNodesConfig(num_nodes, 1, true);
 
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(2);
-  log_attrs.set_nodeSetSize(10);
+  auto log_attrs =
+      logsconfig::LogAttributes().with_replicationFactor(2).with_nodeSetSize(
+          10);
 
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .setNodes(nodes)
@@ -1698,8 +1338,7 @@ TEST_F(SequencerIntegrationTest, AutoLogProvisioning) {
                      .setLogAttributes(log_attrs)
                      .create(3);
 
-  for (const auto& it : nodes) {
-    node_index_t idx = it.first;
+  for (const auto& [idx, _] : *nodes->getServiceDiscovery()) {
     cluster->waitUntilGossip(/* alive */ true, idx);
   }
 
@@ -1846,26 +1485,7 @@ TEST_F(SequencerIntegrationTest, AutoLogProvisioning) {
     return getSequencerEpoch() > cur_epoch;
   });
 
-  auto get_stats = [&]() {
-    std::pair<uint64_t, uint64_t> res{0, 0};
-    for (const auto& it : nodes) {
-      auto stats = cluster->getNode(it.first).stats();
-      res.first += stats["background_sequencer_reactivation_checks_scheduled"];
-      res.second += stats["background_sequencer_reactivation_checks_completed"];
-    }
-    return res;
-  };
-  wait_until("stats match up", [&]() {
-    auto stats = get_stats();
-    ld_check(stats.first > 0);
-    ld_info("Scheduled reactivations: %lu, completed: %lu",
-            stats.first,
-            stats.second);
-    return stats.first == stats.second;
-  });
-
-  ld_info("Sequencer reactivated");
-  cluster->waitForMetaDataLogWrites();
+  waitForReactivations(cluster);
 
   folly::Baton<> baton2;
   request = std::make_unique<ReadMetaDataRequest>(
@@ -1891,8 +1511,7 @@ TEST_F(SequencerIntegrationTest, AutoLogProvisioning) {
   ld_info("Reactivating sequencers by restarting the cluster");
   cluster->stop();
   cluster->start();
-  for (const auto& it : nodes) {
-    node_index_t idx = it.first;
+  for (const auto& [idx, _] : *nodes->getServiceDiscovery()) {
     cluster->waitUntilGossip(/* alive */ true, idx);
   }
   cluster->waitForMetaDataLogWrites();
@@ -1933,21 +1552,22 @@ TEST_F(SequencerIntegrationTest, AutoLogProvisioningEpochStorePreemption) {
       node.addStorageRole();
     }
   }
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes));
 
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(2);
-  log_attrs.set_nodeSetSize(10);
+  auto log_attrs =
+      logsconfig::LogAttributes().with_replicationFactor(2).with_nodeSetSize(
+          10);
 
   auto cluster = IntegrationTestUtils::ClusterFactory()
-                     .setNodes(nodes)
+                     .setNodes(nodes_configuration)
                      .useHashBasedSequencerAssignment(100, "10s")
                      .enableMessageErrorInjection()
                      .setLogGroupName("test_range")
                      .setLogAttributes(log_attrs)
                      .create(num_nodes);
 
-  for (const auto& it : nodes) {
-    node_index_t idx = it.first;
+  for (const auto& [idx, _] : *nodes_configuration->getServiceDiscovery()) {
     cluster->waitUntilGossip(/* alive */ true, idx);
   }
 
@@ -1965,8 +1585,7 @@ TEST_F(SequencerIntegrationTest, AutoLogProvisioningEpochStorePreemption) {
   } while (lsn == LSN_INVALID);
 
   ld_info("Waiting for metadata log writes to complete");
-  cluster->waitForMetaDataLogWrites();
-  cluster->waitForRecovery();
+  cluster->waitUntilAllSequencersQuiescent();
 
   // metadata is written, now stop N0
   ld_info("Stopping N0");
@@ -1985,7 +1604,7 @@ TEST_F(SequencerIntegrationTest, AutoLogProvisioningEpochStorePreemption) {
     }
   } while (lsn == LSN_INVALID);
 
-  cluster->waitForRecovery();
+  cluster->waitUntilAllSequencersQuiescent();
 
   // Resume N0, stop N1
   ld_info("Stopping N1");
@@ -2081,14 +1700,12 @@ TEST_F(SequencerIntegrationTest, AutoLogProvisioningEpochStorePreemption) {
 
 // TODO (T25848602): this test is broken
 TEST_F(SequencerIntegrationTest, DISABLED_SilentDuplicatesBasic) {
-  Configuration::Nodes nodes;
   // Start a cluster with lazy sequencer placement on all nodes.
   // Tell all nodes to not do recovery (including sealing).
   // Note that the cluster must be small to make sure copysets intersect,
   // causing preemption through soft seals.
   auto cluster =
-      createClusterFromNodes(nodes,
-                             3,
+      createClusterFromNodes(3,
                              {{"--test-bypass-recovery"},
                               {"--disable-check-seals"},
                               {"--hold-store-replies", "true"},
@@ -2262,12 +1879,10 @@ TEST_F(SequencerIntegrationTest, DISABLED_SilentDuplicatesBasic) {
 // silent duplicates
 // TODO (T25848602): this test is broken
 TEST_F(SequencerIntegrationTest, DISABLED_SilentDuplicatesTwoEpochsRecovered) {
-  Configuration::Nodes nodes;
   // Start a cluster with lazy sequencer placement on all nodes.
   // Tell all nodes to not do recovery (including sealing).
   auto cluster =
-      createClusterFromNodes(nodes,
-                             3,
+      createClusterFromNodes(3,
                              {{"--test-bypass-recovery"},
                               {"--disable-check-seals"},
                               {"--hold-store-replies", "true"},
@@ -2464,16 +2079,19 @@ TEST_F(SequencerIntegrationTest, DISABLED_SilentDuplicatesCancelled) {
     node.generation = 1;
     node.addSequencerRole();
   }
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes));
 
-  logsconfig::LogAttributes log_attrs =
+  auto log_attrs =
       IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(
-          num_nodes);
-  // This test relies on a replication factor of 2. Set it explicitly here.
-  log_attrs.set_replicationFactor(2);
+          num_nodes)
+          // This test relies on a replication factor of 2. Set it explicitly
+          // here.
+          .with_replicationFactor(2);
 
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
-          .setNodes(nodes)
+          .setNodes(nodes_configuration)
           .setLogAttributes(log_attrs)
           .useHashBasedSequencerAssignment(100, "10s")
           .enableMessageErrorInjection()
@@ -2485,7 +2103,7 @@ TEST_F(SequencerIntegrationTest, DISABLED_SilentDuplicatesCancelled) {
           .doPreProvisionEpochMetaData() // prevents spurious sequencer
                                          // reactivations due to metadata log
                                          // writes
-          .create(nodes.size());
+          .create(nodes_configuration->clusterSize());
 
   // append several records to activate sequencer on primary
   // and write on all store nodes
@@ -2618,16 +2236,19 @@ TEST_F(SequencerIntegrationTest, SilentDuplicatesBypassed) {
     node.generation = 1;
     node.addSequencerRole();
   }
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes));
 
-  logsconfig::LogAttributes log_attrs =
+  auto log_attrs =
       IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(
-          num_nodes);
-  // This test relies on a replication factor of 2. Set it explicitly here.
-  log_attrs.set_replicationFactor(2);
+          num_nodes)
+          // This test relies on a replication factor of 2. Set it explicitly
+          // here.
+          .with_replicationFactor(2);
 
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
-          .setNodes(nodes)
+          .setNodes(nodes_configuration)
           .setLogAttributes(log_attrs)
           .useHashBasedSequencerAssignment(100, "10s")
           .enableMessageErrorInjection()
@@ -2638,7 +2259,7 @@ TEST_F(SequencerIntegrationTest, SilentDuplicatesBypassed) {
           .doPreProvisionEpochMetaData() // prevents spurious sequencer
                                          // reactivations due to metadata log
                                          // writes
-          .create(nodes.size());
+          .create(nodes_configuration->clusterSize());
 
   // append several records to activate sequencer on primary
   // and write on all store nodes
@@ -2689,11 +2310,11 @@ TEST_F(SequencerIntegrationTest, AbortEpoch) {
   // starting epoch after initial provisioning
   const epoch_t starting_epoch = epoch_t(2);
 
-  logsconfig::LogAttributes log_attrs =
+  auto log_attrs =
       IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(
-          num_nodes);
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_maxWritesInFlight(window_size);
+          num_nodes)
+          .with_replicationFactor(3)
+          .with_maxWritesInFlight(window_size);
 
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .setLogAttributes(log_attrs)
@@ -2768,11 +2389,11 @@ TEST_F(SequencerIntegrationTest, AbortEpoch) {
 // test changing weight to 0 for a storage node would make sequencer stop
 // sending writes to the node
 TEST_F(SequencerIntegrationTest, WeightChangeToZero) {
-  logsconfig::LogAttributes log_attrs =
-      IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(2);
-  log_attrs.set_maxWritesInFlight(1024);
-  log_attrs.set_replicationFactor(1);
-  log_attrs.set_extraCopies(0);
+  auto log_attrs =
+      IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(2)
+          .with_maxWritesInFlight(1024)
+          .with_replicationFactor(1)
+          .with_extraCopies(0);
 
   Configuration::MetaDataLogsConfig meta_config =
       createMetaDataLogsConfig(/*nodeset=*/{1}, /*replication=*/1);
@@ -2848,11 +2469,11 @@ TEST_F(SequencerIntegrationTest, WeightChangeToZero) {
 // metadata and write to the metadata logs, while the config changes to disable
 // that sequencer.
 TEST_F(SequencerIntegrationTest, SequencerMetaDataManagerNullptrCrash) {
-  logsconfig::LogAttributes log_attrs =
-      IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(2);
-  log_attrs.set_maxWritesInFlight(1024);
-  log_attrs.set_replicationFactor(1);
-  log_attrs.set_extraCopies(0);
+  auto log_attrs =
+      IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(2)
+          .with_maxWritesInFlight(1024)
+          .with_replicationFactor(1)
+          .with_extraCopies(0);
 
   Configuration::MetaDataLogsConfig meta_config =
       createMetaDataLogsConfig(/*nodeset=*/{1}, /*replication=*/1);
@@ -2911,18 +2532,11 @@ TEST_F(SequencerIntegrationTest, SequencerMetaDataManagerNullptrCrash) {
 }
 
 TEST_F(SequencerIntegrationTest, LogRemovalStressTest) {
-  Configuration::Nodes nodes;
   size_t num_nodes = 5;
-  for (int i = 0; i < num_nodes; ++i) {
-    auto& node = nodes[i];
-    node.generation = 1;
-    node.addSequencerRole();
-    node.addStorageRole();
-  }
+  auto nodes = createSimpleNodesConfig(5);
 
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(2);
-  log_attrs.set_nodeSetSize(3);
+  auto log_attrs =
+      logsconfig::LogAttributes().with_replicationFactor(2).with_nodeSetSize(3);
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
           .setNodes(nodes)
@@ -2934,8 +2548,7 @@ TEST_F(SequencerIntegrationTest, LogRemovalStressTest) {
           // time. Make them notice and request missing releases quicker.
           .setParam("--unreleased-record-detector-interval", "5s")
           .create(num_nodes);
-  for (const auto& it : nodes) {
-    node_index_t idx = it.first;
+  for (const auto& [idx, _] : *nodes->getServiceDiscovery()) {
     cluster->getNode(idx).waitUntilAvailable();
   }
   auto client = cluster->createClient();
@@ -3012,8 +2625,8 @@ TEST_F(SequencerIntegrationTest, LogRemovalStressTest) {
   // collect sequencer stats
   size_t activations = 0;
   size_t removes = 0;
-  for (const auto& it : nodes) {
-    auto stats = cluster->getNode(it.first).stats();
+  for (const auto& [idx, _] : *nodes->getServiceDiscovery()) {
+    auto stats = cluster->getNode(idx).stats();
     activations += stats["sequencer_activations"];
     removes += stats["sequencer_unavailable_log_removed_from_config"];
   }
@@ -3067,20 +2680,14 @@ TEST_F(SequencerIntegrationTest, LogRemovalStressTest) {
 
 // test that sequencers should get activated on window size changes in config
 TEST_F(SequencerIntegrationTest, DynamicallyChangingWindowSize) {
-  Configuration::Nodes nodes;
   size_t num_nodes = 5;
-  for (int i = 0; i < num_nodes; ++i) {
-    auto& node = nodes[i];
-    node.generation = 1;
-    node.addSequencerRole();
-    node.addStorageRole();
-  }
+  auto nodes = createSimpleNodesConfig(5);
 
-  logsconfig::LogAttributes log_attrs =
+  auto log_attrs =
       IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(
-          num_nodes);
-  // window size is initially 200
-  log_attrs.set_maxWritesInFlight(200);
+          num_nodes)
+          // window size is initially 200
+          .with_maxWritesInFlight(200);
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .setNodes(nodes)
                      .useHashBasedSequencerAssignment(100, "10s")
@@ -3089,8 +2696,7 @@ TEST_F(SequencerIntegrationTest, DynamicallyChangingWindowSize) {
                      .setNumLogs(299)
                      .create(num_nodes);
 
-  for (const auto& it : nodes) {
-    node_index_t idx = it.first;
+  for (const auto& [idx, _] : *nodes->getServiceDiscovery()) {
     cluster->waitUntilGossip(/* alive */ true, idx);
   }
   auto client = cluster->createClient();
@@ -3106,15 +2712,14 @@ TEST_F(SequencerIntegrationTest, DynamicallyChangingWindowSize) {
 
   auto get_activations = [&]() {
     size_t activations = 0;
-    for (const auto& it : nodes) {
-      auto stats = cluster->getNode(it.first).stats();
+    for (const auto& [idx, _] : *nodes->getServiceDiscovery()) {
+      auto stats = cluster->getNode(idx).stats();
       activations += stats["sequencer_activations"];
     }
     return activations;
   };
 
-  cluster->waitForRecovery();
-  cluster->waitForMetaDataLogWrites();
+  cluster->waitUntilAllSequencersQuiescent();
 
   const size_t num_activations = get_activations();
   EXPECT_GE(num_activations, 128);
@@ -3157,41 +2762,35 @@ TEST_F(SequencerIntegrationTest, SequencerZeroWeightWhileAppendsPending) {
   std::vector<double> weights = {1.0, 1.0, 1.0, 1.0};
   node_index_t primary = hashing::weighted_ch(1, weights);
 
-  Configuration::Nodes nodes, metadata_nodes;
+  Configuration::Nodes nodes;
   for (node_index_t i = 0; i < 4; ++i) {
     Configuration::Node node;
     node.generation = 1;
     node.addSequencerRole();
     node.addStorageRole(/*num_shards*/ 2);
+    node.metadata_node = true;
 
-    auto meta_node(node);
     nodes[i] = std::move(node);
-    metadata_nodes[i] = std::move(meta_node);
   }
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes), ReplicationProperty{{NodeLocationScope::NODE, 3}});
 
-  Configuration::MetaDataLogsConfig meta_config =
-      createMetaDataLogsConfig(ServerConfig::NodesConfig(metadata_nodes),
-                               metadata_nodes.size() - 1,
-                               /*max_replication=*/3,
-                               NodeLocationScope::NODE);
-
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_maxWritesInFlight(256);
-  log_attrs.set_replicationFactor(3);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_maxWritesInFlight(256)
+                       .with_replicationFactor(3);
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
           .doPreProvisionEpochMetaData() // prevents spurious sequencer
                                          // reactivations due to metadata log
                                          // writes
-          .setNodes(nodes)
+          .setNodes(nodes_configuration)
           // If some reactivations are delayed they still complete quickly
           .setParam("--sequencer-reactivation-delay-secs", "1s..2s")
-          .setMetaDataLogsConfig(meta_config)
           .setLogGroupName("ns/test_logs")
           .setLogAttributes(log_attrs)
           .useHashBasedSequencerAssignment(100, "10s")
           .deferStart()
-          .create(nodes.size());
+          .create(nodes_configuration->clusterSize());
 
   // starting just 2 nodes - the primary sequencer for the log and another node.
   // This is so no writes can actually go through, since we don't have 3 nodes
@@ -3235,11 +2834,11 @@ TEST_F(SequencerIntegrationTest, SequencerZeroWeightWhileAppendsPending) {
 // test that existing metadata sequencer can react to weight changes in
 // metadata nodeset for completing metadata appends eventually
 TEST_F(SequencerIntegrationTest, MetaDataLogSequencerReactToWeightChanges) {
-  logsconfig::LogAttributes log_attrs =
-      IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(2);
-  log_attrs.set_maxWritesInFlight(1024);
-  log_attrs.set_replicationFactor(2);
-  log_attrs.set_extraCopies(0);
+  auto log_attrs =
+      IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(2)
+          .with_maxWritesInFlight(1024)
+          .with_replicationFactor(2)
+          .with_extraCopies(0);
 
   const int NNODES = 5;
   Configuration::Nodes nodes;
@@ -3252,9 +2851,13 @@ TEST_F(SequencerIntegrationTest, MetaDataLogSequencerReactToWeightChanges) {
       node.addStorageRole(/*num_shards*/ 2);
     }
   }
+  nodes[1].metadata_node = true;
+  nodes[2].metadata_node = true;
+  nodes[3].metadata_node = true;
+  nodes[4].metadata_node = true;
 
-  Configuration::MetaDataLogsConfig meta_config =
-      createMetaDataLogsConfig(/*nodeset=*/{1, 2, 3, 4}, /*replication=*/3);
+  auto nodes_configuration = NodesConfigurationTestUtil::provisionNodes(
+      std::move(nodes), ReplicationProperty{{NodeLocationScope::NODE, 3}});
 
   // N0 sequencer, N1, N2, N3, N4 storage node and also metadata nodes
   auto cluster =
@@ -3265,22 +2868,29 @@ TEST_F(SequencerIntegrationTest, MetaDataLogSequencerReactToWeightChanges) {
                     IntegrationTestUtils::ParamScope::ALL)
           // If some reactivations are delayed they still complete quickly
           .setParam("--sequencer-reactivation-delay-secs", "1s..2s")
-          .setNodes(nodes)
+          .setParam("--connect-throttle", "0s..0s")
+          .setNodes(std::move(nodes_configuration))
           .setNumLogs(1)
           .useHashBasedSequencerAssignment(100, "10s")
           .setLogAttributes(log_attrs)
           .setEventLogAttributes(log_attrs)
           .setConfigLogAttributes(log_attrs)
-          .setMetaDataLogsConfig(meta_config)
           .create(NNODES);
+
   std::shared_ptr<Client> client = cluster->createClient();
 
-  ld_info("disabling N1");
+  ld_info("setting N1 as read-only");
   cluster->updateNodeAttributes(1, configuration::StorageState::READ_ONLY, 0);
   cluster->waitForServersToPartiallyProcessConfigUpdate();
 
   // suspend N3
+  ld_info("suspending N3");
   cluster->getNode(3).suspend();
+
+  // wait for nodes to properly startup
+  int rv = cluster->waitUntilAllStartedAndPropagatedInGossip(
+      std::set<node_index_t>{0, 1, 2, 4});
+  ASSERT_NE(-1, rv);
 
   // make sure there is no sequencer running on N0
   auto seq = cluster->getNode(0).sequencerInfo(logid_t{1});
@@ -3288,25 +2898,26 @@ TEST_F(SequencerIntegrationTest, MetaDataLogSequencerReactToWeightChanges) {
 
   // send a write to trigger auto log provisioning
   lsn_t lsn = client->appendSync(logid_t(1), Payload("dummy", 5));
-  EXPECT_NE(LSN_INVALID, lsn);
+  ASSERT_NE(LSN_INVALID, lsn);
 
   // metadata writes should never succeed
-  int rv = cluster->waitForMetaDataLogWrites(std::chrono::steady_clock::now() +
-                                             std::chrono::seconds(1));
-  // the wait should timed out
-  EXPECT_EQ(-1, rv);
+  rv = cluster->waitForMetaDataLogWrites(std::chrono::steady_clock::now() +
+                                         std::chrono::seconds(1));
+  // the wait should time out
+  ASSERT_EQ(-1, rv);
 
   // try to read the metadata log it should also timed out since
   // the record shouldn't be fully written
   std::unique_ptr<Reader> reader(client->createReader(1));
-  reader->setTimeout(std::chrono::milliseconds(500));
   reader->startReading(MetaDataLog::metaDataLogID(logid_t{1}),
                        compose_lsn(EPOCH_MIN, ESN_MIN),
                        LSN_MAX);
   std::vector<std::unique_ptr<DataRecord>> data_out;
   GapRecord gap_out;
+
+  reader->setTimeout(std::chrono::seconds(1)); // don't wait too much
   auto res = reader->read(1, &data_out, &gap_out);
-  EXPECT_EQ(0, res);
+  ASSERT_EQ(0, res);
   rv = reader->stopReading(MetaDataLog::metaDataLogID(logid_t{1}));
   ASSERT_EQ(0, rv);
 
@@ -3327,8 +2938,10 @@ TEST_F(SequencerIntegrationTest, MetaDataLogSequencerReactToWeightChanges) {
   reader->startReading(MetaDataLog::metaDataLogID(logid_t{1}),
                        compose_lsn(EPOCH_MIN, ESN_MIN),
                        LSN_MAX);
+  ld_info("Trying to read a single record from metadata log for logid 1");
+  reader->setTimeout(DEFAULT_TEST_TIMEOUT); // wait as much as possible
   res = reader->read(1, &data_out, &gap_out);
-  EXPECT_EQ(1, res);
+  ASSERT_EQ(1, res);
   rv = reader->stopReading(MetaDataLog::metaDataLogID(logid_t{1}));
   ASSERT_EQ(0, rv);
 
@@ -3336,17 +2949,17 @@ TEST_F(SequencerIntegrationTest, MetaDataLogSequencerReactToWeightChanges) {
   ld_info("reading lsn %s for log 1.", lsn_to_string(lsn).c_str());
   reader->startReading(logid_t{1}, lsn, lsn);
   res = reader->read(1, &data_out, &gap_out);
-  EXPECT_EQ(1, res);
+  ASSERT_EQ(1, res);
 }
 
 // Test that sequencer can get the trim point from storage nodes
 TEST_F(SequencerIntegrationTest, SequencerReadTrimPointTest) {
-  logsconfig::LogAttributes log_attrs =
-      IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(2);
-  log_attrs.set_maxWritesInFlight(1024);
-  log_attrs.set_replicationFactor(2);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_nodeSetSize(4);
+  auto log_attrs =
+      IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(2)
+          .with_maxWritesInFlight(1024)
+          .with_replicationFactor(2)
+          .with_extraCopies(0)
+          .with_nodeSetSize(4);
 
   const int NNODES = 6;
   Configuration::Nodes nodes;
@@ -3358,19 +2971,22 @@ TEST_F(SequencerIntegrationTest, SequencerReadTrimPointTest) {
     }
     node.addStorageRole(/*num_shards*/ 2);
   }
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes));
 
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      // sequencer polling for trim point more frequently
                      .setParam("--get-trimpoint-interval",
                                "1s",
                                IntegrationTestUtils::ParamScope::SEQUENCER)
-                     .setNodes(nodes)
+                     .setNodes(std::move(nodes_configuration))
                      .setNumLogs(1)
                      .useHashBasedSequencerAssignment()
                      .setLogAttributes(log_attrs)
                      .setEventLogAttributes(log_attrs)
                      .setConfigLogAttributes(log_attrs)
                      .create(NNODES);
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
   std::shared_ptr<Client> client = cluster->createClient();
 
   const logid_t logid{1};
@@ -3429,13 +3045,115 @@ TEST_F(SequencerIntegrationTest, SequencerReadTrimPointTest) {
   });
 }
 
+// Test that sequencer periodically trims metadata log
+TEST_F(SequencerIntegrationTest, SequencerTrimsMetadataLogTest) {
+  auto log_attrs =
+      IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(2)
+          .with_maxWritesInFlight(1024)
+          .with_replicationFactor(2)
+          .with_extraCopies(0)
+          .with_nodeSetSize(4);
+
+  const int NNODES = 6;
+  Configuration::Nodes nodes;
+  for (node_index_t i = 0; i < NNODES; ++i) {
+    auto& node = nodes[i];
+    node.generation = 1;
+    if (i == 0) {
+      node.addSequencerRole();
+    }
+    node.addStorageRole(/*num_shards*/ 2);
+  }
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes));
+
+  auto s = IntegrationTestUtils::ParamScope::SEQUENCER;
+  auto cluster = IntegrationTestUtils::ClusterFactory()
+                     // sequencer polling for trim point more frequently
+                     .setParam("--get-trimpoint-interval", "1s", s)
+                     // trim more frequently
+                     .setParam("--metadata-log-trim-interval", "2s", s)
+                     // update medata more often to ensure trimmer sees the
+                     // latest state of log
+                     .setParam("--update-metadata-map-interval", "1s", s)
+                     .setNodes(std::move(nodes_configuration))
+                     .setNumLogs(1)
+                     .useHashBasedSequencerAssignment()
+                     .setLogAttributes(log_attrs)
+                     .setEventLogAttributes(log_attrs)
+                     .setConfigLogAttributes(log_attrs)
+                     .create(NNODES);
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
+  std::shared_ptr<Client> client = cluster->createClient();
+
+  const logid_t logid{1};
+  const logid_t metadata_logid = MetaDataLog::metaDataLogID(logid);
+
+  auto write_records = [&](int n) {
+    lsn_t lsn = LSN_INVALID;
+    for (int i = 0; i < n; ++i) {
+      lsn = client->appendSync(logid, Payload("dummy", 5));
+      EXPECT_NE(LSN_INVALID, lsn);
+    }
+    return lsn;
+  };
+
+  auto start_new_epoch = [&]() {
+    auto cmd = "up --logid " + std::to_string(logid.val_);
+    std::string reply = cluster->getNode(0).sendCommand(cmd);
+    ASSERT_NE(std::string::npos, reply.find("Started sequencer activation"));
+    // Wait for activation to complete
+    cluster->waitUntilAllSequencersQuiescent();
+  };
+
+  // Epoch 1
+  lsn_t last_written_lsn = write_records(63);
+  ld_info("Last written record %s.", lsn_to_string(last_written_lsn).c_str());
+  // trim point for metadata log should be LSN_INVALID
+  EXPECT_EQ(std::to_string(LSN_INVALID),
+            cluster->getNode(0).sequencerInfo(metadata_logid)["Trim point"]);
+
+  // Epoch 2: started with reconfiguration so the new record is added to
+  // metadata log
+  cluster->updateNodeAttributes(
+      node_index_t(1), configuration::StorageState::DISABLED, 1, false);
+  cluster->waitUntilAllSequencersQuiescent();
+  last_written_lsn = write_records(47);
+  ld_info("Last written record %s.", lsn_to_string(last_written_lsn).c_str());
+
+  // Epoch 3: started without new records in metadata log
+  start_new_epoch();
+  last_written_lsn = write_records(54);
+  ld_info("Last written record %s.", lsn_to_string(last_written_lsn).c_str());
+
+  // Epoch 4: started without new records in metadata log
+  start_new_epoch();
+  last_written_lsn = write_records(54);
+  ld_info("Last written record %s.", lsn_to_string(last_written_lsn).c_str());
+
+  // trim the log to last_written_lsn belonging to new epoch
+  int rv = client->trimSync(logid, last_written_lsn);
+  EXPECT_EQ(0, rv);
+
+  // First LSN of new epoch in metadata log should become trim point
+  wait_until("Sequencer trims old epoch records", [&]() {
+    auto trim_point_str =
+        cluster->getNode(0).sequencerInfo(logid)["Metadata trim point"];
+    if (trim_point_str.empty()) {
+      return false;
+    }
+    lsn_t trim_point_lsn = folly::to<uint64_t>(trim_point_str);
+    return lsn_to_epoch(trim_point_lsn).val() == 1;
+  });
+}
+
 // test that preemption while writing to metadata logs, doesn't cause ping-pong
 TEST_F(SequencerIntegrationTest, MetaDataWritePreempted) {
-  logsconfig::LogAttributes log_attrs =
-      IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(2);
-  log_attrs.set_maxWritesInFlight(1024);
-  log_attrs.set_replicationFactor(1);
-  log_attrs.set_extraCopies(0);
+  auto log_attrs =
+      IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(2)
+          .with_maxWritesInFlight(1024)
+          .with_replicationFactor(1)
+          .with_extraCopies(0);
 
   Configuration::MetaDataLogsConfig meta_config =
       createMetaDataLogsConfig(/*nodeset=*/{1}, /*replication=*/1);
@@ -3485,10 +3203,10 @@ TEST_F(SequencerIntegrationTest, MetaDataWritePreempted) {
 }
 
 TEST_F(SequencerIntegrationTest, NodeSetAdjustment) {
-  logsconfig::LogAttributes log_attrs =
-      IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(1);
-  log_attrs.set_backlogDuration(std::chrono::seconds(40));
-  log_attrs.set_nodeSetSize(1);
+  auto log_attrs =
+      IntegrationTestUtils::ClusterFactory::createDefaultLogAttributes(1)
+          .with_backlogDuration(std::chrono::seconds(40))
+          .with_nodeSetSize(1);
   const uint32_t num_user_logs = 1;
 
   // N0 sequencer, N1, N2 storage nodes
@@ -3635,4 +3353,187 @@ TEST_F(SequencerIntegrationTest, NodeSetAdjustment) {
   EXPECT_GT(lsn_to_epoch(lsn2).val(), lsn_to_epoch(lsn1).val());
   EXPECT_GT(lsn_to_epoch(lsn3).val(), lsn_to_epoch(lsn2).val());
   ld_info("Got lsn %s", lsn_to_string(lsn3).c_str());
+}
+
+// Simulate sequencer location based on node health status.
+// Unhealthy nodes are treated as undesirable locations when health based
+// hashing is allowed. Creates a cluster consisting of 2 sequencer nodes - nodes
+// 0 and 1. Health based hashing is turned off and logs are appended to primary
+// seqencer node. Transitions primary node to `UNHEALTHY'. When health based
+// hashing is activated, log 1 sequencer changes to other sequencer node.
+// When secondary sequencer node is transitioned to `UNHEALTHY` check that
+// log1 sequencer is once again on primary node.
+// Health based hasing is not used in this case as percent if unhealthy
+// sequencer nodes exceed the maximum. Revert to previous version of hashing
+// without health status consideration, check that log1 sequencer is still on
+// primary node.
+TEST_F(SequencerIntegrationTest, HealthBasedHashingUnhealthy) {
+  const int NNODES = 4;
+  Configuration::Nodes nodes;
+  for (node_index_t i = 0; i < NNODES; ++i) {
+    auto& node = nodes[i];
+    node.generation = 1;
+    node.addStorageRole(/*num_shards*/ 2);
+  }
+  // Only two sequencer nodes
+  nodes[0].addSequencerRole();
+  nodes[1].addSequencerRole();
+
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes));
+
+  auto cluster =
+      IntegrationTestUtils::ClusterFactory()
+          .setNodes(std::move(nodes_configuration))
+          .useHashBasedSequencerAssignment(100, "10s")
+          .setHealthMonitorParameters(
+              /*health_monitor_max_delay_ms*/ 240000,
+              /*watchdog_poll_interval*/ 5000,
+              /*worker_stall_percentage*/ 1.1,
+              /*queue_stall_percentage*/ 1.1,
+              /*enable_health_based_sequencer_placement*/ false)
+          .setParam("--maximum-percent-unhealthy-seq-nodes-hbsp", "1.0")
+          .enableMessageErrorInjection()
+          .doPreProvisionEpochMetaData() // prevents spurious sequencer
+                                         // reactivations due to metadata log
+                                         // writes
+          .create(NNODES);
+  for (const auto& it : nodes) {
+    node_index_t idx = it.first;
+    cluster->getNode(idx).waitUntilAvailable();
+  }
+  auto client = cluster->createClient();
+  lsn_t lsn1 = client->appendSync(logid_t(1), "foo");
+  ASSERT_NE(LSN_INVALID, lsn1);
+
+  // figure out which node is running a sequencer for log 1 (primary)
+  // and transition it to UNHEALTHY
+  std::vector<double> weights = {1.0, 1.0, 0.0, 0.0};
+  auto primary = hashing::weighted_ch(1, weights);
+  weights[primary] = 0;
+  auto secondary = hashing::weighted_ch(1, weights);
+  ASSERT_NE(primary, secondary);
+  ASSERT_EQ(
+      "ACTIVE", cluster->getNode(primary).sequencerInfo(logid_t(1))["State"]);
+
+  cluster->getNode(primary).setParam(
+      "--health-monitor-max-stalled-worker-percentage", "0.0");
+  cluster->getNode(primary).restart();
+  cluster->waitUntilGossip(/* alive */ true, primary);
+
+  cluster->waitUntilGossipStatus(
+      /* health_status */ NodeHealthStatus::UNHEALTHY, primary);
+  cluster->waitUntilGossipStatus(
+      /* health_status */ NodeHealthStatus::HEALTHY, secondary);
+
+  cluster->updateSetting("enable-health-based-sequencer-placement", "true");
+  lsn_t lsn2 = client->appendSync(logid_t(1), "bar");
+  ASSERT_NE(LSN_INVALID, lsn2);
+  ASSERT_EQ(
+      "ACTIVE", cluster->getNode(secondary).sequencerInfo(logid_t(1))["State"]);
+  ASSERT_GT(lsn2, lsn1);
+
+  cluster->getNode(secondary).setParam(
+      "--health-monitor-max-stalled-worker-percentage", "0.0");
+  cluster->getNode(secondary).restart();
+  cluster->waitUntilGossip(/* alive */ true, secondary);
+  cluster->waitUntilGossipStatus(
+      /* health_status */ NodeHealthStatus::UNHEALTHY, secondary);
+
+  lsn_t lsn3 = client->appendSync(logid_t(1), Payload("test", 4));
+  // because all sequencer nodes are UNHEALTHY, health based hashing is
+  // automatically turned off.
+  ASSERT_NE(LSN_INVALID, lsn3);
+  ASSERT_EQ(
+      "ACTIVE", cluster->getNode(primary).sequencerInfo(logid_t(1))["State"]);
+  ASSERT_GT(lsn3, lsn2);
+
+  cluster->updateSetting("enable-health-based-sequencer-placement", "false");
+  lsn_t lsn4 = client->appendSync(logid_t(1), "baz");
+  ASSERT_NE(LSN_INVALID, lsn4);
+  ASSERT_EQ(
+      "ACTIVE", cluster->getNode(primary).sequencerInfo(logid_t(1))["State"]);
+  ASSERT_GT(lsn4, lsn3);
+}
+
+// Simulate sequencer location based on node health status.
+// Overloaded nodes are CURRENTLY treated an equally desirable location as
+// HEALTHY nodes when health based hashing is allowed. Similar to
+// HealthBasedHashingUnhealthy. Creates a cluster consisting of 2 sequencer
+// nodes - nodes 0 and 1. Health based hashing is turned off and logs are
+// appended to primary seqencer node. Transitions primary to `OVERLOADED'. When
+// health based hashing is activated, log 1 sequencer does not change to other
+// sequencer node. Revert to previous version of hashing without health status
+// consideration, check that log1 sequencer is still on primary node.
+TEST_F(SequencerIntegrationTest, HealthBasedHashingOverloaded) {
+  const int NNODES = 4;
+  Configuration::Nodes nodes;
+  for (node_index_t i = 0; i < NNODES; ++i) {
+    auto& node = nodes[i];
+    node.generation = 1;
+    node.addStorageRole(/*num_shards*/ 2);
+  }
+  // Only two sequencer nodes
+  nodes[0].addSequencerRole();
+  nodes[1].addSequencerRole();
+
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes));
+
+  auto cluster =
+      IntegrationTestUtils::ClusterFactory()
+          .setNodes(std::move(nodes_configuration))
+          .useHashBasedSequencerAssignment(100, "10s")
+          .setHealthMonitorParameters(
+              /*health_monitor_max_delay_ms*/ 240000,
+              /*watchdog_poll_interval*/ 5000,
+              /*worker_stall_percentage*/ 1.1,
+              /*queue_stall_percentage*/ 1.1,
+              /*enable_health_based_sequencer_placement*/ false)
+          .enableMessageErrorInjection()
+          .doPreProvisionEpochMetaData() // prevents spurious sequencer
+                                         // reactivations due to metadata log
+                                         // writes
+          .create(NNODES);
+  for (const auto& it : nodes) {
+    node_index_t idx = it.first;
+    cluster->getNode(idx).waitUntilAvailable();
+  }
+  auto client = cluster->createClient();
+  lsn_t lsn1 = client->appendSync(logid_t(1), "foo");
+  ASSERT_NE(LSN_INVALID, lsn1);
+
+  // figure out which node is running a sequencer for log 1 (primary)
+  // and overload it
+  std::vector<double> weights = {1.0, 1.0, 0.0, 0.0};
+  auto primary = hashing::weighted_ch(1, weights);
+  weights[primary] = 0;
+  auto secondary = hashing::weighted_ch(1, weights);
+  ASSERT_NE(primary, secondary);
+  ASSERT_EQ(
+      "ACTIVE", cluster->getNode(primary).sequencerInfo(logid_t(1))["State"]);
+
+  cluster->getNode(primary).setParam(
+      "--health-monitor-max-overloaded-worker-percentage", "0.0");
+  cluster->getNode(primary).restart();
+  cluster->waitUntilGossip(/* alive */ true, primary);
+
+  cluster->waitUntilGossipStatus(
+      /* health_status */ NodeHealthStatus::OVERLOADED, primary);
+  cluster->waitUntilGossipStatus(
+      /* health_status */ NodeHealthStatus::HEALTHY, secondary);
+
+  cluster->updateSetting("enable-health-based-sequencer-placement", "true");
+  lsn_t lsn2 = client->appendSync(logid_t(1), "bar");
+  ASSERT_NE(LSN_INVALID, lsn2);
+  ASSERT_EQ(
+      "ACTIVE", cluster->getNode(primary).sequencerInfo(logid_t(1))["State"]);
+  ASSERT_GT(lsn2, lsn1);
+
+  cluster->updateSetting("enable-health-based-sequencer-placement", "false");
+  lsn_t lsn3 = client->appendSync(logid_t(1), "baz");
+  ASSERT_NE(LSN_INVALID, lsn3);
+  ASSERT_EQ(
+      "ACTIVE", cluster->getNode(primary).sequencerInfo(logid_t(1))["State"]);
+  ASSERT_GT(lsn3, lsn2);
 }

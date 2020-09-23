@@ -10,6 +10,7 @@
 #include <gmock/gmock.h>
 
 #include "logdevice/include/AsyncReader.h"
+#include "logdevice/include/types.h"
 
 namespace facebook { namespace logdevice {
 
@@ -36,6 +37,10 @@ class MockAsyncReader : public AsyncReader {
 
   MOCK_METHOD1(resumeReading, int(logid_t log_id));
 
+  MOCK_METHOD1(setMonitoringTier, void(MonitoringTier));
+
+  MOCK_METHOD1(addMonitoringTag, void(std::string));
+
   MOCK_METHOD0(withoutPayload, void());
 
   MOCK_METHOD0(forceNoSingleCopyDelivery, void());
@@ -49,5 +54,7 @@ class MockAsyncReader : public AsyncReader {
   MOCK_METHOD0(doNotDecodeBufferedWrites, void());
 
   MOCK_METHOD1(getBytesBuffered, void(std::function<void(size_t)> callback));
+
+  MOCK_METHOD1(setReaderName, void(const std::string&));
 };
 }} // namespace facebook::logdevice

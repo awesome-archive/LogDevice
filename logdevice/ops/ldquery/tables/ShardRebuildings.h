@@ -28,18 +28,21 @@ class ShardRebuildings : public AdminCommandTable {
   std::string getDescription() override {
     return "Show debugging information about the ShardRebuilding state "
            "machines (see "
-           "\"logdevice/server/rebuilding/ShardRebuildingV1.h\").  This state "
-           "machine is responsible for running all LogRebuilding state "
-           "machines (see \"logs_rebuilding\" table) for all logs in a donor "
-           "shard.";
+           "\"logdevice/server/rebuilding/ShardRebuilding.h\"). This state "
+           "machine is responsible for coordinating reads and re-replication "
+           "on a donor shard.";
   }
   TableColumns getFetchableColumns() const override {
     return {
         {"shard_id", DataType::BIGINT, "Donor shard."},
         {"rebuilding_set",
          DataType::TEXT,
-         "Rebuilding set considered.  See \"rebuilding_set\" column of "
-         "the \"log_rebuilding\" table."},
+         "The list of shards that lost record copies which need to be "
+         "re-replicated elsewhere. Expressed in the form "
+         "\"<shard-id>*?[<dirty-ranges>],...\". \"*\" indicates that the shard "
+         "may be up but we want to drain its data by replicating it elsewhere. "
+         " If <dirty-ranges> is not empty, this means that the storage shard "
+         "only lost data within the specified ranges."},
         {"version",
          DataType::LSN,
          "Rebuilding version.  This version comes from the event log RSM that "
@@ -50,38 +53,20 @@ class ShardRebuildings : public AdminCommandTable {
          "--rebuilding-global-window).  This is a time window used to "
          "synchronize all ShardRebuilding state machines across all donor "
          "shards."},
-        {"local_window_end",
+        {"progress_timestamp",
          DataType::TIME,
-         "ShardRebuilding schedules reads for all logs within a time window "
-         "called the local window.  This shows the end of the current window."},
+         "Approximately how far rebuilding has progressed on this donor, "
+         "timestamp-wise. This may be the min timestamp of records of "
+         "in-flight RecordRebuilding-s, or partition timestamp that "
+         "ReadStorageTask has reached, or something else."},
         {"num_logs_waiting_for_plan",
          DataType::BIGINT,
          "Number of logs that are waiting for a plan.  See "
          "\"logdevice/include/RebuildingPlanner.h\"."},
-        {"num_logs_catching_up",
-         DataType::BIGINT,
-         "Number of LogRebuilding state machines currently active."},
-        {"num_logs_queued_for_catch_up",
-         DataType::BIGINT,
-         "Number of LogRebuilding state machines that are inside the local "
-         "window and queued for catch up."},
-        {"num_logs_in_restart_queue",
-         DataType::BIGINT,
-         "Number of LogRebuilding state machines that are ready to be "
-         "restarted as soon as a slot is available.  Logs are scheduled for a "
-         "restart if we waited too long for writes done by the state machine "
-         "to be acknowledged as durable."},
         {"total_memory_used",
          DataType::BIGINT,
-         "Total amount of memory used by all LogRebuilding state machines."},
-        {"stall_timer_active",
-         DataType::INTEGER,
-         "If true, all LogRebuilding state machines are stalled until memory "
-         "usage decreased."},
-        {"num_restart_timers_active",
-         DataType::BIGINT,
-         "Number of logs that have completed but for which we are still "
-         "waiting for acknowlegments that writes were durable."},
+         "Approximate total amount of memory used by ShardRebuilding state "
+         "machine."},
         {"num_active_logs",
          DataType::BIGINT,
          "Set of logs being rebuilt for this shard.  The shard completes "
@@ -93,28 +78,28 @@ class ShardRebuildings : public AdminCommandTable {
         {"time_by_state",
          DataType::TEXT,
          "Time spent in each state. 'stalled' means either waiting for global "
-         "window or aborted because of a persistent error. V2 only"},
+         "window or aborted because of a persistent error."},
         {"task_in_flight",
          DataType::INTEGER,
          "True if a storage task for reading records is in queue or in flight "
-         "right now. V2 only."},
+         "right now."},
         {"persistent_error",
          DataType::INTEGER,
          "True if we encountered an unrecoverable error when reading. Shard "
          "shouldn't stay in this state for more than a few seconds: it's "
          "expected that RebuildingCoordinator will request a rebuilding for "
          "this shard, and rebuilding will rewind without this node's "
-         "participation. V2 only."},
+         "participation."},
         {"read_buffer_bytes",
          DataType::BIGINT,
          "Bytes of records that we've read but haven't started re-replicating "
-         "yet. V2 only."},
+         "yet."},
         {"records_in_flight",
          DataType::BIGINT,
-         "Number of records that are being re-replicated right now. V2 only."},
+         "Number of records that are being re-replicated right now."},
         {"read_pointer",
          DataType::TEXT,
-         "How far we have read: partition, log ID, LSN. V2 only."},
+         "How far we have read: partition, log ID, LSN."},
         {"progress",
          DataType::REAL,
          "Approximately what fraction of the work is done, between 0 and 1. "
@@ -122,8 +107,7 @@ class ShardRebuildings : public AdminCommandTable {
     };
   }
   std::string getCommandToSend(QueryContext& /*ctx*/) const override {
-    // TODO (#35636262): Use "info rebuilding shards --json" instead.
-    return std::string("info rebuildings --shards --json\n");
+    return std::string("info rebuilding shards --json\n");
   }
 };
 

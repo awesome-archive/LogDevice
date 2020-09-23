@@ -47,7 +47,7 @@ Request::Execution GetClusterStateRequest::execute() {
   return Execution::CONTINUE;
 }
 
-bool GetClusterStateRequest::start() {
+void GetClusterStateRequest::start() {
   ld_spew("Starting cluster state refresh");
 
   activateWaveTimer();
@@ -62,13 +62,11 @@ bool GetClusterStateRequest::start() {
   next_node_pos_ = end;
   for (; cur < end; cur++) {
     node_index_t node = nodes_[cur];
-    if (nodes_configuration->isNodeInServiceDiscoveryConfig(node) &&
-        sendTo(nodes_configuration->getNodeID(node))) {
-      return true;
+    if (nodes_configuration->isNodeInServiceDiscoveryConfig(node)) {
+      sendTo(nodes_configuration->getNodeID(node));
     }
     // Node may have been removed from config.
   }
-  return false;
 }
 
 void GetClusterStateRequest::initNodes() {
@@ -88,7 +86,7 @@ void GetClusterStateRequest::initNodes() {
   nodes_.clear();
   next_node_pos_ = 0;
 
-  if (dest_.hasValue()) {
+  if (dest_.has_value()) {
     // An explicit recipient was passed in constructor. Put it by itself in the
     // nodes list and let the request execute immediately.
     nodes_.push_back(dest_.value().index());
@@ -130,22 +128,25 @@ void GetClusterStateRequest::initTimers() {
   timer_->activate(timeout_);
 
   wave_timer_ = std::make_unique<Timer>([&] { onWaveTimeout(); });
+  deferred_error_timer_ =
+      std::make_unique<Timer>([this] { onDeferredError(); });
 }
 
 void GetClusterStateRequest::activateWaveTimer() {
-  if (wave_timer_) {
-    if (wave_timer_->isActive()) {
-      wave_timer_->cancel();
-    }
-    wave_timer_->activate(wave_timeout_);
-  }
+  wave_timer_->activate(wave_timeout_);
 }
 
-bool GetClusterStateRequest::done(Status status,
-                                  std::vector<uint8_t> nodes_state,
-                                  std::vector<node_index_t> boycotted_nodes) {
+void GetClusterStateRequest::activateDeferredErrorTimer() {
+  deferred_error_timer_->activate(std::chrono::milliseconds(0));
+}
+
+bool GetClusterStateRequest::done(
+    Status status,
+    std::vector<std::pair<node_index_t, uint16_t>> nodes_state,
+    std::vector<node_index_t> boycotted_nodes,
+    std::vector<std::pair<node_index_t, uint16_t>> nodes_status) {
   ld_debug("Done getting cluster state from %s with status %s",
-           dest_.hasValue() ? dest_.value().toString().c_str() : "<unknown>",
+           dest_.has_value() ? dest_.value().toString().c_str() : "<unknown>",
            error_description(status));
   if (timer_) {
     timer_->cancel();
@@ -156,7 +157,10 @@ bool GetClusterStateRequest::done(Status status,
 
   ld_check(!callback_called_);
   callback_called_ = true;
-  callback_(status, std::move(nodes_state), std::move(boycotted_nodes));
+  callback_(status,
+            std::move(nodes_state),
+            std::move(boycotted_nodes),
+            std::move(nodes_status));
 
   destroyRequest();
   return true;
@@ -175,7 +179,7 @@ ClusterState* GetClusterStateRequest::getClusterState() const {
   return Worker::getClusterState();
 }
 
-bool GetClusterStateRequest::sendTo(NodeID to) {
+void GetClusterStateRequest::sendTo(NodeID to) {
   ld_debug("Sending GET_CLUSTER_STATE to Node %s",
            Sender::describeConnection(to).c_str());
 
@@ -183,17 +187,22 @@ bool GetClusterStateRequest::sendTo(NodeID to) {
   auto msg = std::make_unique<GET_CLUSTER_STATE_Message>(header);
   int rv = Worker::onThisThread()->sender().sendMessage(std::move(msg), to);
   if (rv != 0) {
-    RATELIMIT_LEVEL(dest_.hasValue() ? facebook::logdevice::dbg::Level::SPEW
-                                     : facebook::logdevice::dbg::Level::ERROR,
+    RATELIMIT_LEVEL(dest_.has_value() ? facebook::logdevice::dbg::Level::SPEW
+                                      : facebook::logdevice::dbg::Level::ERROR,
                     std::chrono::seconds(1),
                     5,
                     "Failed to queue a GET_CLUSTER_STATE message "
                     "for sending to %s: %s",
                     Sender::describeConnection(to).c_str(),
                     error_description(err));
-    return onError(err);
+    // Instead of calling onError() here, activate a zero-delay timer to call it
+    // on a different event loop iteration. This avoids the awkwardness of
+    // (a) calling error callback from inside execute() (FailureDetector
+    // wouldn't like that), (b) retrying recursively with unbounded stack
+    // depth proportional to number of retries.
+    deferred_errors_.push(err);
+    activateDeferredErrorTimer();
   }
-  return false;
 }
 
 bool GetClusterStateRequest::onError(Status status) {
@@ -214,7 +223,10 @@ bool GetClusterStateRequest::onError(Status status) {
                       1,
                       "Retrieving the state of the cluster failed due to "
                       "feature not being supported on one server. giving up.");
-      return done(status, std::vector<uint8_t>(), std::vector<node_index_t>());
+      return done(status,
+                  std::vector<std::pair<node_index_t, uint16_t>>(),
+                  std::vector<node_index_t>(),
+                  std::vector<std::pair<node_index_t, uint16_t>>());
       break;
     default: {
       // trigger the next wave if all the nodes
@@ -222,15 +234,17 @@ bool GetClusterStateRequest::onError(Status status) {
       if (errors_ == next_node_pos_) {
         // if we exhausted all nodes of the cluster, we give up
         if (next_node_pos_ == nodes_.size()) {
-          RATELIMIT_LEVEL(dest_.hasValue()
+          RATELIMIT_LEVEL(dest_.has_value()
                               ? facebook::logdevice::dbg::Level::SPEW
                               : facebook::logdevice::dbg::Level::ERROR,
                           std::chrono::seconds(1),
                           10,
                           "Retrieving the state of the cluster failed. "
                           "giving up.");
-          return done(
-              E::FAILED, std::vector<uint8_t>(), std::vector<node_index_t>());
+          return done(E::FAILED,
+                      std::vector<std::pair<node_index_t, uint16_t>>(),
+                      std::vector<node_index_t>(),
+                      std::vector<std::pair<node_index_t, uint16_t>>());
         } else {
           RATELIMIT_INFO(std::chrono::seconds(1),
                          10,
@@ -240,7 +254,8 @@ bool GetClusterStateRequest::onError(Status status) {
           // In that situation, we are starting a new wave. start() may return
           // true to let the caller know that it should stop and this object
           // may get destroyed in the new wave.
-          return start();
+          start();
+          return false;
         }
       }
     }
@@ -249,11 +264,23 @@ bool GetClusterStateRequest::onError(Status status) {
   return false;
 }
 
+bool GetClusterStateRequest::onDeferredError() {
+  while (!deferred_errors_.empty()) {
+    Status error = deferred_errors_.front();
+    deferred_errors_.pop();
+    if (onError(error)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool GetClusterStateRequest::onReply(
     const Address& from,
     Status status,
-    std::vector<uint8_t> nodes_state,
-    std::vector<node_index_t> boycotted_nodes) {
+    std::vector<std::pair<node_index_t, uint16_t>> nodes_state,
+    std::vector<node_index_t> boycotted_nodes,
+    std::vector<std::pair<node_index_t, uint16_t>> nodes_status) {
   if (status != E::OK) {
     RATELIMIT_WARNING(std::chrono::seconds(1),
                       5,
@@ -267,7 +294,10 @@ bool GetClusterStateRequest::onReply(
            Sender::describeConnection(from).c_str());
 
   // finish and destroy request
-  return done(E::OK, std::move(nodes_state), std::move(boycotted_nodes));
+  return done(E::OK,
+              std::move(nodes_state),
+              std::move(boycotted_nodes),
+              std::move(nodes_status));
 }
 
 bool GetClusterStateRequest::onWaveTimeout() {
@@ -281,8 +311,10 @@ bool GetClusterStateRequest::onWaveTimeout() {
     // the request has been sent to every node in the cluster and we still
     // time out... giving up.
     WORKER_STAT_INCR(client.get_cluster_state_failed);
-    return done(
-        E::TIMEDOUT, std::vector<uint8_t>(), std::vector<node_index_t>());
+    return done(E::TIMEDOUT,
+                std::vector<std::pair<node_index_t, uint16_t>>(),
+                std::vector<node_index_t>(),
+                std::vector<std::pair<node_index_t, uint16_t>>());
   } else {
     // send another wave.
     RATELIMIT_INFO(std::chrono::seconds(1),
@@ -294,20 +326,24 @@ bool GetClusterStateRequest::onWaveTimeout() {
     // wave by a factor at every round if there is a timeout, until the message
     // has been sent to the whole cluster.
     wave_size_ *= kWaveScaleFactor;
-    return start();
+    start();
+    return false;
   }
   return false;
 }
 
 bool GetClusterStateRequest::onTimeout() {
-  RATELIMIT_LEVEL(dest_.hasValue() ? facebook::logdevice::dbg::Level::SPEW
-                                   : facebook::logdevice::dbg::Level::ERROR,
+  RATELIMIT_LEVEL(dest_.has_value() ? facebook::logdevice::dbg::Level::SPEW
+                                    : facebook::logdevice::dbg::Level::ERROR,
                   std::chrono::seconds(1),
                   10,
                   "Retrieving the state of the cluster timed out.");
   WORKER_STAT_INCR(client.get_cluster_state_timeout);
   WORKER_STAT_INCR(client.get_cluster_state_failed);
-  return done(E::TIMEDOUT, std::vector<uint8_t>(), std::vector<node_index_t>());
+  return done(E::TIMEDOUT,
+              std::vector<std::pair<node_index_t, uint16_t>>(),
+              std::vector<node_index_t>(),
+              std::vector<std::pair<node_index_t, uint16_t>>());
 }
 
 const Settings& GetClusterStateRequest::getSettings() const {

@@ -164,17 +164,11 @@ void StreamWriterIntegrationTest::init(size_t num_nodes,
                                        int replication_factor,
                                        int node_set_size,
                                        uint32_t num_logs) {
-  Configuration::Nodes nodes;
-  for (int i = 0; i < num_nodes; ++i) {
-    auto& node = nodes[i];
-    node.generation = 1;
-    node.addSequencerRole();
-    node.addStorageRole();
-  }
+  auto nodes = createSimpleNodesConfig(num_nodes);
 
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(replication_factor);
-  log_attrs.set_nodeSetSize(node_set_size);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(replication_factor)
+                       .with_nodeSetSize(node_set_size);
 
   cluster = IntegrationTestUtils::ClusterFactory()
                 .setNodes(nodes)
@@ -189,8 +183,7 @@ void StreamWriterIntegrationTest::init(size_t num_nodes,
                 .setParam("--nodeset-size-adjustment-min-factor", "0")
                 .create(num_nodes);
 
-  for (const auto& it : nodes) {
-    node_index_t idx = it.first;
+  for (const auto& [idx, _] : *nodes->getServiceDiscovery()) {
     cluster->waitUntilGossip(/* alive */ true, idx);
   }
 

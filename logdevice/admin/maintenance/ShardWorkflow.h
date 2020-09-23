@@ -51,10 +51,17 @@ class ShardWorkflow {
    * Computes the new MaintenanceStatus based on the parameters
    * passed
    *
-   * @param shard_state     The membership ShardState in NC
-   * @param data_health     ShardDataHealth for the shard
-   * @param rebuilding_mode RebuildingMode for the shard
+   * @param shard_state           The membership ShardState in NC
+   * @param excluded_from_nodeset Whether currently this shard is
+   *                              excluded from nodesets or not.
+   * @param data_health           ShardDataHealth for the shard
+   * @param rebuilding_mode       RebuildingMode for the shard
+   * @param is_draining           Is drain flag set in event log
+   * @param is_non_authoritative  Is current rebuilding non authoritative.
    * @param node_gossip_state The gossip state of the node for this shard
+   * @param use_force_restore_flag A flag indicating whether maintenance manager
+   *                               should use the FORCE_RESTORE eventlog flag or
+   *                               not when triggering rebuilding for a shard.
    *
    * @return folly::SemiFuture<MaintenanceStatus> A SemiFuture out of
    *      MaintenanceStatus. Promise is fulfiled immediately if there
@@ -64,9 +71,13 @@ class ShardWorkflow {
    */
   folly::SemiFuture<thrift::MaintenanceStatus>
   run(const membership::ShardState& shard_state,
+      bool excluded_from_nodeset,
       ShardDataHealth data_health,
       RebuildingMode rebuilding_mode,
-      ClusterStateNodeState node_gossip_state);
+      bool is_draining,
+      bool is_non_authoritative,
+      ClusterStateNodeState node_gossip_state,
+      bool use_force_restore_flag);
 
   // Returns the ShardID for this workflow
   ShardID getShardID() const;
@@ -83,6 +94,10 @@ class ShardWorkflow {
   // Sets the RebuildingMode for the maintenance
   void rebuildInRestoreMode(bool is_restore);
 
+  // If filter_relocate_shards is true, FILTER_RELOCATE_SHARDS will be
+  // added to SHARD_NEEDS_REBUILD event
+  void rebuildingFilterRelocateShards(bool filter_relocate_shards);
+
   // Returns the target_op_state_
   folly::F14FastSet<ShardOperationalState> getTargetOpStates() const;
 
@@ -94,8 +109,9 @@ class ShardWorkflow {
 
   // Returns the StorageStateTransition that this workflow expects for this
   // shard in NodesConfiguration. This will be used
-  // by the MaintenanceManager in NodesConfig update request
-  membership::StorageStateTransition getExpectedStorageStateTransition() const;
+  // by the MaintenanceManager in NodesConfig update request.
+  folly::Optional<membership::StorageStateTransition>
+  getExpectedStorageStateTransition() const;
 
   // Returns value of allow_passive_drain_
   bool allowPassiveDrain() const;
@@ -105,7 +121,8 @@ class ShardWorkflow {
         target_op_state_ == other.target_op_state_ &&
         allow_passive_drain_ == other.allow_passive_drain_ &&
         skip_safety_check_ == other.skip_safety_check_ &&
-        restore_mode_rebuilding_ == other.restore_mode_rebuilding_;
+        restore_mode_rebuilding_ == other.restore_mode_rebuilding_ &&
+        filter_relocate_shards_ == other.filter_relocate_shards_;
   }
 
  protected:
@@ -127,7 +144,8 @@ class ShardWorkflow {
   // in the NodesConfiguration. Workflow will set this value
   // and MaintenanceManager will make use of it to request
   // the update in NodesConfiguration.
-  membership::StorageStateTransition expected_storage_state_transition_;
+  folly::Optional<membership::StorageStateTransition>
+      expected_storage_state_transition_{folly::none};
   // If safety checker determines that a drain is needed,
   // allow passive drain if reruired
   bool allow_passive_drain_{false};
@@ -136,6 +154,8 @@ class ShardWorkflow {
   // True if RebuildingMode requested by the maintenance is RESTORE.
   // Mainly set by internal maintenance request when a shard is down
   bool restore_mode_rebuilding_{false};
+  // True if rebuilding needs to filter shards in relocate mode
+  bool filter_relocate_shards_{false};
   // The EventLogRecord to write as determined by workflow.
   // nullptr if there isn't one to write
   std::unique_ptr<EventLogRecord> event_;
@@ -145,10 +165,21 @@ class ShardWorkflow {
   // The last StorageState as informed by MM for this shard
   // Gets updated every time `run` is called
   membership::StorageState current_storage_state_;
+  // Whether we are currently being excluded from nodesets or not.
+  bool is_excluded_from_nodeset_{false};
   // The last ShardDataHealth as informed by the MM for this
   // shard.
   // Gets updated every time `run` is called
   ShardDataHealth current_data_health_;
+  // True if current rebuilding has drain flag set
+  // in the event log
+  bool current_is_draining_;
+  // True if current rebuilding is non authoritative
+  // Gets updated every time `run` is called
+  bool current_rebuilding_is_non_authoritative_;
+  // A feature gating that was added temporarily to allow a migration of admin
+  // server to use a new eventlog FORCE_RESTORE flag
+  bool use_force_restore_flag_{false};
   // The last known gossip state for the node.
   ClusterStateNodeState gossip_state_;
   // The last RebuildingMode as informed by the MM for this
@@ -170,10 +201,10 @@ class ShardWorkflow {
   void computeMaintenanceStatusForDrain();
   void computeMaintenanceStatusForMayDisappear();
   void computeMaintenanceStatusForEnable();
-  // Sets event_ to SHARD_NEEDS_REBUILD_Event if the mode is different from
-  // current_rebuilding_mode_. If force argument is true, a new event of `mode`
-  // will be created irrespective of the current_rebuilding_mode_.
-  void createRebuildEventIfRequired(RebuildingMode mode, bool force = false);
+  // Sets event_ to SHARD_NEEDS_REBUILD_Event with appropriate flags. If force
+  // argument is true, a new event will be created irrespective of the
+  // current_rebuilding_mode_ and current_is_draining_
+  void createRebuildEventIfRequired(bool force = false);
   // Sets event_ to SHARD_ABORT_EVENT if this is a full shard
   // rebuilding based on current_data_health_ and current_rebuilding_mode_
   void createAbortEventIfRequired();
@@ -182,6 +213,9 @@ class ShardWorkflow {
   // 2 * nodes-configuration-manager-intermediary-shard-state-timeout since
   // last time the status_ was updated
   virtual bool isNcTransitionStuck() const;
+
+  // Returns true if the node is alive, false otherwise.
+  bool isNodeAlive() const;
 };
 
 }}} // namespace facebook::logdevice::maintenance

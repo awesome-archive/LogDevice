@@ -13,12 +13,12 @@
 #include <mutex>
 #include <string>
 
-#include <folly/AtomicBitSet.h>
+#include <folly/ConcurrentBitSet.h>
 #include <folly/Function.h>
 #include <folly/Memory.h>
 #include <folly/memory/EnableSharedFromThis.h>
 
-#include "logdevice/common/HealthMonitor.h"
+#include "logdevice/common/RequestExecutor.h"
 #include "logdevice/common/ResourceBudget.h"
 #include "logdevice/common/Semaphore.h"
 #include "logdevice/common/WorkerType.h"
@@ -27,6 +27,7 @@
 #include "logdevice/common/types_internal.h"
 #include "logdevice/common/work_model/WorkContext.h"
 #include "logdevice/include/types.h"
+
 // Think twice before adding new includes here!  This file is included in many
 // translation units and increasing its transitive dependency footprint will
 // slow down the build.  We use forward declaration and the pimpl idiom to
@@ -55,23 +56,30 @@ class PermissionChecker;
 class PluginRegistry;
 class PrincipalParser;
 class ProcessorImpl;
-class RebuildingSupervisor;
 class Request;
 class SequencerBatching;
+class ReadStreamDebugInfoSamplingConfig;
 class SequencerLocator;
+class SSLSessionCache;
 class StatsHolder;
 class TraceLogger;
-class TrafficShaper;
+class ThriftClientFactory;
+class ThriftRouter;
+class TLSCredMonitor;
 class UpdateableConfig;
 class UpdateableSecurityInfo;
-class WatchDogThread;
 class Worker;
 class WheelTimer;
 class Configuration;
 enum class SequencerOptions : uint8_t;
 using workers_t = std::vector<std::unique_ptr<Worker>>;
 
-class Processor : public folly::enable_shared_from_this<Processor> {
+class Processor : public folly::enable_shared_from_this<Processor>,
+                  public RequestPoster,
+                  // TODO: Remove this inheritence after migrating all the
+                  // callsites to use RequestExecutorInterface instead of the
+                  // Processor directly.
+                  public RequestExecutor {
  public:
   enum class Order { FORWARD, REVERSE, RANDOM };
 
@@ -79,22 +87,8 @@ class Processor : public folly::enable_shared_from_this<Processor> {
    * Creates a new Processor.  You cannot use this directly, need to call the
    * create() factory method which performs two-step initialisation with init().
    *
-   * @param cluster_config config to pass to Worker threads
-   * @param Settings       common setting shared by all EventLoops in this
-   *                       Processor and all the objects running on them.
-   *                       Must be non-null. Is NOT owned by Processor.
-   * @param rebuilding_mode             whether this Processor is part of
-   *                                    rebuilding process
-   * @param permission_checker          pointer to a PermissionChecker.
-   *                                    Ownership is transfered to the processor
-   * @param principal_parser            pointer to a PrinciplaParser. Ownership
-   *                                    is transfered to the processor
-   * @param stats                       object used to update various stat
-   *                                    counters
-   * @param sequencer_locator           used on clients and storage nodes to
-   *                                    map from log ids to sequencer nodes
    * @param credentials                 an optional field used in the initial
-   *                                    handshake of a Socket connection. Used
+   *                                    handshake of a Connection. Used
    *                                    only when the configuration file has set
    *                                    authentication_type to be
    *                                    "self_identification"
@@ -112,7 +106,8 @@ class Processor : public folly::enable_shared_from_this<Processor> {
  protected:
   /**
    * Second step of construction, decoupled from constructor to allow
-   * subclasses to override Worker construction.  Starts all worker threads.
+   * subclasses to override Worker construction. Creates workers but doesn't
+   * start their threads.
    *
    * @throws ConstructorFailed if one or more EventLoops failed to start. err
    *         is set to NOMEM, SYSLIMIT or INTERNAL as defined for EventLoop
@@ -121,6 +116,13 @@ class Processor : public folly::enable_shared_from_this<Processor> {
    *         PermissionChecker or PrincipalParser could not be created.
    */
   virtual void init();
+
+  /**
+   * Start workers' event loop threads, and any background work.
+   * This is separate from init() to make it easy to ensure that worker threads
+   * don't try to access half-initialized Processor.
+   */
+  virtual void startRunning();
 
   /**
    * Creates a worker pool of the supplied type and returns the vector
@@ -134,23 +136,23 @@ class Processor : public folly::enable_shared_from_this<Processor> {
                    bool force);
 
   /**
-   * Common implementation of postRequest(), postImportant() etc. Different
-   * processors can decide to override this accordingly.
+   * Implementation for the RequestExecutor interface.
    */
   int postImpl(std::unique_ptr<Request>& rq,
                WorkerType worker_type,
                int target_thread,
-               bool force);
-
-  int blockingRequestImpl(std::unique_ptr<Request>& rq, bool force);
+               bool force) override;
 
   /**
    * Decides which thread to send a request to.
    */
   int getTargetThreadForRequest(const std::unique_ptr<Request>& rq);
 
-  // HealthMonitor pointer. Used on server side.
-  std::unique_ptr<HealthMonitor> health_monitor_;
+  // BufferedWriter for batching by sequencers.  Initialized only on servers.
+  std::unique_ptr<SequencerBatching> sequencer_batching_;
+  // Used to detect that we are in a test environment without a
+  // fully initialized processor;
+  std::atomic<bool> initialized_{false};
 
  public:
   /**
@@ -162,6 +164,7 @@ class Processor : public folly::enable_shared_from_this<Processor> {
   static std::shared_ptr<Processor> create(Args&&... args) {
     auto p = std::make_shared<Processor>(std::forward<Args>(args)...);
     p->init();
+    p->startRunning();
     return p;
   }
 
@@ -170,9 +173,19 @@ class Processor : public folly::enable_shared_from_this<Processor> {
    */
   explicit Processor(std::shared_ptr<UpdateableConfig> updateable_config,
                      UpdateableSettings<Settings> settings,
+                     folly::Optional<NodeID> my_node_id = folly::none,
                      bool fake_storage_node = false,
                      int max_logs = 1,
                      StatsHolder* stats = nullptr);
+
+  /**
+   * Used for testing.
+   */
+  template <typename... Args>
+  static std::shared_ptr<Processor> createNoInit(Args&&... args) {
+    auto p = std::make_shared<Processor>(std::forward<Args>(args)...);
+    return p;
+  }
 
   virtual ~Processor();
 
@@ -258,67 +271,6 @@ class Processor : public folly::enable_shared_from_this<Processor> {
   WheelTimer& getWheelTimer();
 
   /**
-   * Schedules rq to run on one of the Workers managed by this Processor.
-   *
-   * @param rq  request to execute. Must not be nullptr. On success the
-   *            function takes ownership of the object (and passes it on
-   *            to a Worker). On failure ownership remains with the
-   *            caller.
-   *
-   * @return 0 if request was successfully passed to a Worker thread for
-   *           execution, -1 on failure. err is set to
-   *     INVALID_PARAM  if rq is invalid
-   *     NOBUFS         if too many requests are pending to be delivered to
-   *                    Workers
-   *     SHUTDOWN       Processor is shutting down
-   */
-  int postRequest(std::unique_ptr<Request>& rq);
-
-  /**
-   * The same as standard postRequest() but worker id is being
-   * selected manually
-   */
-  int postRequest(std::unique_ptr<Request>& rq,
-                  WorkerType worker_type,
-                  int target_thread);
-
-  /**
-   * Runs a Request on one of the Workers, waiting for it to finish.
-   *
-   * For parameters and return values, see postRequest()/postImportant().
-   */
-  int blockingRequest(std::unique_ptr<Request>& rq);
-  int blockingRequestImportant(std::unique_ptr<Request>& rq);
-
-  /**
-   * Similar to postRequest() but proceeds regardless of how many requests are
-   * already pending on the worker (no NOBUFS error).
-   *
-   * This should be used when there is no avenue for pushback in case the
-   * worker is overloaded.  A guideline: if the only way to handle NOBUFS from
-   * the regular postRequest() would be to retry posting the request
-   * individually, then using this instead is appropriate and more efficient.
-   *
-   * @param rq  request to execute. Must not be nullptr. On success the
-   *            function takes ownership of the object (and passes it on
-   *            to the Processor). On failure ownership remains with the
-   *            caller.
-   *
-   * @return 0 if request was successfully passed to a Worker thread for
-   *           execution, -1 on failure. err is set to
-   *     INVALID_PARAM  if rq is invalid
-   *     SHUTDOWN       this queue or processor_ is shutting down
-   */
-  int postImportant(std::unique_ptr<Request>& rq);
-  int postImportant(std::unique_ptr<Request>& rq,
-                    WorkerType worker_type,
-                    int target_thread);
-  // Older alias for postImportant()
-  int postWithRetrying(std::unique_ptr<Request>& rq) {
-    return postImportant(rq);
-  }
-
-  /**
    * Are we a storage node, able to store and deliver records?
    */
   virtual bool runningOnStorageNode() const {
@@ -363,11 +315,6 @@ class Processor : public folly::enable_shared_from_this<Processor> {
    * until this method is called.
    */
   void markShardClean(uint32_t shard_idx);
-
-  /**
-   * Maps log ID to shard index. The mapping must be the same on all nodes.
-   */
-  int getShardForLog(logid_t log);
 
   /**
    * This MUST be called on ServerProcessor only, this lives here as an
@@ -428,19 +375,9 @@ class Processor : public folly::enable_shared_from_this<Processor> {
    */
   void setNodesConfigurationManager(
       std::shared_ptr<configuration::nodes::NodesConfigurationManager> ncm);
-  /**
-   * Get the NodesConfiguration updated by NodesConfigurationManager.
-   * Note: only used during NCM migration period, will be removed later
-   */
-  std::shared_ptr<const configuration::nodes::NodesConfiguration>
-  getNodesConfigurationFromNCMSource() const;
-
-  std::shared_ptr<const configuration::nodes::NodesConfiguration>
-  getNodesConfigurationFromServerConfigSource() const;
 
   /**
-   * @return  NodesConfiguraton object of the cluster, depending on
-   *          processor settings, the source can be server config or NCM.
+   * @return  NodesConfiguraton object of the cluster.
    */
   std::shared_ptr<const configuration::nodes::NodesConfiguration>
   getNodesConfiguration() const;
@@ -468,11 +405,9 @@ class Processor : public folly::enable_shared_from_this<Processor> {
    */
   ResourceBudget::Token getIncomingMessageToken(size_t payload_size);
 
-  /**
-   * Check if sampling of all read streams debug info is allowed for given
-   * Client Session ID.
-   */
-  bool isReadStreamDebugInfoSamplingAllowed(const std::string&) const;
+  RequestExecutor getRequestExecutor() {
+    return RequestExecutor(this);
+  }
 
  private:
   // Make runningOnStorageNode() return true. Used for tests.
@@ -487,15 +422,16 @@ class Processor : public folly::enable_shared_from_this<Processor> {
 
   std::shared_ptr<PluginRegistry> plugin_registry_;
 
+  std::unique_ptr<ThriftClientFactory> thrift_client_factory_;
+  std::unique_ptr<ThriftRouter> thrift_router_;
+
  public:
   StatsHolder* stats_;
 
+  ThriftRouter* getThriftRouter() const;
+
   friend class ProcessorImpl;
   std::unique_ptr<ProcessorImpl> impl_;
-
-  // Pointer to the object responsible for requesting rebuilding. Unowned.
-  // nullptr if we're not a server or not a storage node.
-  RebuildingSupervisor* rebuilding_supervisor_ = nullptr;
 
   // Maintains state of nodes in the cluster
   std::unique_ptr<ClusterState> cluster_state_;
@@ -518,13 +454,6 @@ class Processor : public folly::enable_shared_from_this<Processor> {
   // sequencer for a particular log.
   std::unique_ptr<SequencerLocator> sequencer_locator_;
 
-  // Orchestrates bandwidth policy and bandwidth releases to the Senders
-  // in each Worker.
-  std::unique_ptr<TrafficShaper> traffic_shaper_;
-
-  // A thread running on server side to detect worker stalls
-  std::unique_ptr<WatchDogThread> watchdog_thread_;
-
   // ResourceBudget used to limit the total number of accepted connections.
   // See Settings::max_incoming_connections_.
   ResourceBudget conn_budget_incoming_;
@@ -539,6 +468,14 @@ class Processor : public folly::enable_shared_from_this<Processor> {
   // If it's non-nullptr we don't have any guarantees about how up-to-date it
   // is either, but it's not likely to be far behind.
   UpdateableSharedPtr<EventLogRebuildingSet> rebuilding_set_;
+
+  // RSM in-memory versions for this node.
+  // RSMs will write and FailureDetector will read from this map, so that
+  // the versions can be distributed to other cluster nodes
+  std::map<logid_t, lsn_t> rsm_versions_;
+  // RSM durable versions(only meant for local store) for this node.
+  std::map<logid_t, lsn_t> rsm_durable_versions_;
+  folly::SharedMutex rsm_versions_mutex_;
 
   /**
    * Tracer for API calls.
@@ -555,7 +492,7 @@ class Processor : public folly::enable_shared_from_this<Processor> {
    * Stops any running threads.  Normally exercised through the destructor but
    * also if the constructor fails or explicitly during shutdown.
    */
-  void shutdown();
+  virtual void shutdown();
 
   /**
    * Called by a Worker during shutdown informing the Processor that it had
@@ -581,6 +518,11 @@ class Processor : public folly::enable_shared_from_this<Processor> {
   buffered_writer_id_t issueBufferedWriterID() {
     return buffered_writer_id_t(next_buffered_writer_id_++);
   }
+
+  std::map<logid_t, lsn_t> getAllRSMVersions();
+  std::map<logid_t, lsn_t> getAllDurableRSMVersions();
+  void setRSMVersion(logid_t rsm_type, lsn_t ver);
+  void setDurableRSMVersion(logid_t rsm_type, lsn_t ver);
 
   /**
    * Selects a worker based on hash of the given `seed` value.
@@ -683,9 +625,7 @@ class Processor : public folly::enable_shared_from_this<Processor> {
   void
   setSequencerBatching(std::unique_ptr<SequencerBatching> sequencer_batching);
 
-  HealthMonitor& getHealthMonitor() {
-    return *health_monitor_;
-  }
+  SSLSessionCache& sslSessionCache() const;
 
  private:
   const std::shared_ptr<TraceLogger> trace_logger_;
@@ -700,12 +640,8 @@ class Processor : public folly::enable_shared_from_this<Processor> {
 
   std::atomic<bool> allow_post_during_shutdown_{false};
 
-  // Used to detect that we are in a test environment without a
-  // fully initialized processor;
-  std::atomic<bool> initialized_{false};
-
   // Keeps track of those workers that called noteWorkerFinished()
-  std::array<folly::AtomicBitSet<MAX_WORKERS>,
+  std::array<folly::ConcurrentBitSet<MAX_WORKERS>,
              static_cast<uint8_t>(WorkerType::MAX)>
       workers_finished_;
 
@@ -716,13 +652,10 @@ class Processor : public folly::enable_shared_from_this<Processor> {
   std::atomic<buffered_writer_id_t::raw_type> next_buffered_writer_id_{1};
 
   // See isDataMissingFromShard().
-  folly::AtomicBitSet<MAX_SHARDS> shards_not_missing_data_;
+  folly::ConcurrentBitSet<MAX_SHARDS> shards_not_missing_data_;
 
   // See isShardDirty().
-  folly::AtomicBitSet<MAX_SHARDS> clean_shards_;
-
-  // BufferedWriter for batching by sequencers.  Initialized only on servers.
-  std::unique_ptr<SequencerBatching> sequencer_batching_;
+  folly::ConcurrentBitSet<MAX_SHARDS> clean_shards_;
 
   std::string name_;
 
@@ -750,6 +683,16 @@ class Processor : public folly::enable_shared_from_this<Processor> {
   // and FastUpdateableSharedPtr and shared_ptr machinery every time we need it
   // is relatively expensive
   size_t num_general_workers_{0};
+
+  // Callback called when settings are update
+  void onSettingsUpdated();
+
+ protected:
+  // A component that monitors TLS certificates and TLS ticket seeds and invokes
+  // the callbacks on SSLFetchers on workers.
+  std::unique_ptr<TLSCredMonitor> tls_cred_monitor_;
+
+  virtual void initTLSCredMonitor();
 };
 
 }} // namespace facebook::logdevice

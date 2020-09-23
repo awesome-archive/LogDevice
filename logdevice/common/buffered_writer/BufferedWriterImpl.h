@@ -23,6 +23,7 @@ class StreamWriterTest;
 namespace facebook { namespace logdevice {
 
 class Client;
+class PayloadHolder;
 class Processor;
 class Request;
 
@@ -86,7 +87,7 @@ class BufferedWriterAppendSink {
   appendBuffered(logid_t logid,
                  const BufferedWriter::AppendCallback::ContextSet& contexts,
                  AppendAttributes attrs,
-                 const Payload& payload,
+                 PayloadHolder&& payload,
                  AppendRequestCallback callback,
                  worker_id_t target_worker,
                  int checksum_bits) = 0;
@@ -161,11 +162,31 @@ class WaitableCounter {
   bool allow_more_{true};
 };
 
+/** Provides different measurements of payloads. */
+class BufferedWriterPayloadMeter {
+ public:
+  /** Size of encoded payload in bytes. */
+  static size_t encodedSize(const std::string& payload);
+  static size_t encodedSize(const PayloadGroup& payload_group);
+  static size_t
+  encodedSize(const std::variant<std::string, PayloadGroup>& payload_variant);
+
+  /** Approximate payload memory usage. */
+  static size_t memorySize(const std::string& payload);
+  static size_t memorySize(const PayloadGroup& payload_group);
+  static size_t
+  memorySize(const std::variant<std::string, PayloadGroup>& payload_variant);
+};
+
 class BufferedWriterImpl : public BufferedWriter {
  public:
   // BufferedWriter interface
   int append(logid_t log_id,
              std::string&& payload,
+             AppendCallback::Context,
+             AppendAttributes&& attrs = AppendAttributes());
+  int append(logid_t log_id,
+             PayloadGroup&& payload_group,
              AppendCallback::Context,
              AppendAttributes&& attrs = AppendAttributes());
   std::vector<Status> append(std::vector<Append>&& appends);
@@ -330,6 +351,12 @@ class BufferedWriterImpl : public BufferedWriter {
   }
 
  private:
+  template <typename T>
+  int appendImpl(logid_t log_id,
+                 T&& payload,
+                 AppendCallback::Context cb_context,
+                 AppendAttributes&& attrs);
+
   int mapLogToShardIndex(logid_t) const;
 
   int64_t memoryForPayloadBytes(int64_t payload_bytes) const {
@@ -340,9 +367,6 @@ class BufferedWriterImpl : public BufferedWriter {
     // because we're calling it for batches as well as for individual payloads.
     return 2 * payload_bytes;
   }
-
-  // implementation of append(vector)
-  std::vector<Status> appendImpl(std::vector<Append>&& appends, bool atomic);
 
   template <typename RequestClass>
   void postToAllWorkersAndBlockUntilDone();

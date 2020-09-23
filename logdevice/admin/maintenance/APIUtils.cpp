@@ -36,15 +36,15 @@ validateDefinition(const MaintenanceDefinition& definition) {
     return InvalidRequest(
         "user must be set for the definition to non-empty string");
   }
-  // does user has whitespaces?
-  const std::string& user = definition.get_user();
-  if (contains_whitespaces(user)) {
-    return InvalidRequest("user cannot contain whitespaces");
+
+  if (definition.get_user() == INTERNAL_USER) {
+    return InvalidRequest(
+        "This is a reserved user, cannot be used through the API");
   }
 
   // sequencer_target_state must be set if sequencer_nodes is non-empty
   if (!definition.get_sequencer_nodes().empty() &&
-      definition.sequencer_target_state != SequencingState::DISABLED) {
+      *definition.sequencer_target_state_ref() != SequencingState::DISABLED) {
     return InvalidRequest(
         "sequencer_target_state must be DISABLED if sequencer_nodes is set");
   }
@@ -67,10 +67,6 @@ validateDefinition(const MaintenanceDefinition& definition) {
     }
   }
 
-  // force_restore_rebuilding cannot be set by the user.
-  if (definition.get_force_restore_rebuilding()) {
-    return InvalidRequest("Setting force_restore_rebuilding is not allowed");
-  }
   // ttl cannot be a negative numebr
   if (definition.get_ttl_seconds() < 0) {
     return InvalidRequest("ttl_seconds must be a non-negative number");
@@ -208,13 +204,15 @@ void fillSystemGeneratedAttributes(
     std::vector<MaintenanceDefinition>& definitions) {
   // System-generated values.
   auto created_on = SystemTimestamp::now().toMilliseconds().count();
-  int32_t expires_on = 0;
+  int64_t expires_on = 0;
   if (input.get_ttl_seconds() > 0) {
     expires_on = SystemTimestamp::now().toMilliseconds().count() +
         input.get_ttl_seconds() * 1000;
   }
-
   for (auto& def : definitions) {
+    // We set the priority to MEDIUM if unset in the request.
+    def.set_priority(
+        input.priority_ref().value_or(MaintenancePriority::MEDIUM));
     // set all group-id
     def.set_group(true);
     def.set_group_id(generateGroupID(8));
@@ -226,6 +224,14 @@ void fillSystemGeneratedAttributes(
     def.set_shard_target_state(input.get_shard_target_state());
     def.set_sequencer_target_state(input.get_sequencer_target_state());
     def.set_skip_safety_checks(input.get_skip_safety_checks());
+    def.set_skip_capacity_checks(input.get_skip_capacity_checks());
+    // A temporary backward compatibility hack to support both IMMINENT
+    // maintenances and maintenances with the skip_safety_check flags at the
+    // same time.
+    // TODO: T65770965 Remove me when removing skip_safety_check flag
+    if (def.priority_ref().value() == MaintenancePriority::IMMINENT) {
+      def.set_skip_safety_checks(true);
+    }
     def.set_allow_passive_drains(input.get_allow_passive_drains());
     def.set_force_restore_rebuilding(input.get_force_restore_rebuilding());
     def.set_ttl_seconds(input.get_ttl_seconds());
@@ -373,23 +379,23 @@ bool doesMaintenanceMatchFilter(const thrift::MaintenancesFilter& filter,
 void removeNonExistentNodesFromMaintenance(
     thrift::MaintenanceDefinition& maintenance,
     const configuration::nodes::NodesConfiguration& nodes_configuration) {
-  maintenance.shards.erase(
-      std::remove_if(maintenance.shards.begin(),
-                     maintenance.shards.end(),
+  maintenance.shards_ref()->erase(
+      std::remove_if(maintenance.shards_ref()->begin(),
+                     maintenance.shards_ref()->end(),
                      [&](const auto& shard) {
                        return !findNodeIndex(
                                    shard.get_node(), nodes_configuration)
                                    .hasValue();
                      }),
-      maintenance.shards.end());
-  maintenance.sequencer_nodes.erase(
+      maintenance.shards_ref()->end());
+  maintenance.sequencer_nodes_ref()->erase(
       std::remove_if(
-          maintenance.sequencer_nodes.begin(),
-          maintenance.sequencer_nodes.end(),
+          maintenance.sequencer_nodes_ref()->begin(),
+          maintenance.sequencer_nodes_ref()->end(),
           [&](const auto& node) {
             return !findNodeIndex(node, nodes_configuration).hasValue();
           }),
-      maintenance.sequencer_nodes.end());
+      maintenance.sequencer_nodes_ref()->end());
 }
 
 bool isEmptyMaintenance(const thrift::MaintenanceDefinition& maintenance) {

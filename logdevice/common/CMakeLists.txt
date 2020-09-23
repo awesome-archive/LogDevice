@@ -15,13 +15,17 @@ REMOVE_MATCHES_FROM_LISTS(files hfiles
 )
 
 
+add_subdirectory(if)
 add_subdirectory(configuration/if)
 add_subdirectory(configuration/utils)
 add_subdirectory(configuration/nodes)
+add_subdirectory(configuration/logs/if)
 add_subdirectory(membership)
+add_subdirectory(replicated_state_machine/if)
 
 add_library(common STATIC ${hfiles} ${files})
-add_dependencies(common folly flatbuffers OpenTracing)
+add_dependencies(common folly flatbuffers)
+add_dependencies(common api_service-cpp2-target)
 add_dependencies(common NodesConfiguration-cpp2-target)
 add_dependencies(common ConfigurationCodec-cpp2-target)
 add_dependencies(common AllReadStreamsDebugConfig-cpp2-target)
@@ -30,9 +34,13 @@ set_target_properties(common
   PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_link_libraries(common
+  common-cpp2
+  api_service-cpp2
+  logsconfig-cpp2
   Membership-cpp2
   NodesConfiguration-cpp2
   ConfigurationCodec-cpp2
+  KeyValueStore-cpp2
   AllReadStreamsDebugConfig-cpp2
   ${LOGDEVICE_EXTERNAL_DEPS}
 )
@@ -65,7 +73,7 @@ if(${BUILD_TESTS})
     ${GMOCK_LIBRARY}
   )
 
-  add_dependencies(common_test_util googletest folly rocksdb OpenTracing)
+  add_dependencies(common_test_util googletest folly rocksdb)
 
   add_executable(common_test ${test_hfiles} ${test_files})
   add_dependencies(common_test googletest folly)

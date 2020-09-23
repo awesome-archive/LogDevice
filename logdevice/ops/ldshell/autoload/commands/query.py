@@ -6,8 +6,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import sys
 import textwrap
-from collections import Counter
+import traceback
 
 from nubia import context
 from nubia.internal.cmdbase import Command
@@ -158,7 +159,7 @@ class SelectCommand(Command):
         if not self.ldquery:
             return []
         if self._tables_cached is None:
-            self._tables_cached = [t for t in self.ldquery.tables]
+            self._tables_cached = list(self.ldquery.tables)
         return self._tables_cached
 
     @property
@@ -169,7 +170,6 @@ class SelectCommand(Command):
             )
         return self._table_completer_cached
 
-    # pyre-fixme[15]: T48485855
     def get_completions(self, cmd, document, complete_event):
         if cmd.lower() == "describe" and self.ldquery:
             return self._table_completer.get_completions(document, complete_event)
@@ -413,7 +413,7 @@ class SelectCommand(Command):
         except RuntimeError as e:
             print()
             cprint("[ERROR] A runtime error occured: {}".format(str(e)), "red")
-            return "Invalid Statement"
+            return "Unexpected Runtime Error"
         except StatementError as e:
             print()
             cprint("[ERROR] Invalid Statement: {}".format(str(e)), "red")
@@ -421,16 +421,24 @@ class SelectCommand(Command):
         except LDQueryError as e:
             print()
             cprint("[ERROR] Something went wrong in ldquery: {}".format(str(e)), "red")
-            return "Unexpected Error"
+            return "Unexpected Query Error"
 
     def run_interactive(self, cmd, input, query):
-        if not self.ldquery:
-            cprint(
-                "You need to be connected to a logdevice cluster. You can use"
-                " the 'connect' command to do so.",
-                "red",
-            )
+        try:
+            if not self.ldquery:
+                cprint(
+                    "You need to be connected to a logdevice cluster. You can use"
+                    " the 'connect' command to do so.",
+                    "red",
+                )
+                return 1
+        except Exception as e:
+            cprint("Error running command: {}".format(str(e)), "red")
+            cprint("-" * 60, "yellow")
+            traceback.print_exc(file=sys.stderr)
+            cprint("-" * 60, "yellow")
             return 1
+
         if not self.running_from_cli and not self._prev_query:
             # enable pretty-printing by default
             self.ldquery.pretty_output = True

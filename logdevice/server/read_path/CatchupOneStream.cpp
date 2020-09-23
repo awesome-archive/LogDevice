@@ -339,12 +339,10 @@ int ReadingCallback::processRecord(
 
   LogStorageState& log_state = catchup_->deps_.getLogStorageStateMap().get(
       stream_->log_id_, stream_->shard_);
-  folly::Optional<lsn_t> trim_point = log_state.getTrimPoint();
-  if (trim_point.hasValue() &&
-      stream_->last_delivered_lsn_ < trim_point.value() &&
+  lsn_t trim_point = log_state.getTrimPoint();
+  if (stream_->last_delivered_lsn_ < trim_point &&
       lsn > stream_->last_delivered_lsn_ + 1) {
-    int rv = catchup_->sendGAP(
-        std::min(trim_point.value(), lsn - 1), GapReason::TRIM);
+    int rv = catchup_->sendGAP(std::min(trim_point, lsn - 1), GapReason::TRIM);
 
     if (rv != 0) {
       if (err == E::NOBUFS || err == E::SHUTDOWN) {
@@ -418,9 +416,9 @@ int ReadingCallback::processRecord(
     // the success case we obviously need to update the read stream state.  As
     // for the failure case (RECORD message gets dropped), the messaging layer
     // guarantees this only happens when there is miscommunication or the
-    // client disconnects, and the Socket is getting closed.  Since the
-    // ClientID is tied to the Socket, it means the read stream will also get
-    // destroyed and it doesn't matter what we do.
+    // client disconnects, and the Connection is getting closed.  Since the
+    // ClientID is tied to the Connection, it means the read stream will also
+    // get destroyed and it doesn't matter what we do.
 
     ld_check(!stream_->storage_task_in_flight_);
     stream_->last_delivered_lsn_ = lsn;
@@ -449,13 +447,10 @@ OffsetMap ReadingCallback::getEpochOffsets(epoch_t record_epoch,
   LogStorageState::LastReleasedLSN last_released_lsn =
       log_state.getLastReleasedLSN();
 
-  // last_released_lsn was known before start reading so it should be known
-  // now.
-  ld_check(last_released_lsn.hasValue());
   epoch_t last_epoch = lsn_to_epoch(last_released_lsn.value());
 
-  const folly::Optional<std::pair<epoch_t, OffsetMap>>&
-      epoch_offsets_from_log_state = log_state.getEpochOffsetMap();
+  folly::Optional<std::pair<epoch_t, OffsetMap>> epoch_offsets_from_log_state =
+      log_state.getEpochOffsetMap();
 
   const folly::Optional<std::pair<epoch_t, OffsetMap>>&
       epoch_offsets_from_metadata = stream_->epoch_offsets_;
@@ -463,10 +458,10 @@ OffsetMap ReadingCallback::getEpochOffsets(epoch_t record_epoch,
   // First check if right epoch offsets are already available from
   // LogStorageState or cached value from PerEpochLogMetadata in
   // ServerReadStream.
-  if (epoch_offsets_from_log_state.hasValue() &&
+  if (epoch_offsets_from_log_state.has_value() &&
       epoch_offsets_from_log_state.value().first == record_epoch) {
     return epoch_offsets_from_log_state.value().second;
-  } else if (epoch_offsets_from_metadata.hasValue() &&
+  } else if (epoch_offsets_from_metadata.has_value() &&
              epoch_offsets_from_metadata.value().first == record_epoch) {
     return epoch_offsets_from_metadata.value().second;
   }
@@ -600,9 +595,8 @@ int ReadingCallback::shipRecord(lsn_t lsn,
                           static_cast<uint64_t>(timestamp.count()),
                           wire_flags,
                           stream_->shard_};
-
+  PayloadHolder payload_holder;
   if (stream_->no_payload_ || stream_->csi_data_only_) {
-    payload = Payload(nullptr, 0);
     // Clear checksum flags if we don't ship payload
     header.flags &= ~(RECORD_Header::CHECKSUM | RECORD_Header::CHECKSUM_64BIT);
     header.flags |= RECORD_Header::CHECKSUM_PARITY;
@@ -635,11 +629,11 @@ int ReadingCallback::shipRecord(lsn_t lsn,
 
     h.length = static_cast<uint32_t>(payload.size());
     h.hash = checksum_32bit(Slice(payload));
-    payload = Payload(&h, sizeof(h)).dup();
+    payload_holder = PayloadHolder::copyBuffer(&h, sizeof(h));
   } else {
     // Make private copy of the data so it is stable for the lifetime of
     // the, possibly deferred on transmission, RECORD message.
-    payload = payload.dup();
+    payload_holder = PayloadHolder::copyPayload(payload);
   }
 
   if (stream_->include_byte_offset_ && offsets.isValid()) {
@@ -653,7 +647,7 @@ int ReadingCallback::shipRecord(lsn_t lsn,
   auto msg =
       std::make_unique<RECORD_Message>(header,
                                        stream_->trafficClass(),
-                                       std::move(payload),
+                                       std::move(payload_holder),
                                        std::move(extra_metadata),
                                        RECORD_Message::Source::LOCAL_LOG_STORE,
                                        std::move(offsets),
@@ -767,31 +761,12 @@ CatchupOneStream::startRead(WeakRef<CatchupQueue> catchup_queue,
       deps_.getLogStorageStateMap().get(stream_->log_id_, stream_->shard_);
   LogStorageState::LastReleasedLSN last_released_lsn =
       log_state.getLastReleasedLSN();
-  folly::Optional<lsn_t> trim_point = log_state.getTrimPoint();
+  lsn_t trim_point = log_state.getTrimPoint();
 
   if (sendStarted(last_released_lsn) != 0) {
     ld_check(err != E::CBREGISTERED);
     stream_->last_batch_status_ = "failed to send STARTED";
     return Action::TRANSIENT_ERROR;
-  }
-
-  bool needs_recover =
-      (!last_released_lsn.hasValue() && !stream_->ignore_released_status_) ||
-      !trim_point.hasValue();
-
-  if (needs_recover) {
-    // If either trim_point or last_released_lsn (in case we care about it)
-    // is not initialized, try to recover it first.
-    int rv = deps_.recoverLogState(stream_->log_id_, stream_->shard_);
-    if (rv == 0) {
-      stream_ld_debug(
-          *stream_, "Dequeuing stream because log state needs to be recovered");
-      stream_->last_batch_status_ = "recover log state";
-      return Action::DEQUEUE_AND_CONTINUE;
-    } else {
-      stream_->last_batch_status_ = "permanent error in recoverLogState";
-      return Action::PERMANENT_ERROR;
-    }
   }
 
   if (stream_->rebuilding_) {
@@ -801,22 +776,22 @@ CatchupOneStream::startRead(WeakRef<CatchupQueue> catchup_queue,
     return Action::DEQUEUE_AND_CONTINUE;
   }
 
-  if (stream_->getReadPtr().lsn <= trim_point.value() ||
+  if (stream_->getReadPtr().lsn <= trim_point ||
       stream_->need_to_deliver_lsn_zero_) {
     // Next requested LSN is not past the trim point. We'll inform the
     // client and fast-forward the stream (we'll keep reading if trim_point+1
     // is still inside client's window).
-    int rv = sendGAP(trim_point.value(), GapReason::TRIM);
+    int rv = sendGAP(trim_point, GapReason::TRIM);
     if (rv != 0) {
       ld_check(err != E::CBREGISTERED);
       stream_ld_debug(*stream_,
                       "Failed to send a gap up to %s",
-                      lsn_to_string(trim_point.value()).c_str());
+                      lsn_to_string(trim_point).c_str());
       stream_->last_batch_status_ = "failed to send gap";
       return Action::TRANSIENT_ERROR;
     }
 
-    if (trim_point.value() >= LSN_MAX) {
+    if (trim_point >= LSN_MAX) {
       // log was fully trimmed, there's nothing more to read
       stream_ld_debug(*stream_, "trim_point >= LSN_MAX. Erasing stream.");
       stream_->last_batch_status_ = "trim_point >= LSN_MAX";
@@ -824,8 +799,8 @@ CatchupOneStream::startRead(WeakRef<CatchupQueue> catchup_queue,
     }
 
     // fast forward the stream....
-    if (stream_->getReadPtr().lsn <= trim_point.value()) {
-      stream_->setReadPtr(trim_point.value() + 1);
+    if (stream_->getReadPtr().lsn <= trim_point) {
+      stream_->setReadPtr(trim_point + 1);
     }
   }
 
@@ -833,7 +808,6 @@ CatchupOneStream::startRead(WeakRef<CatchupQueue> catchup_queue,
 
   // We don't care about released records in recovery mode; sequencer is
   // interested in all records we have.
-  ld_check(stream_->ignore_released_status_ || last_released_lsn.hasValue());
   lsn_t last_released =
       stream_->ignore_released_status_ ? LSN_MAX : last_released_lsn.value();
 
@@ -857,13 +831,12 @@ CatchupOneStream::startRead(WeakRef<CatchupQueue> catchup_queue,
     lsn_t last_per_epoch_released = log_state.getLastPerEpochReleasedLSN();
     ld_check(last_per_epoch_released >= last_released);
 
-    // Refresh last_released. The underlying atomic may have increased in
-    // the meantime. Refreshing last_released avoids false positives where
-    // stream_->last_delivered_lsn_ would fall between last_released and
-    // last_per_epoch_released just because getLastPerEpochReleasedLSN() is
-    // called (much) later than getLastReleasedLSN().
+    // Refresh last_released. Refreshing last_released avoids false
+    // positives where stream_->last_delivered_lsn_ would fall between
+    // last_released and last_per_epoch_released just because
+    // getLastPerEpochReleasedLSN() is called (much) later than
+    // getLastReleasedLSN().
     last_released_lsn = log_state.getLastReleasedLSN();
-    ld_check(last_released_lsn.hasValue());
     ld_check(last_released <= last_released_lsn.value());
     last_released = last_released_lsn.value();
 
@@ -1234,7 +1207,7 @@ CatchupOneStream::Action CatchupOneStream::pushReleasedRecords(
         break;
       }
 
-      size_t msg_size = RECORD_Message::expectedSize(entry->payload_raw.size);
+      size_t msg_size = RECORD_Message::expectedSize(entry->payload.size());
 
       if (read_ctx.byteLimitReached(nrecords, bytes_delivered, msg_size)) {
         status = E::BYTE_LIMIT_REACHED;
@@ -1243,17 +1216,17 @@ CatchupOneStream::Action CatchupOneStream::pushReleasedRecords(
 
       nrecords++;
 
-      int rv = callback.processRecord(
-          entry->lsn,
-          std::chrono::milliseconds(entry->timestamp),
-          entry->flags,
-          entry->keys,
-          Payload(entry->payload_raw.data, entry->payload_raw.size),
-          entry->wave_or_recovery_epoch,
-          entry->last_known_good,
-          entry->copyset.size(),
-          entry->copyset.data(),
-          entry->offsets_within_epoch);
+      int rv =
+          callback.processRecord(entry->lsn,
+                                 std::chrono::milliseconds(entry->timestamp),
+                                 entry->flags,
+                                 entry->keys,
+                                 entry->payload.getPayload(),
+                                 entry->wave_or_recovery_epoch,
+                                 entry->last_known_good,
+                                 entry->copyset.size(),
+                                 entry->copyset.data(),
+                                 entry->offsets_within_epoch);
       if (rv != 0) {
         ld_check_ne(err, E::CBREGISTERED);
         status = E::ABORTED;
@@ -1445,7 +1418,7 @@ std::pair<CatchupOneStream::Action, size_t>
 CatchupOneStream::onReadTaskDone(CatchupQueueDependencies& deps,
                                  ServerReadStream* stream,
                                  const ReadStorageTask& task) {
-  auto& resume_cb = task.catchup_queue_->resumeCallback();
+  auto& resume_cb = task.catchup_queue_.get()->resumeCallback();
   CatchupOneStream catchup(deps, stream, resume_cb);
   Action action = catchup.processTask(task);
   return std::make_pair(action, catchup.record_bytes_queued_);
@@ -1503,12 +1476,11 @@ int CatchupOneStream::sendStarted(
     return 0;
   }
 
-  // to not include last released if the read stream is used for rebuilding
+  // Do not include last released if the read stream is used for rebuilding
   // or recovery (digest)
   lsn_t last_released_to_include =
-      ((stream_->rebuilding_ || stream_->digest_ || !last_released.hasValue())
-           ? LSN_INVALID
-           : last_released.value());
+      ((stream_->rebuilding_ || stream_->digest_) ? LSN_INVALID
+                                                  : last_released.value());
 
   STARTED_Header header = {stream_->log_id_,
                            stream_->id_,
@@ -1597,23 +1569,21 @@ int CatchupOneStream::sendGapNoRecords(lsn_t no_records_upto) {
 
   LogStorageState& log_state =
       deps_.getLogStorageStateMap().get(stream_->log_id_, stream_->shard_);
-  folly::Optional<lsn_t> trim_point = log_state.getTrimPoint();
+  lsn_t trim_point = log_state.getTrimPoint();
 
   int rv = 0;
 
   // First send a TRIM gap (if any).
-  if (trim_point.hasValue() &&
-      stream_->last_delivered_lsn_ < trim_point.value()) {
+  if (stream_->last_delivered_lsn_ < trim_point) {
     // Trim point was set after the check in pushRecords().
-    rv =
-        sendGAP(std::min(trim_point.value(), no_records_upto), GapReason::TRIM);
+    rv = sendGAP(std::min(trim_point, no_records_upto), GapReason::TRIM);
     if (rv != 0) {
       return rv;
     }
   }
 
   // If there is a filtered out gap, we need to send it out first.
-  if (trim_point.value_or(LSN_INVALID) < stream_->filtered_out_end_lsn_ &&
+  if (trim_point < stream_->filtered_out_end_lsn_ &&
       sendGapFilteredOutIfNeeded(trim_point) != 0) {
     return rv;
   }
@@ -1627,9 +1597,8 @@ int CatchupOneStream::sendGapNoRecords(lsn_t no_records_upto) {
   return rv;
 }
 
-int CatchupOneStream::sendGapFilteredOutIfNeeded(
-    folly::Optional<lsn_t> trim_point) {
-  if (trim_point.value_or(LSN_INVALID) < stream_->filtered_out_end_lsn_ &&
+int CatchupOneStream::sendGapFilteredOutIfNeeded(lsn_t trim_point) {
+  if (trim_point < stream_->filtered_out_end_lsn_ &&
       sendGAP(stream_->filtered_out_end_lsn_, GapReason::FILTERED_OUT) != 0) {
     RATELIMIT_ERROR(std::chrono::seconds(10),
                     3,
@@ -1899,7 +1868,6 @@ CatchupOneStream::createReadContext(lsn_t last_released_lsn,
                                             last_released_lsn,
                                             max_record_bytes_queued,
                                             first_record_any_size,
-                                            false, // is_rebuilding
                                             std::move(filter),
                                             catchup_reason);
 

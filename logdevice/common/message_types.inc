@@ -57,15 +57,12 @@ MESSAGE_TYPE(ACK,   'I')   // server at passive connection end sends this in
 
 MESSAGE_TYPE(GOSSIP, 'G')   // used to exchange information about dead nodes
 
-MESSAGE_TYPE(GET_LOG_INFO, 'j')       // request for configuration of a
-                                      // particular log
-MESSAGE_TYPE(GET_LOG_INFO_REPLY, 'J') // configuration of the log requested.
 MESSAGE_TYPE(CONFIG_CHANGED, 'g')     // we send this on config change
-MESSAGE_TYPE(CONFIG_ADVISORY, 'X')    // used to send the config version
+// MESSAGE_TYPE(CONFIG_ADVISORY, 'X')    // used to send the config version
 MESSAGE_TYPE(CONFIG_FETCH, 'z')       // used to fetch a config
 
-MESSAGE_TYPE(IS_LOG_EMPTY, 'e')        // request to know whether a log is empty
-MESSAGE_TYPE(IS_LOG_EMPTY_REPLY, 'E')  // response to IS_LOG_EMPTY request
+// MESSAGE_TYPE(IS_LOG_EMPTY, 'e')        // request to know whether a log is empty
+// MESSAGE_TYPE(IS_LOG_EMPTY_REPLY, 'E')  // response to IS_LOG_EMPTY request
 
 MESSAGE_TYPE(GET_HEAD_ATTRIBUTES, 'h') // request to get log head attributes
                                        // such as trim point and its timestamp
@@ -110,6 +107,10 @@ MESSAGE_TYPE(GET_TRIM_POINT_REPLY, '{')
 MESSAGE_TYPE(DATA_SIZE, 'O')    // request to approximate data size by
                                 // time range, log
 MESSAGE_TYPE(DATA_SIZE_REPLY, 'P')  // response to DATA_SIZE request
+
+MESSAGE_TYPE(GET_RSM_SNAPSHOT, '&')
+MESSAGE_TYPE(GET_RSM_SNAPSHOT_REPLY, '*')
+
 
 MESSAGE_TYPE(TEST, char(1))
 

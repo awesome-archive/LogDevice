@@ -7,10 +7,11 @@
 # LICENSE file in the root directory of this source tree.
 
 from enum import Enum, auto
-from typing import Any, Dict, Iterator, List, Optional, Tuple, TypeVar
+from typing import Any, AnyStr, Dict, Iterator, List, Mapping, Optional, Tuple, TypeVar
 
 # Convenience
 Attrs = Dict[str, Any]
+Directories = Mapping[str, "Directory"]
 lsn_t = int
 
 # everything here is copied from the BOOST_PYTHON_MODULE in
@@ -18,10 +19,17 @@ lsn_t = int
 # not everything is copied, but I have attempted to be as comprehensive as possible
 
 class LogGroup:
-    pass  # TODO flesh out
+    name: str
+    fully_qualified_name: str
+    version: int
+    range: Tuple[int, int]
+    attrs: Attrs
 
 class Directory:
-    pass  # TODO flesh out
+    children: Directories
+    logs: Mapping[str, LogGroup]
+    attrs: Attrs
+    # TODO flesh out
 
 class Reader:
     def __iter__(self) -> Iterator: ...
@@ -43,7 +51,7 @@ class Client:
         credentials: Optional[str] = None,
         csid: Optional[str] = None,
     ) -> None: ...
-    def append(self, logid: int, data: str) -> lsn_t: ...
+    def append(self, logid: int, data: AnyStr) -> lsn_t: ...
     def create_reader(self, max_logs: int) -> Reader: ...
     def data_size(self, logid: int, start_sec: float, end_sec: float) -> int: ...
     def find_key(self, logid: int, key: str) -> Tuple[int, int]: ...
@@ -125,3 +133,5 @@ def normalize_json(main: str, logs: str, verbose: bool) -> bool: ...
 def parse_log_level(value: str) -> LoggingLevel: ...
 def use_python_logging(cb: Any) -> None: ...  # what kind of object is this?
 def set_log_fd(fd: int) -> int: ...
+def get_internal_log_name(int): ...
+def is_internal_log(int): ...

@@ -66,7 +66,8 @@ NodesConfigurationStoreFactory::create(Params params) noexcept {
       return std::make_unique<ZookeeperNodesConfigurationStore>(
           params.path,
           NodesConfigurationCodec::extractConfigVersion,
-          std::move(zkclient));
+          std::move(zkclient),
+          params.max_transient_errors_retries);
     }
     case NCSType::File: {
       return std::make_unique<FileBasedNodesConfigurationStore>(
@@ -107,6 +108,7 @@ std::unique_ptr<NodesConfigurationStore> NodesConfigurationStoreFactory::create(
     ncs_params.type = NCSType::Zookeeper;
     ncs_params.zk_config = config.zookeeperConfig();
     ncs_params.zk_client_factory = std::move(zk_client_factory);
+    ncs_params.max_transient_errors_retries = settings.zk_vcs_max_retries;
     ncs_params.path = getDefaultConfigStorePath(
         NCSType::Zookeeper, config.serverConfig()->getClusterName());
   }
@@ -182,7 +184,7 @@ NodesConfigurationManagerFactory::create(
   const auto& settings = *processor->settings();
   const bool is_server = settings.server;
 
-  if (is_server && !roles.hasValue()) {
+  if (is_server && !roles.has_value()) {
     ld_critical("Unable to create NodesConfigurationStore for creating "
                 "NodesConfiguratonManager!");
     err = E::INTERNAL;

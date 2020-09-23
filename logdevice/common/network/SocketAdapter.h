@@ -7,6 +7,7 @@
  */
 
 #pragma once
+#include <folly/io/SocketOptionMap.h>
 #include <folly/io/async/AsyncSocket.h>
 
 namespace folly {
@@ -37,13 +38,13 @@ class SocketAdapter {
    *                  does not succeed within this period,
    *                  callback->connectError() will be invoked.
    */
-  virtual void connect(ConnectCallback* callback,
-                       const folly::SocketAddress& address,
-                       int timeout = 0,
-                       const folly::AsyncSocket::OptionMap& options =
-                           folly::AsyncSocket::emptyOptionMap,
-                       const folly::SocketAddress& bindAddr =
-                           folly::AsyncSocket::anyAddress()) noexcept = 0;
+  virtual void
+  connect(ConnectCallback* callback,
+          const folly::SocketAddress& address,
+          int timeout = 0,
+          const folly::SocketOptionMap& options = folly::emptySocketOptionMap,
+          const folly::SocketAddress& bindAddr =
+              folly::AsyncSocket::anyAddress()) noexcept = 0;
   /**
    * Close the transport immediately.
    *
@@ -56,6 +57,11 @@ class SocketAdapter {
    * callbacks.
    */
   virtual void closeNow() = 0;
+
+  /**
+   * Close the socket after flushing write buffer. Stop reading immediately.
+   */
+  virtual void close() = 0;
 
   /**
    * Determine if transport is open and ready to read or write.
@@ -94,7 +100,7 @@ class SocketAdapter {
   /**
    * Get the address of the local endpoint of this transport.
    *
-   * This function may throw AsyncSocketException on error.
+   * This function may throw std::runtime_error on error.
    *
    * @param address  The local address will be stored in the specified
    *                 SocketAddress.
@@ -104,7 +110,7 @@ class SocketAdapter {
    * Get the address of the remote endpoint to which this transport is
    * connected.
    *
-   * This function may throw AsyncSocketException on error.
+   * This function may throw std::runtime_error on error.
    *
    * @return         Return the local address
    */
@@ -117,7 +123,7 @@ class SocketAdapter {
    * Get the address of the remote endpoint to which this transport is
    * connected.
    *
-   * This function may throw AsyncSocketException on error.
+   * This function may throw std::runtime_error on error.
    *
    * @param address  The remote endpoint's address will be stored in the
    *                 specified SocketAddress.
@@ -125,10 +131,15 @@ class SocketAdapter {
   virtual void getPeerAddress(folly::SocketAddress* address) const = 0;
 
   /**
+   * Get the underlying file descriptor.
+   */
+  virtual folly::NetworkSocket getNetworkSocket() const = 0;
+
+  /**
    * Get the address of the remote endpoint to which this transport is
    * connected.
    *
-   * This function may throw AsyncSocketException on error.
+   * This function may throw std::runtime_error on error.
    *
    * @return         Return the remote endpoint's address
    */
@@ -139,9 +150,9 @@ class SocketAdapter {
   }
 
   /**
-   * Get the peer certificate information if any
+   * Get the SSL object associated with socket if any.
    */
-  virtual const folly::AsyncTransportCertificate* getPeerCertificate() const {
+  virtual const SSL* getSSL() const {
     return nullptr;
   }
 
@@ -206,6 +217,22 @@ class SocketAdapter {
                                 int optname,
                                 void const* optval,
                                 socklen_t optlen) = 0;
+
+  /**
+   * Determine if the session specified during setSSLSession was reused
+   * or if the server rejected it and issued a new session.
+   */
+  virtual bool getSSLSessionReused() const = 0;
+
+  /**
+   * Get a handle to the negotiated SSL session.
+   */
+  virtual folly::ssl::SSLSessionUniquePtr getSSLSession() = 0;
+
+  /**
+   * Set the SSL session to be used during sslConn.
+   */
+  virtual void setSSLSession(folly::ssl::SSLSessionUniquePtr session) = 0;
 };
 
 }} // namespace facebook::logdevice

@@ -83,7 +83,7 @@ void AdminServerSettings::defineSettings(SettingEasyInit& init) {
          );
        }
      },
-     "The precentage of the storage that is allowed to be taken down by "
+     "The percentage of the storage that is allowed to be taken down by "
      "operations, safety checker will take into account DEAD nodes as well. "
      "This means that if this value is 25, then safety checker will deny "
      "maintenances that will may take down more storage nodes. The percentage "
@@ -103,7 +103,7 @@ void AdminServerSettings::defineSettings(SettingEasyInit& init) {
          );
        }
      },
-     "The precentage of the sequencing capacity that is allowed to be taken "
+     "The percentage of the sequencing capacity that is allowed to be taken "
      "down by operations, safety checker will take into account DEAD nodes as "
      "well. This means that if this value is 25, then safety checker will deny "
      "maintenances that will may take down more sequencer nodes. The percentage "
@@ -144,7 +144,7 @@ void AdminServerSettings::defineSettings(SettingEasyInit& init) {
 
     ("maintenance-log-max-delta-records",
      &maintenance_log_max_delta_records,
-     "100",
+     "5000",
      nullptr,
      "How many delta records to keep in the maintenance log before we "
      "snapshot it.",
@@ -220,6 +220,16 @@ void AdminServerSettings::defineSettings(SettingEasyInit& init) {
      SERVER,
      SettingsCategory::AdminAPI)
 
+    ("use-force-restore-rebuilding-flag",
+     &use_force_restore_rebuilding_flag,
+     "false",
+     nullptr,
+     "Allows maintenance manager to set the FORCE_RESTORE rebuilding flag."
+     "This is a transitional setting that will be removed after all servers"
+     "have support for this setting.",
+     SERVER,
+     SettingsCategory::AdminAPI)
+
     ("safety-check-metadata-update-period",
      &safety_check_metadata_update_period,
      "10min",
@@ -234,6 +244,40 @@ void AdminServerSettings::defineSettings(SettingEasyInit& init) {
      "cache",
      SERVER,
      SettingsCategory::AdminAPI)
+
+    ("block-maintenance-rsm",
+     &block_maintenance_rsm,
+     "false",
+     nullptr,
+     "If true, the Maintenance replicated state machine will not publish any "
+     "state updates. This simulates the case where we cannot finish loading "
+     "the state on startup. Changing the value will cause the RSM to publish "
+     "the state immediately if it can.",
+     SERVER,
+     SettingsCategory::Testing)
+
+    ("safety-margin-medium-pri-scopes" ,
+     &safety_margin_medium_pri_scopes,
+     "0",
+     parse_nonnegative<ssize_t>(),
+     "This is the extra safety margin that will be accounted for when evaluating"
+     "maintenances with MEDIUM priority. The value represents how many extra "
+     "failure domains that the system can still lose in addition to the impact "
+     "of the requested maintenance before losing availability",
+     SERVER,
+     SettingsCategory::AdminAPI)
+
+    ("safety-margin-low-pri-scopes" ,
+     &safety_margin_low_pri_scopes,
+     "1",
+     parse_nonnegative<ssize_t>(),
+     "This is the extra safety margin that will be accounted for when evaluating"
+     "maintenances with LOW priority. The value represents how many extra "
+     "failure domains that the system can still lose in addition to the impact "
+     "of the requested maintenance before losing availability",
+     SERVER,
+     SettingsCategory::AdminAPI)
+
     ;
   // clang-format on
 };

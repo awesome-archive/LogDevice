@@ -19,6 +19,7 @@
 #include "logdevice/common/configuration/nodes/utils.h"
 #include "logdevice/common/nodeset_selection/NodeSetSelectorFactory.h"
 #include "logdevice/common/test/NodeSetTestUtil.h"
+#include "logdevice/common/test/NodesConfigurationTestUtil.h"
 #include "logdevice/common/util.h"
 
 using namespace facebook::logdevice;
@@ -30,34 +31,48 @@ using Decision = NodeSetSelector::Decision;
 using verify_func_t = std::function<void(StorageSet*)>;
 
 // Wrapper to provide always defaulted args to addNodes().
-static inline void addWeightedNodes(ServerConfig::Nodes* nodes,
-                                    size_t num_nodes,
-                                    shard_size_t num_shards,
-                                    std::string location_string,
-                                    size_t num_non_zw_nodes) {
-  return addNodes(nodes,
-                  num_nodes,
-                  num_shards,
-                  location_string,
-                  /*storage_capacity*/ 1.,
-                  /*sequencer_weight*/ 1.,
-                  num_non_zw_nodes);
+static inline void
+addWeightedNodes(std::shared_ptr<const NodesConfiguration>& nodes,
+                 size_t num_nodes,
+                 shard_size_t num_shards,
+                 std::string location_string,
+                 size_t num_read_write) {
+  ld_check(num_nodes >= num_read_write);
+  auto num_read_only = num_nodes - num_read_write;
+  if (num_read_write > 0) {
+    addNodes(nodes,
+             num_read_write,
+             num_shards,
+             location_string,
+             /*storage_capacity*/ 1.,
+             /*sequencer_weight*/ 1.,
+             membership::StorageState::READ_WRITE);
+  }
+
+  if (num_read_only > 0) {
+    addNodes(nodes,
+             num_read_only,
+             num_shards,
+             location_string,
+             /*storage_capacity*/ 1.,
+             /*sequencer_weight*/ 1.,
+             membership::StorageState::READ_ONLY);
+  }
 }
 
-static void
-verify_result(NodeSetSelector* selector,
-              std::shared_ptr<Configuration>& config,
-              logid_t logid,
-              Decision expected_decision,
-              verify_func_t verify,
-              const NodeSetSelector::Options* options = nullptr,
-              size_t iteration = 10,
-              folly::Optional<nodeset_size_t> target_size = folly::none) {
+static void verify_result(
+    NodeSetSelector* selector,
+    std::shared_ptr<Configuration>& config,
+    logid_t logid,
+    Decision expected_decision,
+    verify_func_t verify,
+    const NodeSetSelector::Options& options = NodeSetSelector::Options{},
+    size_t iteration = 10,
+    folly::Optional<nodeset_size_t> target_size = folly::none) {
   SCOPED_TRACE("log " + toString(logid.val_));
 
-  if (!target_size.hasValue()) {
-    const std::shared_ptr<LogsConfig::LogGroupNode> logcfg =
-        config->getLogGroupByIDShared(logid);
+  if (!target_size.has_value()) {
+    const auto logcfg = config->getLogGroupByIDShared(logid);
     ASSERT_NE(nullptr, logcfg);
     target_size =
         logcfg->attrs().nodeSetSize().value().value_or(NODESET_SIZE_MAX);
@@ -65,14 +80,13 @@ verify_result(NodeSetSelector* selector,
 
   ld_check(iteration > 0);
   for (size_t i = 0; i < iteration; ++i) {
-    auto res = selector->getStorageSet(
-        logid,
-        config.get(),
-        *config->getNodesConfigurationFromServerConfigSource(),
-        target_size.value(),
-        /* seed */ 0,
-        nullptr,
-        options);
+    auto res = selector->getStorageSet(logid,
+                                       config.get(),
+                                       *config->getNodesConfiguration(),
+                                       target_size.value(),
+                                       /* seed */ 0,
+                                       nullptr,
+                                       options);
     ASSERT_EQ(expected_decision, res.decision);
     if (res.decision != Decision::NEEDS_CHANGE) {
       continue;
@@ -86,12 +100,10 @@ verify_result(NodeSetSelector* selector,
         res.storage_set.begin(), res.storage_set.end(), std::less<ShardID>()));
 
     // must comply with the config
-    const std::shared_ptr<LogsConfig::LogGroupNode> logcfg =
-        config->getLogGroupByIDShared(logid);
+    const auto logcfg = config->getLogGroupByIDShared(logid);
     ASSERT_NE(nullptr, logcfg);
     const auto& attrs = logcfg->attrs();
-    const auto& nodes_config =
-        *config->getNodesConfigurationFromServerConfigSource();
+    const auto& nodes_config = *config->getNodesConfiguration();
     ASSERT_TRUE(configuration::nodes::validStorageSet(
         nodes_config,
         res.storage_set,
@@ -120,38 +132,36 @@ verify_result(NodeSetSelector* selector,
 
 // return true if nodesets for a given log based on 2 node configs are the same;
 // false otherwise
-static std::pair<size_t, size_t>
-compare_nodesets(NodeSetSelector* selector,
-                 std::shared_ptr<Configuration>& config1,
-                 std::shared_ptr<Configuration>& config2,
-                 logid_t logid,
-                 std::map<ShardID, size_t>& old_distribution,
-                 std::map<ShardID, size_t>& new_distribution,
-                 const NodeSetSelector::Options* options = nullptr) {
-  auto old_res = selector->getStorageSet(
-      logid,
-      config1.get(),
-      *config1->getNodesConfigurationFromServerConfigSource(),
-      config1->getLogGroupByIDShared(logid)
-          ->attrs()
-          .nodeSetSize()
-          .value()
-          .value_or(NODESET_SIZE_MAX),
-      0,
-      nullptr,
-      options);
-  auto new_res = selector->getStorageSet(
-      logid,
-      config2.get(),
-      *config2->getNodesConfigurationFromServerConfigSource(),
-      config1->getLogGroupByIDShared(logid)
-          ->attrs()
-          .nodeSetSize()
-          .value()
-          .value_or(NODESET_SIZE_MAX),
-      0,
-      nullptr,
-      options);
+static std::pair<size_t, size_t> compare_nodesets(
+    NodeSetSelector* selector,
+    std::shared_ptr<Configuration>& config1,
+    std::shared_ptr<Configuration>& config2,
+    logid_t logid,
+    std::map<ShardID, size_t>& old_distribution,
+    std::map<ShardID, size_t>& new_distribution,
+    const NodeSetSelector::Options& options = NodeSetSelector::Options{}) {
+  auto old_res = selector->getStorageSet(logid,
+                                         config1.get(),
+                                         *config1->getNodesConfiguration(),
+                                         config1->getLogGroupByIDShared(logid)
+                                             ->attrs()
+                                             .nodeSetSize()
+                                             .value()
+                                             .value_or(NODESET_SIZE_MAX),
+                                         0,
+                                         nullptr,
+                                         options);
+  auto new_res = selector->getStorageSet(logid,
+                                         config2.get(),
+                                         *config2->getNodesConfiguration(),
+                                         config1->getLogGroupByIDShared(logid)
+                                             ->attrs()
+                                             .nodeSetSize()
+                                             .value()
+                                             .value_or(NODESET_SIZE_MAX),
+                                         0,
+                                         nullptr,
+                                         options);
 
   ld_check(old_res.decision == Decision::NEEDS_CHANGE);
   ld_check(new_res.decision == Decision::NEEDS_CHANGE);
@@ -184,16 +194,14 @@ compare_nodesets(NodeSetSelector* selector,
 
 TEST(RandomCrossDomainNodeSetSelectorTest, RackAssignment) {
   // 100-node cluster with nodes from 5 different racks
-  Nodes nodes;
-  addWeightedNodes(&nodes, 10, 5, "region0.datacenter1.01.a.a", 10);
-  addWeightedNodes(&nodes, 35, 5, "region0.datacenter2.01.a.a", 35);
-  addWeightedNodes(&nodes, 20, 5, "region0.datacenter1.01.a.b", 10);
-  addWeightedNodes(&nodes, 20, 5, "region1.datacenter1.02.a.a", 20);
-  addWeightedNodes(&nodes, 15, 5, "region1.datacenter1.02.a.b", 15);
+  auto nodes = std::make_shared<const NodesConfiguration>();
+  addWeightedNodes(nodes, 10, 5, "region0.datacenter1.01.a.a", 10);
+  addWeightedNodes(nodes, 35, 5, "region0.datacenter2.01.a.a", 35);
+  addWeightedNodes(nodes, 20, 5, "region0.datacenter1.01.a.b", 10);
+  addWeightedNodes(nodes, 20, 5, "region1.datacenter1.02.a.a", 20);
+  addWeightedNodes(nodes, 15, 5, "region1.datacenter1.02.a.b", 15);
 
-  ld_check(nodes.size() == 100);
-
-  Configuration::NodesConfig nodes_config(std::move(nodes));
+  ld_check(nodes->clusterSize() == 100);
 
   auto logs_config = std::make_shared<LocalLogsConfig>();
   addLog(logs_config.get(), logid_t{1}, 3, 0, 10, {}, NodeLocationScope::RACK);
@@ -201,9 +209,9 @@ TEST(RandomCrossDomainNodeSetSelectorTest, RackAssignment) {
   addLog(logs_config.get(), logid_t{3}, 5, 0, 18, {}, NodeLocationScope::RACK);
 
   auto config = std::make_shared<Configuration>(
-      ServerConfig::fromDataTest(
-          "nodeset_selector_test", std::move(nodes_config)),
-      std::move(logs_config));
+      ServerConfig::fromDataTest("nodeset_selector_test"),
+      std::move(logs_config),
+      std::move(nodes));
 
   auto selector =
       NodeSetSelectorFactory::create(NodeSetSelectorType::RANDOM_CROSSDOMAIN);
@@ -215,9 +223,10 @@ TEST(RandomCrossDomainNodeSetSelectorTest, RackAssignment) {
       ld_check(storage_set != nullptr);
       std::map<std::string, StorageSet> node_map;
       for (const ShardID i : *storage_set) {
-        const Configuration::Node* node = cfg.serverConfig()->getNode(i.node());
+        const nodes::NodeServiceDiscovery* node =
+            cfg.getNodesConfiguration()->getNodeServiceDiscovery(i.node());
         ASSERT_NE(nullptr, node);
-        ASSERT_TRUE(node->location.hasValue());
+        ASSERT_TRUE(node->location.has_value());
         node_map[node->locationStr()].push_back(i);
       }
 
@@ -238,12 +247,10 @@ TEST(RandomCrossDomainNodeSetSelectorTest, RackAssignment) {
 
 TEST(RandomNodeSetSelectorTest, NodeExclusion) {
   // 10 node cluster
-  configuration::Nodes nodes;
+  auto nodes = std::make_shared<const NodesConfiguration>();
   const int SHARDS_PER_NODE = 5;
-  addWeightedNodes(&nodes, 10, SHARDS_PER_NODE, "", 10);
-  ld_check(nodes.size() == 10);
-
-  Configuration::NodesConfig nodes_config(std::move(nodes));
+  addWeightedNodes(nodes, 10, SHARDS_PER_NODE, "", 10);
+  ld_check(nodes->clusterSize() == 10);
 
   auto logs_config = std::make_shared<LocalLogsConfig>();
   addLog(logs_config.get(), logid_t{1}, 3, 0, 5, {}, NodeLocationScope::NODE);
@@ -251,9 +258,9 @@ TEST(RandomNodeSetSelectorTest, NodeExclusion) {
   addLog(logs_config.get(), logid_t{6}, 3, 0, 8, {}, NodeLocationScope::NODE);
 
   auto config = std::make_shared<Configuration>(
-      ServerConfig::fromDataTest(
-          "nodeset_selector_test", std::move(nodes_config)),
-      std::move(logs_config));
+      ServerConfig::fromDataTest("nodeset_selector_test"),
+      std::move(logs_config),
+      std::move(nodes));
 
   auto selector =
       NodeSetSelectorFactory::create(NodeSetSelectorType::RANDOM_CROSSDOMAIN);
@@ -278,7 +285,7 @@ TEST(RandomNodeSetSelectorTest, NodeExclusion) {
                 logid_t{1},
                 Decision::NEEDS_CHANGE,
                 gen({1, 2, 3}),
-                &options);
+                options);
 
   options.exclude_nodes = {1, 3};
   verify_result(selector.get(),
@@ -286,7 +293,7 @@ TEST(RandomNodeSetSelectorTest, NodeExclusion) {
                 logid_t{5},
                 Decision::NEEDS_CHANGE,
                 gen({1, 3}),
-                &options);
+                options);
 
   options.exclude_nodes = {1, 2, 3};
   // there are not enough nodes for log 6
@@ -295,22 +302,20 @@ TEST(RandomNodeSetSelectorTest, NodeExclusion) {
                 logid_t{6},
                 Decision::FAILED,
                 gen({1, 2, 3}),
-                &options);
+                options);
 }
 
 TEST(RandomNodeSetSelector, ImpreciseNodeSetSize) {
   // 26-node cluster with nodes from 5 different racks
   dbg::currentLevel = dbg::Level::SPEW;
-  Nodes nodes;
-  addWeightedNodes(&nodes, 5, 1, "region0.datacenter1.01.a.a", 5);
-  addWeightedNodes(&nodes, 5, 1, "region0.datacenter2.01.a.a", 5);
-  addWeightedNodes(&nodes, 5, 1, "region0.datacenter1.01.a.b", 5);
-  addWeightedNodes(&nodes, 5, 1, "region1.datacenter1.02.a.a", 5);
-  addWeightedNodes(&nodes, 6, 1, "region1.datacenter1.02.a.b", 6);
+  auto nodes = std::make_shared<const NodesConfiguration>();
+  addWeightedNodes(nodes, 5, 1, "region0.datacenter1.01.a.a", 5);
+  addWeightedNodes(nodes, 5, 1, "region0.datacenter2.01.a.a", 5);
+  addWeightedNodes(nodes, 5, 1, "region0.datacenter1.01.a.b", 5);
+  addWeightedNodes(nodes, 5, 1, "region1.datacenter1.02.a.a", 5);
+  addWeightedNodes(nodes, 6, 1, "region1.datacenter1.02.a.b", 6);
 
-  ASSERT_EQ(26, nodes.size());
-
-  Configuration::NodesConfig nodes_config(std::move(nodes));
+  ASSERT_EQ(26, nodes->clusterSize());
 
   auto logs_config = std::make_shared<LocalLogsConfig>();
   for (size_t i = 1; i <= 200; ++i) {
@@ -332,10 +337,10 @@ TEST(RandomNodeSetSelector, ImpreciseNodeSetSize) {
       NodeSetSelectorType::RANDOM_CROSSDOMAIN;
 
   auto config = std::make_shared<Configuration>(
-      ServerConfig::fromDataTest("nodeset_selector_test",
-                                 std::move(nodes_config),
-                                 std::move(metadata_config)),
-      std::move(logs_config));
+      ServerConfig::fromDataTest(
+          "nodeset_selector_test", std::move(metadata_config)),
+      std::move(logs_config),
+      std::move(nodes));
 
   auto selector =
       NodeSetSelectorFactory::create(NodeSetSelectorType::RANDOM_CROSSDOMAIN);
@@ -387,16 +392,14 @@ TEST(RandomNodeSetSelector, ImpreciseNodeSetSize) {
 
 TEST(RandomCrossDomainNodeSetSelectorTest, NodeExclusion) {
   // 26-node cluster with nodes from 5 different racks
-  Nodes nodes;
-  addWeightedNodes(&nodes, 5, 1, "region0.datacenter1.01.a.a", 5);
-  addWeightedNodes(&nodes, 5, 1, "region0.datacenter2.01.a.a", 5);
-  addWeightedNodes(&nodes, 5, 1, "region0.datacenter1.01.a.b", 5);
-  addWeightedNodes(&nodes, 5, 1, "region1.datacenter1.02.a.a", 5);
-  addWeightedNodes(&nodes, 6, 1, "region1.datacenter1.02.a.b", 6);
+  auto nodes = std::make_shared<const NodesConfiguration>();
+  addWeightedNodes(nodes, 5, 1, "region0.datacenter1.01.a.a", 5);
+  addWeightedNodes(nodes, 5, 1, "region0.datacenter2.01.a.a", 5);
+  addWeightedNodes(nodes, 5, 1, "region0.datacenter1.01.a.b", 5);
+  addWeightedNodes(nodes, 5, 1, "region1.datacenter1.02.a.a", 5);
+  addWeightedNodes(nodes, 6, 1, "region1.datacenter1.02.a.b", 6);
 
-  ASSERT_EQ(26, nodes.size());
-
-  Configuration::NodesConfig nodes_config(std::move(nodes));
+  ASSERT_EQ(26, nodes->clusterSize());
 
   auto logs_config = std::make_shared<LocalLogsConfig>();
   addLog(logs_config.get(),
@@ -408,9 +411,9 @@ TEST(RandomCrossDomainNodeSetSelectorTest, NodeExclusion) {
          NodeLocationScope::RACK);
 
   auto config = std::make_shared<Configuration>(
-      ServerConfig::fromDataTest(
-          "nodeset_selector_test", std::move(nodes_config)),
-      std::move(logs_config));
+      ServerConfig::fromDataTest("nodeset_selector_test"),
+      std::move(logs_config),
+      std::move(nodes));
 
   auto selector =
       NodeSetSelectorFactory::create(NodeSetSelectorType::RANDOM_CROSSDOMAIN);
@@ -423,7 +426,8 @@ TEST(RandomCrossDomainNodeSetSelectorTest, NodeExclusion) {
     ld_check(storage_set != nullptr);
     std::unordered_map<std::string, int> domains; // location to count map
     for (ShardID shard : *storage_set) {
-      auto node = cfg.serverConfig()->getNode(shard.node());
+      auto node =
+          cfg.getNodesConfiguration()->getNodeServiceDiscovery(shard.node());
       ld_check(node);
       ++domains[node->locationStr()];
     }
@@ -442,7 +446,7 @@ TEST(RandomCrossDomainNodeSetSelectorTest, NodeExclusion) {
                 Decision::NEEDS_CHANGE,
                 // should select 4 racks of 5 nodes each
                 std::bind(verify_domains, 4, 5, std::placeholders::_1),
-                &options);
+                options);
 
   // nodeset generation and nodeset size if one rack is partially removed
   options.exclude_nodes = {20, 21, 22, 23};
@@ -452,7 +456,7 @@ TEST(RandomCrossDomainNodeSetSelectorTest, NodeExclusion) {
                 Decision::NEEDS_CHANGE,
                 // should select 4 racks of 5 nodes each
                 std::bind(verify_domains, 4, 5, std::placeholders::_1),
-                &options);
+                options);
 
   // nodeset generation and nodeset size if two racks is partially removed
   options.exclude_nodes = {15, 16, 17, 20, 21, 22, 23};
@@ -462,7 +466,7 @@ TEST(RandomCrossDomainNodeSetSelectorTest, NodeExclusion) {
                 Decision::NEEDS_CHANGE,
                 // should select 3 racks of 5 nodes each
                 std::bind(verify_domains, 3, 5, std::placeholders::_1),
-                &options);
+                options);
 
   // nodeset generation and nodeset size if three racks is partially removed
   options.exclude_nodes = {10, 11, 15, 16, 20, 21, 22};
@@ -473,25 +477,23 @@ TEST(RandomCrossDomainNodeSetSelectorTest, NodeExclusion) {
                 // should select 5 racks of 3 nodes each, not 2 racks of 5
                 // nodes each
                 std::bind(verify_domains, 5, 3, std::placeholders::_1),
-                &options);
+                options);
 }
 
 void basic_test(NodeSetSelectorType ns_type) {
   // 25-node cluster with nodes from 6 different racks, 1 of them unwritable
-  Nodes nodes;
+  auto nodes = std::make_shared<const NodesConfiguration>();
   std::vector<int> rack_sizes = {1, 5, 5, 6, 5, 3};
-  addWeightedNodes(&nodes, rack_sizes[0], 1, "region0.datacenter1.01.a.a", 1);
-  addWeightedNodes(&nodes, rack_sizes[1], 1, "region0.datacenter2.01.a.a", 5);
+  addWeightedNodes(nodes, rack_sizes[0], 1, "region0.datacenter1.01.a.a", 1);
+  addWeightedNodes(nodes, rack_sizes[1], 1, "region0.datacenter2.01.a.a", 5);
   // Only 2 out of 5 nodes are writable.
-  addWeightedNodes(&nodes, rack_sizes[2], 1, "region0.datacenter1.01.a.b", 2);
-  addWeightedNodes(&nodes, rack_sizes[3], 1, "region1.datacenter1.02.a.a", 6);
-  addWeightedNodes(&nodes, rack_sizes[4], 1, "region1.datacenter1.02.a.b", 5);
+  addWeightedNodes(nodes, rack_sizes[2], 1, "region0.datacenter1.01.a.b", 2);
+  addWeightedNodes(nodes, rack_sizes[3], 1, "region1.datacenter1.02.a.a", 6);
+  addWeightedNodes(nodes, rack_sizes[4], 1, "region1.datacenter1.02.a.b", 5);
   // Unwritable rack. Should still be picked in nodesets.
-  addWeightedNodes(&nodes, rack_sizes[5], 1, "region1.datacenter1.02.a.c", 0);
+  addWeightedNodes(nodes, rack_sizes[5], 1, "region1.datacenter1.02.a.c", 0);
 
-  ASSERT_EQ(25, nodes.size());
-
-  Configuration::NodesConfig nodes_config(std::move(nodes));
+  ASSERT_EQ(25, nodes->clusterSize());
 
   auto logs_config = std::make_shared<LocalLogsConfig>();
   addLog(logs_config.get(),
@@ -524,18 +526,17 @@ void basic_test(NodeSetSelectorType ns_type) {
          6 /* nodeset_size */);
 
   auto config = std::make_shared<Configuration>(
-      ServerConfig::fromDataTest(
-          "nodeset_selector_test", std::move(nodes_config)),
-      std::move(logs_config));
+      ServerConfig::fromDataTest("nodeset_selector_test"),
+      std::move(logs_config),
+      std::move(nodes));
 
   auto selector = NodeSetSelectorFactory::create(ns_type);
 
   auto keep_only_writable = [&](StorageSet ss) -> StorageSet {
     StorageSet res;
+    auto storage_mem = config->getNodesConfiguration()->getStorageMembership();
     for (ShardID s : ss) {
-      const configuration::Node* n = config->serverConfig()->getNode(s.node());
-      ld_check(n != nullptr);
-      if (n->isWritableStorageNode()) {
+      if (storage_mem->canWriteToShard(s)) {
         res.push_back(s);
       }
     }
@@ -624,31 +625,32 @@ void basic_test(NodeSetSelectorType ns_type) {
                   EXPECT_EQ(25, ss->size());
                 });
 
-  verify_result(selector.get(),
-                config,
-                logid_t(5),
-                Decision::NEEDS_CHANGE,
-                [&](StorageSet* ss) {
-                  StorageSet w = keep_only_writable(*ss);
-                  EXPECT_EQ(6, w.size());
-                  EXPECT_GE(ss->size(), 7);
-                  EXPECT_LE(ss->size(), 9);
-                  // Should cover all 6 racks.
-                  const auto& all_nodes = config->serverConfig()->getNodes();
-                  std::set<std::string> racks;
-                  std::set<std::string> writable_racks;
-                  for (auto s : *ss) {
-                    const configuration::Node& n = all_nodes.at(s.node());
-                    std::string rack =
-                        n.location->getDomain(NodeLocationScope::RACK);
-                    racks.insert(rack);
-                    if (n.isWritableStorageNode()) {
-                      writable_racks.insert(rack);
-                    }
-                  }
-                  EXPECT_EQ(5, writable_racks.size()) << toString(racks);
-                  EXPECT_EQ(6, racks.size()) << toString(racks);
-                });
+  verify_result(
+      selector.get(),
+      config,
+      logid_t(5),
+      Decision::NEEDS_CHANGE,
+      [&](StorageSet* ss) {
+        StorageSet w = keep_only_writable(*ss);
+        EXPECT_EQ(6, w.size());
+        EXPECT_GE(ss->size(), 7);
+        EXPECT_LE(ss->size(), 9);
+        // Should cover all 6 racks.
+        auto nodes_cfg = config->getNodesConfiguration();
+        std::set<std::string> racks;
+        std::set<std::string> writable_racks;
+        for (auto s : *ss) {
+          std::string rack =
+              nodes_cfg->getNodeServiceDiscovery(s.node())->location->getDomain(
+                  NodeLocationScope::RACK);
+          racks.insert(rack);
+          if (nodes_cfg->getStorageMembership()->canWriteToShard(s)) {
+            writable_racks.insert(rack);
+          }
+        }
+        EXPECT_EQ(5, writable_racks.size()) << toString(racks);
+        EXPECT_EQ(6, racks.size()) << toString(racks);
+      });
 
   // Exclude a rack in options.
   NodeSetSelector::Options options;
@@ -673,22 +675,22 @@ void basic_test(NodeSetSelectorType ns_type) {
               std::vector<int>({1, 0, (int)ss->size() - 10, 3, 3, 3}), count);
         }
       },
-      &options);
+      options);
 }
 
 TEST(WeightAwareNodeSetSelectorTest, ExcludeFromNodesets) {
   // 6-node cluster with nodes in 2 different racks
-  Nodes nodes;
-  addNodes(&nodes, 3, 1, "region0.datacenter1.01.a.a");
-  addNodes(&nodes, 3, 1, "region0.datacenter1.01.a.b");
+  auto nodes = std::make_shared<const NodesConfiguration>();
+  addNodes(nodes, 3, 1, "region0.datacenter1.01.a.a");
+  addNodes(nodes, 3, 1, "region0.datacenter1.01.a.b");
 
-  ASSERT_EQ(6, nodes.size());
+  ASSERT_EQ(6, nodes->clusterSize());
   // Settings exclude_from_nodesets on 3 nodes
-  for (node_index_t node_id : {0, 1, 3}) {
-    nodes[node_id].storage_attributes->exclude_from_nodesets = true;
-  }
 
-  Configuration::NodesConfig nodes_config(std::move(nodes));
+  nodes =
+      nodes->applyUpdate(NodesConfigurationTestUtil::excludeFromNodesetUpdate(
+          *nodes, {0, 1, 3}, true));
+  ld_check(nodes);
 
   auto logs_config = std::make_shared<LocalLogsConfig>();
   addLog(logs_config.get(),
@@ -699,9 +701,9 @@ TEST(WeightAwareNodeSetSelectorTest, ExcludeFromNodesets) {
          5 /* nodeset_size */);
 
   auto config = std::make_shared<Configuration>(
-      ServerConfig::fromDataTest(
-          "nodeset_selector_test", std::move(nodes_config)),
-      std::move(logs_config));
+      ServerConfig::fromDataTest("nodeset_selector_test"),
+      std::move(logs_config),
+      std::move(nodes));
 
   auto selector =
       NodeSetSelectorFactory::create(NodeSetSelectorType::WEIGHT_AWARE);
@@ -716,28 +718,27 @@ TEST(WeightAwareNodeSetSelectorTest, ExcludeFromNodesets) {
 TEST(WeightAwareNodeSetSelectorTest, InternalLogs) {
   // The test verifies that nodeset selection for internal logs
   // adheres to the nodeset size, and doesn't get bloated like data logs.
-  Nodes nodes;
+  auto nodes = std::make_shared<const NodesConfiguration>();
   // taken from logdevice.scribe.ld.prn-13
-  addNodes(&nodes, 13, 1, "region.dc3.FB|REGION3|MSB_9.00.ab");
-  addNodes(&nodes, 12, 1, "region.dc3.FB|REGION3|MSB_8.00.ab");
-  addNodes(&nodes, 15, 1, "region.dc3.FB|REGION3|MSB_7.00.ab");
-  addNodes(&nodes, 1, 1, "region.dc3.FB|REGION3|MSB_6.00.ab");
-  addNodes(&nodes, 4, 1, "region.dc3.FB|REGION3|MSB_5.00.ab");
-  addNodes(&nodes, 5, 1, "region.dc3.FB|REGION3|MSB_4.00.ab");
-  addNodes(&nodes, 13, 1, "region.dc3.FB|REGION3|MSB_3.00.ab");
-  addNodes(&nodes, 13, 1, "region.dc3.FB|REGION3|MSB_2.00.ab");
-  addNodes(&nodes, 22, 1, "region.dc3.FB|REGION3|MSB_10.00.ab");
-  addNodes(&nodes, 13, 1, "region.dc3.FB|REGION3|MSB_1.00.ab");
-  addNodes(&nodes, 2, 1, "region.dc2.FB|REGION2|MSB_5.01.cd");
-  addNodes(&nodes, 1, 1, "region.dc2.FB|REGION2|MSB_3.01.cd");
-  addNodes(&nodes, 1, 1, "region.dc2.FB|REGION2|MSB_2.01.cd");
-  addNodes(&nodes, 11, 1, "region.dc3.FB|REGION3|MSB_12.00.ab");
-  addNodes(&nodes, 6, 1, "region.dc1.FB|REGION1|MSB_11.00.ab");
-  addNodes(&nodes, 21, 1, "region.dc3.FB|REGION3|MSB_11.01.cd");
-  addNodes(&nodes, 5, 1, "region.dc1.FB|REGION1|MSB_12.01.cd");
+  addNodes(nodes, 13, 1, "region.dc3.FB|REGION3|MSB_9.00.ab");
+  addNodes(nodes, 12, 1, "region.dc3.FB|REGION3|MSB_8.00.ab");
+  addNodes(nodes, 15, 1, "region.dc3.FB|REGION3|MSB_7.00.ab");
+  addNodes(nodes, 1, 1, "region.dc3.FB|REGION3|MSB_6.00.ab");
+  addNodes(nodes, 4, 1, "region.dc3.FB|REGION3|MSB_5.00.ab");
+  addNodes(nodes, 5, 1, "region.dc3.FB|REGION3|MSB_4.00.ab");
+  addNodes(nodes, 13, 1, "region.dc3.FB|REGION3|MSB_3.00.ab");
+  addNodes(nodes, 13, 1, "region.dc3.FB|REGION3|MSB_2.00.ab");
+  addNodes(nodes, 22, 1, "region.dc3.FB|REGION3|MSB_10.00.ab");
+  addNodes(nodes, 13, 1, "region.dc3.FB|REGION3|MSB_1.00.ab");
+  addNodes(nodes, 2, 1, "region.dc2.FB|REGION2|MSB_5.01.cd");
+  addNodes(nodes, 1, 1, "region.dc2.FB|REGION2|MSB_3.01.cd");
+  addNodes(nodes, 1, 1, "region.dc2.FB|REGION2|MSB_2.01.cd");
+  addNodes(nodes, 11, 1, "region.dc3.FB|REGION3|MSB_12.00.ab");
+  addNodes(nodes, 6, 1, "region.dc1.FB|REGION1|MSB_11.00.ab");
+  addNodes(nodes, 21, 1, "region.dc3.FB|REGION3|MSB_11.01.cd");
+  addNodes(nodes, 5, 1, "region.dc1.FB|REGION1|MSB_12.01.cd");
 
-  ASSERT_EQ(158, nodes.size());
-  Configuration::NodesConfig nodes_config(std::move(nodes));
+  ASSERT_EQ(158, nodes->clusterSize());
 
   ReplicationProperty replication(
       {{NodeLocationScope::CLUSTER, 3}, {NodeLocationScope::NODE, 6}});
@@ -754,10 +755,11 @@ TEST(WeightAwareNodeSetSelectorTest, InternalLogs) {
   addLog(lcfg, data_log, replication, 0, nodeset_size);
 
   InternalLogs il;
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_nodeSetSize(nodeset_size);
-  log_attrs.set_replicationFactor(replication.getReplicationFactor());
-  log_attrs.set_replicateAcross(replication.getDistinctReplicationFactors());
+  auto log_attrs =
+      logsconfig::LogAttributes()
+          .with_nodeSetSize(nodeset_size)
+          .with_replicationFactor(replication.getReplicationFactor())
+          .with_replicateAcross(replication.getDistinctReplicationFactors());
   auto log_group_node = il.insert("config_log_snapshots", log_attrs);
   ASSERT_NE(nullptr, log_group_node);
   log_group_node = il.insert("config_log_deltas", log_attrs);
@@ -770,23 +772,23 @@ TEST(WeightAwareNodeSetSelectorTest, InternalLogs) {
   ASSERT_NE(nullptr, log_group_node);
   log_group_node = il.insert("maintenance_log_deltas", log_attrs);
   ASSERT_NE(nullptr, log_group_node);
+  logs_config->setInternalLogsConfig(il);
 
   ShapingConfig shaping_cfg(
       std::set<NodeLocationScope>{NodeLocationScope::NODE},
       std::set<NodeLocationScope>{NodeLocationScope::NODE});
   auto config = std::make_shared<Configuration>(
       ServerConfig::fromDataTest("nodeset_selector_test",
-                                 std::move(nodes_config),
                                  MetaDataLogsConfig(),
                                  PrincipalsConfig(),
                                  SecurityConfig(),
-                                 TraceLoggerConfig(),
                                  TrafficShapingConfig(),
                                  shaping_cfg,
                                  ServerConfig::SettingsConfig(),
                                  ServerConfig::SettingsConfig(),
                                  std::move(il)),
-      std::move(logs_config));
+      std::move(logs_config),
+      std::move(nodes));
 
   auto selector =
       NodeSetSelectorFactory::create(NodeSetSelectorType::WEIGHT_AWARE);
@@ -816,21 +818,20 @@ TEST(ConsistentHashingWeightAwareNodeSetSelectorTest, Basic) {
 }
 
 TEST(ConsistentHashingWeightAwareNodeSetSelectorTest, AddNode) {
-  Nodes nodes1, nodes2;
-  addWeightedNodes(&nodes1, 16, 1, "region0.datacenter1.01.a.a", 16);
-  addWeightedNodes(&nodes1, 16, 1, "region0.datacenter2.01.a.a", 16);
-  addWeightedNodes(&nodes1, 16, 1, "region0.datacenter1.01.a.b", 16);
-  addWeightedNodes(&nodes1, 16, 1, "region1.datacenter1.02.a.a", 16);
-  addWeightedNodes(&nodes1, 15, 1, "region1.datacenter1.02.a.b", 15);
+  auto nodes1 = std::make_shared<const NodesConfiguration>();
+  auto nodes2 = std::make_shared<const NodesConfiguration>();
+  addWeightedNodes(nodes1, 16, 1, "region0.datacenter1.01.a.a", 16);
+  addWeightedNodes(nodes1, 16, 1, "region0.datacenter2.01.a.a", 16);
+  addWeightedNodes(nodes1, 16, 1, "region0.datacenter1.01.a.b", 16);
+  addWeightedNodes(nodes1, 16, 1, "region1.datacenter1.02.a.a", 16);
+  addWeightedNodes(nodes1, 15, 1, "region1.datacenter1.02.a.b", 15);
 
-  nodes2 = nodes1;
+  nodes2 = std::make_shared<const NodesConfiguration>(*nodes1);
 
   // another node added to the 5th rack
-  addWeightedNodes(&nodes2, 1, 1, "region1.datacenter1.02.a.b", 1);
-  Configuration::NodesConfig nodes_config1(std::move(nodes1));
-  Configuration::NodesConfig nodes_config2(std::move(nodes2));
+  addWeightedNodes(nodes2, 1, 1, "region1.datacenter1.02.a.b", 1);
 
-#ifdef FOLLY_SANITIZE_ADDRESS
+#ifdef FOLLY_SANITIZE
   // ASAN builds are 3-10 times slower than normal, use much fewer iterations.
   const int numlogs = 1000;
 #else
@@ -850,14 +851,14 @@ TEST(ConsistentHashingWeightAwareNodeSetSelectorTest, AddNode) {
   auto logs_config2 = logs_config;
 
   auto config1 = std::make_shared<Configuration>(
-      ServerConfig::fromDataTest(
-          "nodeset_selector_test", std::move(nodes_config1)),
-      std::move(logs_config));
+      ServerConfig::fromDataTest("nodeset_selector_test"),
+      std::move(logs_config),
+      std::move(nodes1));
 
   auto config2 = std::make_shared<Configuration>(
-      ServerConfig::fromDataTest(
-          "nodeset_selector_test", std::move(nodes_config2)),
-      std::move(logs_config2));
+      ServerConfig::fromDataTest("nodeset_selector_test"),
+      std::move(logs_config2),
+      std::move(nodes2));
 
   auto selector =
       NodeSetSelectorFactory::create(NodeSetSelectorType::CONSISTENT_HASHING);
@@ -927,18 +928,24 @@ TEST(ConsistentHashingWeightAwareNodeSetSelectorTest, AddNode) {
 }
 
 TEST(ConsistentHashingWeightAwareNodeSetSelectorTest, DisabledNodes) {
-  Nodes nodes;
-  addWeightedNodes(&nodes, 3, 1, "a.a.a.a.rack0", 3);
-  addWeightedNodes(&nodes, 3, 1, "a.a.a.a.rack1", 3);
-  addWeightedNodes(&nodes, 5, 1, "a.a.a.a.rack2", 5);
-  ASSERT_EQ(11, nodes.size());
+  auto nodes = std::make_shared<const NodesConfiguration>();
+  addWeightedNodes(nodes, 3, 1, "a.a.a.a.rack0", 3);
+  addWeightedNodes(nodes, 3, 1, "a.a.a.a.rack1", 3);
+  addWeightedNodes(nodes, 5, 1, "a.a.a.a.rack2", 5);
+  ASSERT_EQ(11, nodes->clusterSize());
 
-  for (node_index_t node_id : {0, 1, 2, 3}) {
-    nodes[node_id].storage_attributes->state =
-        (node_id % 2) ? StorageState::DISABLED : StorageState::READ_ONLY;
-  }
-
-  Configuration::NodesConfig nodes_config(std::move(nodes));
+  nodes =
+      nodes->applyUpdate(NodesConfigurationTestUtil::setStorageMembershipUpdate(
+          *nodes,
+          {ShardID(0, -1), ShardID(2, -1)},
+          membership::StorageState::READ_ONLY,
+          folly::none));
+  nodes =
+      nodes->applyUpdate(NodesConfigurationTestUtil::setStorageMembershipUpdate(
+          *nodes,
+          {ShardID(1, -1), ShardID(3, -1)},
+          membership::StorageState::NONE,
+          folly::none));
 
   auto logs_config = std::make_shared<LocalLogsConfig>();
   addLog(logs_config.get(),
@@ -949,21 +956,20 @@ TEST(ConsistentHashingWeightAwareNodeSetSelectorTest, DisabledNodes) {
          6 /* nodeset_size */);
 
   auto config = std::make_shared<Configuration>(
-      ServerConfig::fromDataTest(
-          "nodeset_selector_test", std::move(nodes_config)),
-      std::move(logs_config));
+      ServerConfig::fromDataTest("nodeset_selector_test"),
+      std::move(logs_config),
+      std::move(nodes));
 
   auto selector =
       NodeSetSelectorFactory::create(NodeSetSelectorType::CONSISTENT_HASHING);
 
-  auto res = selector->getStorageSet(
-      logid_t(1),
-      config.get(),
-      *config->getNodesConfigurationFromServerConfigSource(),
-      6,
-      0,
-      nullptr,
-      nullptr);
+  auto res = selector->getStorageSet(logid_t(1),
+                                     config.get(),
+                                     *config->getNodesConfiguration(),
+                                     6,
+                                     0,
+                                     nullptr,
+                                     NodeSetSelector::Options{});
   ASSERT_EQ(Decision::NEEDS_CHANGE, res.decision);
 
   std::array<int, 3> per_domain{};
@@ -982,13 +988,12 @@ TEST(ConsistentHashingWeightAwareNodeSetSelectorTest, DisabledNodes) {
 }
 
 TEST(ConsistentHashingWeightAwareNodeSetSelectorTest, Seed) {
-  Nodes nodes;
-  addWeightedNodes(&nodes, 3, 1, "a.a.a.a.rack0", 3);
-  addWeightedNodes(&nodes, 3, 1, "a.a.a.a.rack1", 3);
-  addWeightedNodes(&nodes, 3, 1, "a.a.a.a.rack2", 3);
-  ASSERT_EQ(9, nodes.size());
+  auto nodes = std::make_shared<const NodesConfiguration>();
+  addWeightedNodes(nodes, 3, 1, "a.a.a.a.rack0", 3);
+  addWeightedNodes(nodes, 3, 1, "a.a.a.a.rack1", 3);
+  addWeightedNodes(nodes, 3, 1, "a.a.a.a.rack2", 3);
+  ASSERT_EQ(9, nodes->clusterSize());
 
-  Configuration::NodesConfig nodes_config(std::move(nodes));
   ReplicationProperty replication(
       {{NodeLocationScope::RACK, 2}, {NodeLocationScope::NODE, 2}});
 
@@ -1000,34 +1005,32 @@ TEST(ConsistentHashingWeightAwareNodeSetSelectorTest, Seed) {
          3 /* nodeset_size (unused) */);
 
   auto config = std::make_shared<Configuration>(
-      ServerConfig::fromDataTest(
-          "nodeset_selector_test", std::move(nodes_config)),
-      std::move(logs_config));
+      ServerConfig::fromDataTest("nodeset_selector_test"),
+      std::move(logs_config),
+      std::move(nodes));
 
   auto selector =
       NodeSetSelectorFactory::create(NodeSetSelectorType::CONSISTENT_HASHING);
 
-  auto res = selector->getStorageSet(
-      logid_t(1),
-      config.get(),
-      *config->getNodesConfigurationFromServerConfigSource(),
-      /* target_nodeset_size */ 5,
-      /* seed */ 0,
-      nullptr,
-      nullptr);
+  auto res = selector->getStorageSet(logid_t(1),
+                                     config.get(),
+                                     *config->getNodesConfiguration(),
+                                     /* target_nodeset_size */ 5,
+                                     /* seed */ 0,
+                                     nullptr,
+                                     NodeSetSelector::Options{});
   ASSERT_EQ(Decision::NEEDS_CHANGE, res.decision);
   ASSERT_EQ(5, res.storage_set.size());
 
   EpochMetaData meta(res.storage_set, replication);
   meta.nodeset_params.signature = res.signature;
-  auto res2 = selector->getStorageSet(
-      logid_t(1),
-      config.get(),
-      *config->getNodesConfigurationFromServerConfigSource(),
-      5,
-      0,
-      &meta,
-      nullptr);
+  auto res2 = selector->getStorageSet(logid_t(1),
+                                      config.get(),
+                                      *config->getNodesConfiguration(),
+                                      5,
+                                      0,
+                                      &meta,
+                                      NodeSetSelector::Options{});
   EXPECT_EQ(Decision::KEEP, res2.decision);
   EXPECT_EQ(res.signature, res2.signature);
 
@@ -1036,66 +1039,61 @@ TEST(ConsistentHashingWeightAwareNodeSetSelectorTest, Seed) {
   // everything is deterministic, it it passes once it passes always.
   // If you changed the nodeset selector's logic, and this fails, maybe you
   // just got unlucky and need to set a different seed here.
-  auto res3 = selector->getStorageSet(
-      logid_t(1),
-      config.get(),
-      *config->getNodesConfigurationFromServerConfigSource(),
-      5,
-      1,
-      &meta,
-      nullptr);
+  auto res3 = selector->getStorageSet(logid_t(1),
+                                      config.get(),
+                                      *config->getNodesConfiguration(),
+                                      5,
+                                      1,
+                                      &meta,
+                                      NodeSetSelector::Options{});
   EXPECT_EQ(Decision::NEEDS_CHANGE, res3.decision);
   EXPECT_NE(res3.signature, res2.signature);
   ASSERT_EQ(5, res3.storage_set.size());
 
   meta.shards = res3.storage_set;
   meta.nodeset_params.signature = res3.signature;
-  auto res4 = selector->getStorageSet(
-      logid_t(1),
-      config.get(),
-      *config->getNodesConfigurationFromServerConfigSource(),
-      5,
-      1,
-      &meta,
-      nullptr);
+  auto res4 = selector->getStorageSet(logid_t(1),
+                                      config.get(),
+                                      *config->getNodesConfiguration(),
+                                      5,
+                                      1,
+                                      &meta,
+                                      NodeSetSelector::Options{});
   EXPECT_EQ(Decision::KEEP, res4.decision);
   EXPECT_EQ(res3.signature, res4.signature);
 
   // Change target nodeset size and check that nodeset changes.
-  auto res5 = selector->getStorageSet(
-      logid_t(1),
-      config.get(),
-      *config->getNodesConfigurationFromServerConfigSource(),
-      6,
-      1,
-      &meta,
-      nullptr);
+  auto res5 = selector->getStorageSet(logid_t(1),
+                                      config.get(),
+                                      *config->getNodesConfiguration(),
+                                      6,
+                                      1,
+                                      &meta,
+                                      NodeSetSelector::Options{});
   EXPECT_EQ(Decision::NEEDS_CHANGE, res5.decision);
   EXPECT_NE(res5.signature, res4.signature);
   ASSERT_EQ(6, res5.storage_set.size());
 
   meta.shards = res5.storage_set;
   meta.nodeset_params.signature = res5.signature;
-  auto res6 = selector->getStorageSet(
-      logid_t(1),
-      config.get(),
-      *config->getNodesConfigurationFromServerConfigSource(),
-      6,
-      1,
-      &meta,
-      nullptr);
+  auto res6 = selector->getStorageSet(logid_t(1),
+                                      config.get(),
+                                      *config->getNodesConfiguration(),
+                                      6,
+                                      1,
+                                      &meta,
+                                      NodeSetSelector::Options{});
   EXPECT_EQ(Decision::KEEP, res6.decision);
   EXPECT_EQ(res5.signature, res6.signature);
 }
 
 TEST(WeightAwareNodeSetSelectorTest, InternalLogsConfiguredTooSmall) {
-  Nodes nodes;
-  addNodes(&nodes, 5, 1, "region.dc3.FB|REGION3|MSB_9.00.ab");
-  addNodes(&nodes, 5, 1, "region.dc3.FB|REGION3|MSB_8.00.ab");
-  addNodes(&nodes, 5, 1, "region.dc3.FB|REGION3|MSB_7.00.ab");
+  auto nodes = std::make_shared<const NodesConfiguration>();
+  addNodes(nodes, 5, 1, "region.dc3.FB|REGION3|MSB_9.00.ab");
+  addNodes(nodes, 5, 1, "region.dc3.FB|REGION3|MSB_8.00.ab");
+  addNodes(nodes, 5, 1, "region.dc3.FB|REGION3|MSB_7.00.ab");
 
-  ASSERT_EQ(15, nodes.size());
-  Configuration::NodesConfig nodes_config(std::move(nodes));
+  ASSERT_EQ(15, nodes->clusterSize());
 
   ReplicationProperty replication(
       {{NodeLocationScope::CLUSTER, 2}, {NodeLocationScope::NODE, 4}});
@@ -1103,28 +1101,29 @@ TEST(WeightAwareNodeSetSelectorTest, InternalLogsConfiguredTooSmall) {
   auto logs_config = std::make_shared<LocalLogsConfig>();
 
   InternalLogs il;
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_nodeSetSize(nodeset_size);
-  log_attrs.set_replicateAcross(replication.getDistinctReplicationFactors());
+  auto log_attrs =
+      logsconfig::LogAttributes()
+          .with_nodeSetSize(nodeset_size)
+          .with_replicateAcross(replication.getDistinctReplicationFactors());
   auto log_group_node = il.insert("event_log_snapshots", log_attrs);
   ASSERT_NE(nullptr, log_group_node);
+  logs_config->setInternalLogsConfig(il);
 
   ShapingConfig shaping_cfg(
       std::set<NodeLocationScope>{NodeLocationScope::NODE},
       std::set<NodeLocationScope>{NodeLocationScope::NODE});
   auto config = std::make_shared<Configuration>(
       ServerConfig::fromDataTest("nodeset_selector_test",
-                                 std::move(nodes_config),
                                  MetaDataLogsConfig(),
                                  PrincipalsConfig(),
                                  SecurityConfig(),
-                                 TraceLoggerConfig(),
                                  TrafficShapingConfig(),
                                  shaping_cfg,
                                  ServerConfig::SettingsConfig(),
                                  ServerConfig::SettingsConfig(),
                                  std::move(il)),
-      std::move(logs_config));
+      std::move(logs_config),
+      std::move(nodes));
 
   auto selector =
       NodeSetSelectorFactory::create(NodeSetSelectorType::WEIGHT_AWARE);

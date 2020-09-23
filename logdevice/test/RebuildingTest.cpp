@@ -21,7 +21,6 @@
 #include "logdevice/include/Client.h"
 #include "logdevice/include/ClientSettings.h"
 #include "logdevice/lib/ops/EventLogUtils.h"
-#include "logdevice/server/locallogstore/ShardToPathMapping.h"
 #include "logdevice/server/locallogstore/test/StoreUtil.h"
 #include "logdevice/test/utils/IntegrationTestBase.h"
 #include "logdevice/test/utils/IntegrationTestUtils.h"
@@ -33,71 +32,40 @@ using IntegrationTestUtils::waitUntilShardsHaveEventLogState;
 
 namespace fs = boost::filesystem;
 
-enum class DurabilityMode {
-  V1_WITH_WAL,
-  V1_WITHOUT_WAL,
-  V2_WITH_WAL,
-  // V2 doesn't support disabling wal.
-};
+namespace {
 
 enum class FlushMode { ROCKSDB, LD };
 
 // Enable/Disable --filter-relocate-shards
 enum class FilterMode { DEFAULT, FILTER_RELOCATE };
 
+enum class RebuildingDirection { OLD_TO_NEW, NEW_TO_OLD };
+
 struct TestMode {
-  DurabilityMode m;
   FlushMode f;
   FilterMode filter_mode;
+  RebuildingDirection d;
 };
 
-const logid_t LOG_ID(1);
-const int NUM_DB_SHARDS = 3;
+const int NUM_DB_SHARDS = 2;
+// More logs than shards, so that at least one shard gets multiple logs.
+const std::vector<logid_t> LOG_IDS = {logid_t(1), logid_t(2), logid_t(3)};
 
 logsconfig::LogAttributes logAttributes(int replication) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(replication);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(300);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(replication)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(300);
   return log_attrs;
-}
-
-void writeRecords(Client& client,
-                  size_t nrecords,
-                  folly::Optional<lsn_t>* first_lsn_out = nullptr) {
-  ld_info("Writing %lu records", nrecords);
-  // Write some records
-  Semaphore sem;
-  std::atomic<lsn_t> first_lsn(LSN_MAX);
-  auto cb = [&](Status st, const DataRecord& r) {
-    EXPECT_EQ(E::OK, st);
-    if (st == E::OK) {
-      ASSERT_NE(LSN_INVALID, r.attrs.lsn);
-      atomic_fetch_min(first_lsn, r.attrs.lsn);
-    }
-    sem.post();
-  };
-  for (int i = 1; i <= nrecords; ++i) {
-    std::string data("data" + std::to_string(i));
-    client.append(LOG_ID, std::move(data), cb);
-  }
-  for (int i = 1; i <= nrecords; ++i) {
-    sem.wait();
-  }
-  if (first_lsn_out) {
-    *first_lsn_out = first_lsn.load();
-    ASSERT_NE(LSN_MAX, *first_lsn_out);
-  }
 }
 
 void createPartition(IntegrationTestUtils::Cluster& cluster,
                      NodeSetIndices nodeset,
                      shard_index_t shard) {
   ld_info("Creating partition on nodes %s", toString(nodeset).c_str());
-  cluster.applyToNodes(nodeset, [shard](auto& node) {
-    node.sendCommand(folly::format("logsdb create {}", shard).str());
-  });
+  cluster.applyToNodes(
+      nodeset, [shard](auto& node) { node.createPartition(shard); });
 }
 
 void flushPartition(IntegrationTestUtils::Cluster& cluster,
@@ -120,34 +88,156 @@ void flushPartition(IntegrationTestUtils::Cluster& cluster,
               .count());
 }
 
-size_t dirtyNodes(IntegrationTestUtils::Cluster& cluster,
-                  Client& client,
-                  NodeSetIndices nodeset,
-                  shard_index_t shard,
-                  folly::Optional<lsn_t>& batch_start) {
-  // This is 2 times the partition timestamp granularity so we guarantee
+struct RecordsInfo {
+  size_t num_records = 0;
+  lsn_t min_lsn = LSN_MAX;
+  lsn_t max_lsn = LSN_INVALID;
+
+  void merge(const RecordsInfo& rhs) {
+    num_records += rhs.num_records;
+    min_lsn = std::min(min_lsn, rhs.min_lsn);
+    max_lsn = std::max(max_lsn, rhs.max_lsn);
+  }
+};
+
+void writeRecords(Client& client,
+                  size_t nrecords,
+                  std::vector<RecordsInfo>* out_info_per_log = nullptr,
+                  const std::vector<logid_t>& logs = LOG_IDS,
+                  std::chrono::milliseconds sleep_between_writes =
+                      std::chrono::milliseconds(0)) {
+  ld_info("Writing %lu records", nrecords);
+
+  // Write some records, keeping a window of at most 20 appends in flight.
+  // All tests that use writeRecords() should have maxWritesInFlight >= 20.
+  //
+  // Note that, unfortunately, it's not enough to limit number of appends
+  // in flight - we may still get a SEQNOBUFS if the first few appends are
+  // slow (e.g. because some storage nodes haven't fully started yet), while the
+  // next appends are fast (e.g. if they picked a more lucky copyset). So we
+  // have to keep a window of in-flight appends rather than just a counter.
+
+  const size_t max_in_flight = std::min(nrecords, 20ul);
+  std::mutex mutex;
+  std::set<int> in_flight;
+  std::condition_variable cv;
+  std::vector<RecordsInfo> temp_info_per_log;
+  if (out_info_per_log == nullptr) {
+    out_info_per_log = &temp_info_per_log;
+  }
+  out_info_per_log->resize(logs.size());
+
+  std::unique_lock lock(mutex);
+  for (int i = 1; i <= nrecords; ++i) {
+    while (!in_flight.empty() && i - *in_flight.begin() >= max_in_flight) {
+      cv.wait(lock);
+    }
+    std::string data("data" + std::to_string(i));
+    int log_idx = folly::Random::rand32() % logs.size();
+    int rv =
+        client.append(logs[log_idx],
+                      std::move(data),
+                      [&mutex, &cv, &in_flight, out_info_per_log, i, log_idx](
+                          Status st, const DataRecord& r) {
+                        std::unique_lock lock2(mutex);
+                        EXPECT_EQ(E::OK, st);
+                        if (st == E::OK) {
+                          ASSERT_NE(LSN_INVALID, r.attrs.lsn);
+                          auto& info = out_info_per_log->at(log_idx);
+                          ++info.num_records;
+                          info.min_lsn = std::min(info.min_lsn, r.attrs.lsn);
+                          info.max_lsn = std::max(info.max_lsn, r.attrs.lsn);
+                        }
+                        bool erased = in_flight.erase(i);
+                        ld_check(erased);
+                        cv.notify_one();
+                      });
+    if (rv == 0) {
+      in_flight.insert(i);
+    } else {
+      ADD_FAILURE() << "append failed synchronously: " << error_name(err);
+    }
+    if (sleep_between_writes.count() != 0) {
+      lock.unlock();
+      /* sleep override */
+      std::this_thread::sleep_for(sleep_between_writes);
+      lock.lock();
+    }
+  }
+  while (!in_flight.empty()) {
+    cv.wait(lock);
+  }
+}
+
+void writeRecordsToMultiplePartitions(
+    IntegrationTestUtils::Cluster& cluster,
+    Client& client,
+    size_t nrecords,
+    std::vector<RecordsInfo>* out_info_per_log = nullptr,
+    const std::vector<logid_t>& logs = LOG_IDS,
+    std::chrono::milliseconds sleep_between_writes =
+        std::chrono::milliseconds(0)) {
+  // ~5 nodes x 2 shards per node x ~3 partitions per shard.
+  const size_t total_partitions = 30;
+  for (size_t i = 0; i < total_partitions; ++i) {
+    if (i != 0) {
+      // Create a new partition in a random shard on a random node.
+      // We don't do it on all nodes at once because we want different partition
+      // boundaries on different nodes. But we could do it in batches: a few
+      // random shards at a time, in parallel; that would probably speed this up
+      // a little; this is not implemented.
+
+      std::vector<node_index_t> nodes = cluster.getRunningStorageNodes();
+      ld_check(!nodes.empty());
+      auto& node =
+          cluster.getNode(nodes[folly::Random::rand32() % nodes.size()]);
+      shard_index_t shard = folly::Random::rand32() % node.num_db_shards_;
+      node.createPartition(shard);
+
+      // Make sure that all partitions have different timestamps (they have
+      // millisecond granularity).
+      /* sleep override */
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    // Careful rounding to make sure we write exactly nrecords records in total.
+    size_t records_to_write =
+        nrecords * (i + 1) / total_partitions - nrecords * i / total_partitions;
+
+    writeRecords(
+        client, records_to_write, out_info_per_log, logs, sleep_between_writes);
+  }
+}
+
+void dirtyNodes(IntegrationTestUtils::Cluster& cluster,
+                Client& client,
+                NodeSetIndices nodeset,
+                shard_index_t shard,
+                std::vector<RecordsInfo>* out_info_per_log = nullptr) {
+  // This is 4 times the partition timestamp granularity so we guarantee
   // that partitions have non-overlapping time ranges.
-  auto partition_creation_delay = std::chrono::milliseconds(200);
-  size_t nrecords = 0;
+  //
+  // Why 4 instead of 2? Reopening the DB effectively doubles the timestamp
+  // margins for dirty partitions, see "Expand partition bounds to cover the
+  // dirty time range" in PartitionedRocksDBStore::open(), and
+  // PartitionedRocksDBStore::dirtyTimeInterval().
+  auto partition_creation_delay = std::chrono::milliseconds(400);
 
   // Create dirty/clean/dirty paritition pattern
-  writeRecords(client, 24, &batch_start);
-  nrecords += 24;
+  writeRecords(client, 24, out_info_per_log);
 
   /* Provide some time distance between partitions. */
   std::this_thread::sleep_for(partition_creation_delay);
   createPartition(cluster, nodeset, shard);
 
-  writeRecords(client, 18);
-  nrecords += 18;
+  writeRecords(client, 18, out_info_per_log);
 
   /* Provide some time distance between partitions. */
   std::this_thread::sleep_for(partition_creation_delay);
   createPartition(cluster, nodeset, shard);
   flushPartition(cluster, nodeset, shard, -1);
 
-  writeRecords(client, 20);
-  nrecords += 20;
+  writeRecords(client, 20, out_info_per_log);
 
   /* Provide some time distance between partitions. */
   std::this_thread::sleep_for(partition_creation_delay);
@@ -156,43 +246,19 @@ size_t dirtyNodes(IntegrationTestUtils::Cluster& cluster,
   for (auto nidx : nodeset) {
     // Have different partition boundaries between nodes so we test dirty
     // regions that span partitions on the donor.
-    writeRecords(client, 10);
-    nrecords += 10;
+    writeRecords(client, 10, out_info_per_log);
     std::this_thread::sleep_for(partition_creation_delay);
     createPartition(cluster, {nidx}, shard);
     flushPartition(cluster, {nidx}, shard, -1);
 
     // Mix retired and inflight data in the same partition
-    writeRecords(client, 15);
-    nrecords += 15;
+    writeRecords(client, 15, out_info_per_log);
     flushPartition(cluster, {nidx}, shard, 0);
-    writeRecords(client, 11);
-    nrecords += 11;
+    writeRecords(client, 11, out_info_per_log);
   }
-
-  return nrecords;
 }
 
-// Wait until all nodes in `nodes` have read the event log up to `sync_lsn`.
-static void wait_until_event_log_synced(IntegrationTestUtils::Cluster& cluster,
-                                        lsn_t sync_lsn,
-                                        std::vector<node_index_t> nodes) {
-  const int rv = cluster.waitUntilEventLogSynced(sync_lsn, nodes);
-  ASSERT_EQ(0, rv);
-}
-
-static fs::path path_for_node_shard(IntegrationTestUtils::Cluster& cluster,
-                                    node_index_t node_index,
-                                    shard_index_t shard_index) {
-  std::string db_path = cluster.getNode(node_index).getDatabasePath();
-  std::vector<boost::filesystem::path> out;
-  auto num_shards = cluster.getNode(node_index).num_db_shards_;
-  int rv = ShardToPathMapping(db_path, num_shards).get(&out);
-  if (rv != 0 || shard_index >= int(out.size())) {
-    std::abort();
-  }
-  return out[shard_index];
-}
+} // anonymous namespace
 
 class RebuildingTest : public IntegrationTestBase,
                        public ::testing::WithParamInterface<TestMode> {
@@ -223,13 +289,6 @@ class RebuildingTest : public IntegrationTestBase,
           .setParam("--rocksdb-min-manual-flush-interval", "200ms")
           .setParam("--rocksdb-partition-hi-pri-check-period", "50ms")
           .setParam("--rebuilding-store-timeout", "6s..10s")
-          .setParam("--rebuild-store-durability",
-                    test_param.m == DurabilityMode::V1_WITHOUT_WAL
-                        ? "memory"
-                        : "async_write")
-          .setParam(
-              "--rebuilding-v2",
-              test_param.m == DurabilityMode::V2_WITH_WAL ? "true" : "false")
           // When rebuilding Without WAL, destruction of memtable is used as
           // proxy for memtable being flushed to stable storage. Iterators can
           // pin a memtable preventing its destruction. Low ttl in tests ensures
@@ -237,7 +296,10 @@ class RebuildingTest : public IntegrationTestBase,
           // delayed
           .setParam("--iterator-cache-ttl", "1s")
           .setParam("--rocksdb-partitioned", "true")
+          // Make newly created partitions receive new records immediately.
+          .setParam("--rocksdb-new-partition-timestamp-margin", "0")
           .setNumDBShards(NUM_DB_SHARDS)
+          .setNumLogs(3)
           .useDefaultTrafficShapingConfig(false)
           .setParam("--rocksdb-ld-managed-flushes",
                     test_param.f == FlushMode::LD ? "true" : "false")
@@ -245,7 +307,13 @@ class RebuildingTest : public IntegrationTestBase,
           .setParam("--filter-relocate-shards",
                     test_param.filter_mode == FilterMode::FILTER_RELOCATE
                         ? "true"
-                        : "false");
+                        : "false")
+          .setParam("--rebuilding-new-to-old",
+                    test_param.d == RebuildingDirection::NEW_TO_OLD ? "true"
+                                                                    : "false")
+          // Reduce the copyset block size so we get a copyset shuffle every ~6
+          // records.
+          .setParam("--sticky-copysets-block-size", "128");
     };
   }
 
@@ -287,12 +355,12 @@ class RebuildingTest : public IntegrationTestBase,
    */
   IntegrationTestUtils::ClusterFactory
   rollingRebuildingClusterFactory(int /*nnodes*/, int r, int x, bool trim) {
-    logsconfig::LogAttributes log_attrs;
-    log_attrs.set_replicationFactor(r);
-    log_attrs.set_extraCopies(x);
-    log_attrs.set_syncedCopies(0);
-    log_attrs.set_maxWritesInFlight(30);
-    log_attrs.set_stickyCopySets(true);
+    auto log_attrs = logsconfig::LogAttributes()
+                         .with_replicationFactor(r)
+                         .with_extraCopies(x)
+                         .with_syncedCopies(0)
+                         .with_maxWritesInFlight(30)
+                         .with_stickyCopySets(true);
 
     return IntegrationTestUtils::ClusterFactory()
         .apply(commonSetup())
@@ -304,7 +372,7 @@ class RebuildingTest : public IntegrationTestBase,
         .setParam("--event-log-max-delta-records", "5")
         .setParam(
             "--message-tracing-types", "RECORD,APPEND,APPENDED,STORE,STORED")
-        .setNumLogs(1)
+        .setNumLogs(3)
         .eventLogMode(
             IntegrationTestUtils::ClusterFactory::EventLogMode::SNAPSHOTTED);
   }
@@ -322,17 +390,15 @@ class RebuildingTest : public IntegrationTestBase,
     NodeSetIndices node_set(end - begin + 1);
     std::iota(node_set.begin(), node_set.end(), begin);
 
-    cluster.waitForRecovery();
-    cluster.waitForMetaDataLogWrites();
+    cluster.waitUntilAllSequencersQuiescent();
 
     auto client = cluster.createClient();
 
     // Write some records
-    folly::Optional<lsn_t> first;
-    writeRecords(*client, 30, &first);
-    size_t nrecords = 30;
+    std::vector<RecordsInfo> info_per_log;
+    writeRecordsToMultiplePartitions(cluster, *client, 100, &info_per_log);
 
-    std::vector<OffsetMap> correct_offsets;
+    std::vector<std::vector<OffsetMap>> correct_offsets(LOG_IDS.size());
     // Reading first time will trigger log storage state to get epoch offset
     // by sending GetSeqStateRequest to sequencer. We will try read from
     // beginning until epoch offset is ready.
@@ -342,21 +408,37 @@ class RebuildingTest : public IntegrationTestBase,
         [&]() {
           auto reader = client->createReader(1);
           reader->includeByteOffset();
-          ld_error("Starting Read at %s", lsn_to_string(first.value()).c_str());
-          int rv = reader->startReading(LOG_ID, first.value());
-          EXPECT_EQ(0, rv);
-          std::vector<std::unique_ptr<DataRecord>> data_out;
-          read_records_no_gaps(*reader, nrecords, &data_out);
-          if (data_out[0]->attrs.offsets.isValid()) {
-            for (int i = 0; i < nrecords; ++i) {
+          std::vector<std::vector<OffsetMap>> new_offsets(LOG_IDS.size());
+          for (size_t log_idx = 0; log_idx < LOG_IDS.size(); ++log_idx) {
+            logid_t log = LOG_IDS.at(log_idx);
+            const auto& info = info_per_log.at(log_idx);
+            if (info.num_records == 0) {
+              continue;
+            }
+            ld_info("Starting Read of log %lu at %s",
+                    log.val(),
+                    lsn_to_string(info.min_lsn).c_str());
+            int rv = reader->startReading(log, info.min_lsn, info.max_lsn);
+            EXPECT_EQ(0, rv);
+            std::vector<std::unique_ptr<DataRecord>> data_out;
+            read_records_no_gaps(*reader, info.num_records, &data_out);
+            for (int i = 0; i < info.num_records; ++i) {
+              if (!data_out.at(i)->attrs.offsets.isValid()) {
+                // No offsets yet, keep waiting.
+                return false;
+              }
               EXPECT_NE(RecordOffset(), data_out[i]->attrs.offsets);
               OffsetMap offsets =
                   OffsetMap::fromRecord(std::move(data_out[i]->attrs.offsets));
-              correct_offsets.push_back(offsets);
+              new_offsets.at(log_idx).push_back(offsets);
             }
-            return true;
           }
-          return false;
+          for (size_t log_idx = 0; log_idx < LOG_IDS.size(); ++log_idx) {
+            correct_offsets.at(log_idx).insert(correct_offsets[log_idx].end(),
+                                               new_offsets.at(log_idx).begin(),
+                                               new_offsets.at(log_idx).end());
+          }
+          return true;
         });
 
     for (node_index_t node = begin; node <= end; ++node) {
@@ -371,19 +453,21 @@ class RebuildingTest : public IntegrationTestBase,
           // Trigger rebuilding of all of its shards.
           ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node, 0));
           ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node, 1));
-          ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node, 2));
 
           // Wait until all shards finish rebuilding.
           cluster.getNode(node).waitUntilAllShardsFullyAuthoritative(client);
           break;
         case NodeFailureMode::KILL:
           // Ensure there is dirty data to rebuild.
-          folly::Optional<lsn_t> batch_start;
-          size_t batch_records = dirtyNodes(cluster,
-                                            *client,
-                                            node_set,
-                                            /*shard*/ 0,
-                                            batch_start);
+          std::vector<RecordsInfo> batch_info;
+          dirtyNodes(cluster,
+                     *client,
+                     node_set,
+                     /*shard*/ 0,
+                     &batch_info);
+          for (size_t log_idx = 0; log_idx < LOG_IDS.size(); ++log_idx) {
+            info_per_log[log_idx].merge(batch_info.at(log_idx));
+          }
 
           // Include added records in our byte offset verifications
           wait_until(
@@ -392,24 +476,40 @@ class RebuildingTest : public IntegrationTestBase,
               [&]() {
                 auto reader = client->createReader(1);
                 reader->includeByteOffset();
-                ld_error("Starting Read at %s",
-                         lsn_to_string(batch_start.value()).c_str());
-                int rv = reader->startReading(LOG_ID, batch_start.value());
-                EXPECT_EQ(0, rv);
-                std::vector<std::unique_ptr<DataRecord>> data_out;
-                read_records_no_gaps(*reader, batch_records, &data_out);
-                if (data_out[0]->attrs.offsets.isValid()) {
-                  for (int i = 0; i < batch_records; ++i) {
+                std::vector<std::vector<OffsetMap>> new_offsets(LOG_IDS.size());
+                for (size_t log_idx = 0; log_idx < LOG_IDS.size(); ++log_idx) {
+                  logid_t log = LOG_IDS.at(log_idx);
+                  const auto& info = batch_info.at(log_idx);
+                  if (info.num_records == 0) {
+                    continue;
+                  }
+                  ld_info("Starting Read of log %lu at %s",
+                          log.val(),
+                          lsn_to_string(info.min_lsn).c_str());
+                  int rv =
+                      reader->startReading(log, info.min_lsn, info.max_lsn);
+                  EXPECT_EQ(0, rv);
+                  std::vector<std::unique_ptr<DataRecord>> data_out;
+                  read_records_no_gaps(*reader, info.num_records, &data_out);
+                  for (int i = 0; i < info.num_records; ++i) {
+                    if (!data_out.at(i)->attrs.offsets.isValid()) {
+                      // No offsets yet, keep waiting.
+                      return false;
+                    }
                     EXPECT_NE(RecordOffset(), data_out[i]->attrs.offsets);
                     OffsetMap offsets = OffsetMap::fromRecord(
                         std::move(data_out[i]->attrs.offsets));
-                    correct_offsets.push_back(offsets);
+                    new_offsets.at(log_idx).push_back(offsets);
                   }
-                  return true;
                 }
-                return false;
+                for (size_t log_idx = 0; log_idx < LOG_IDS.size(); ++log_idx) {
+                  correct_offsets.at(log_idx).insert(
+                      correct_offsets[log_idx].end(),
+                      new_offsets.at(log_idx).begin(),
+                      new_offsets.at(log_idx).end());
+                }
+                return true;
               });
-          nrecords += batch_records;
 
           // Kill/Restart the node and monitor the event log to ensure
           // rebuilding is triggered and completes.
@@ -449,22 +549,32 @@ class RebuildingTest : public IntegrationTestBase,
           [&]() {
             auto reader = client->createReader(1);
             reader->includeByteOffset();
-            int rv = reader->startReading(LOG_ID, first.value());
-            ld_error(
-                "Starting Read at %s", lsn_to_string(first.value()).c_str());
-            EXPECT_EQ(0, rv);
-            std::vector<std::unique_ptr<DataRecord>> data_out;
-            read_records_no_gaps(*reader, nrecords, &data_out);
-            EXPECT_EQ(nrecords, data_out.size());
-            if (data_out[0]->attrs.offsets.isValid()) {
-              for (int i = 0; i < nrecords; ++i) {
+            for (size_t log_idx = 0; log_idx < LOG_IDS.size(); ++log_idx) {
+              logid_t log = LOG_IDS.at(log_idx);
+              const auto& info = info_per_log.at(log_idx);
+              if (info.num_records == 0) {
+                continue;
+              }
+              ld_info("Starting Read of log %lu at %s",
+                      log.val(),
+                      lsn_to_string(info.min_lsn).c_str());
+              int rv = reader->startReading(log, info.min_lsn, info.max_lsn);
+              EXPECT_EQ(0, rv);
+              std::vector<std::unique_ptr<DataRecord>> data_out;
+              read_records_no_gaps(*reader, info.num_records, &data_out);
+              for (int i = 0; i < info.num_records; ++i) {
+                if (!data_out.at(i)->attrs.offsets.isValid()) {
+                  // No offsets yet, keep waiting.
+                  return false;
+                }
+                EXPECT_NE(RecordOffset(), data_out[i]->attrs.offsets);
                 OffsetMap offsets = OffsetMap::fromRecord(
                     std::move(data_out[i]->attrs.offsets));
-                EXPECT_EQ(correct_offsets[i], offsets);
+                EXPECT_EQ(correct_offsets[log_idx].at(i), offsets)
+                    << log.val() << ' ' << i;
               }
-              return true;
             }
-            return false;
+            return true;
           });
     }
 
@@ -537,11 +647,11 @@ TEST_P(RebuildingTest, NodeRebuiltTwice) {
 }
 
 TEST_P(RebuildingTest, OnlineDiskRepair) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30);
 
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .apply(commonSetup())
@@ -552,20 +662,14 @@ TEST_P(RebuildingTest, OnlineDiskRepair) {
                      .setNumLogs(1)
                      .create(5);
 
-  cluster->waitForRecovery();
+  cluster->waitUntilAllSequencersQuiescent();
 
   auto client = cluster->createClient();
 
-  // Write some records..
-  folly::Optional<lsn_t> first;
-  for (int i = 1; i <= 30; ++i) {
-    std::string data("data" + std::to_string(i));
-    lsn_t lsn = client->appendSync(LOG_ID, Payload(data.data(), data.size()));
-    ASSERT_NE(LSN_INVALID, lsn);
-    if (!first.hasValue()) {
-      first = lsn;
-    }
-  }
+  // Write some records to shard 1.
+  std::vector<RecordsInfo> info_per_log;
+  writeRecordsToMultiplePartitions(
+      *cluster, *client, 50, &info_per_log, {logid_t(1)});
 
   // Stop N3...
   ld_info("Stopping N3...");
@@ -574,7 +678,7 @@ TEST_P(RebuildingTest, OnlineDiskRepair) {
   // In the real world, the disk will be unmounted. Here let's just remove
   // everything and write a marker that instructs ShardedRocksDBLocalLogStore to
   // create a FailingLocalLogStore for the shard.
-  fs::path shard_path = path_for_node_shard(*cluster, node_index_t(3), 1);
+  fs::path shard_path = cluster->getNode(3).getShardPath(1);
   for (fs::directory_iterator end_dir_it, it(shard_path); it != end_dir_it;
        ++it) {
     fs::remove_all(it->path());
@@ -595,9 +699,9 @@ TEST_P(RebuildingTest, OnlineDiskRepair) {
   // Read data... N3 should respond with E::REBUILDING.
   {
     auto reader = client->createReader(1);
-    int rv = reader->startReading(LOG_ID, first.value());
+    int rv = reader->startReading(logid_t(1), info_per_log.at(0).min_lsn);
     ASSERT_EQ(0, rv);
-    read_records_no_gaps(*reader, 30);
+    read_records_no_gaps(*reader, info_per_log.at(0).num_records);
   }
 
   // Trigger rebuilding of the shard....
@@ -617,9 +721,9 @@ TEST_P(RebuildingTest, OnlineDiskRepair) {
   // Read data again...
   {
     auto reader = client->createReader(1);
-    int rv = reader->startReading(LOG_ID, first.value());
+    int rv = reader->startReading(logid_t(1), info_per_log.at(0).min_lsn);
     ASSERT_EQ(0, rv);
-    read_records_no_gaps(*reader, 30);
+    read_records_no_gaps(*reader, info_per_log.at(0).num_records);
   }
 
   cluster->waitForMetaDataLogWrites();
@@ -638,11 +742,11 @@ TEST_P(RebuildingTest, OnlineDiskRepair) {
 // Note that this test relies on the event log still being available, ie the
 // event log is not stored on the shard being rebuilt.
 TEST_P(RebuildingTest, AllNodesRebuildingSameShard) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30);
 
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .apply(commonSetup())
@@ -650,13 +754,18 @@ TEST_P(RebuildingTest, AllNodesRebuildingSameShard) {
                      .setLogAttributes(log_attrs)
                      .setEventLogAttributes(log_attrs)
                      .setNumLogs(42)
+                     .setNumDBShards(2)
                      .create(5);
-  cluster->waitForRecovery();
+  cluster->waitUntilAllSequencersQuiescent();
 
-  // Restart all nodes with an empty disk for shard 1.
+  // We use 2 shards, and event has odd ID => event log and its metadata log
+  // live in shard 1 => it's safe to wipe shard 0.
+  const shard_index_t SHARD = 0;
+
+  // Restart all nodes with an empty disk for shard 0.
   for (node_index_t node = 1; node <= 4; ++node) {
     EXPECT_EQ(0, cluster->getNode(node).shutdown());
-    auto shard_path = path_for_node_shard(*cluster, node, 1);
+    auto shard_path = cluster->getNode(node).getShardPath(SHARD);
     for (fs::directory_iterator end_dir_it, it(shard_path); it != end_dir_it;
          ++it) {
       fs::remove_all(it->path());
@@ -669,13 +778,16 @@ TEST_P(RebuildingTest, AllNodesRebuildingSameShard) {
   ld_info("Triggering rebuiling of shard 0 for all nodes in the cluster...");
   auto client = cluster->createClient(std::chrono::hours(1));
   for (node_index_t node = 1; node <= 4; ++node) {
-    ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node, 1));
+    ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node, SHARD));
   }
 
   ld_info("Waiting for all nodes to acknowledge rebuilding...");
   IntegrationTestUtils::waitUntilShardsHaveEventLogState(
       client,
-      {ShardID(1, 1), ShardID(2, 1), ShardID(3, 1), ShardID(4, 1)},
+      {ShardID(1, SHARD),
+       ShardID(2, SHARD),
+       ShardID(3, SHARD),
+       ShardID(4, SHARD)},
       AuthoritativeStatus::FULLY_AUTHORITATIVE,
       true);
 }
@@ -702,24 +814,20 @@ TEST_P(RebuildingTest, RebuildingWithNoAmends) {
                      .setNumLogs(42)
                      .create(9); // 1 sequencer node + 8 storage nodes
 
-  cluster->waitForRecovery();
+  cluster->waitUntilAllSequencersQuiescent();
 
   auto client = cluster->createClient();
   client->settings().set("gap-grace-period", "10ms");
 
   // Write some records.
-  for (int i = 1; i <= 1000; ++i) {
-    std::string data("data" + std::to_string(i));
-    lsn_t lsn = client->appendSync(LOG_ID, Payload(data.data(), data.size()));
-    ASSERT_NE(LSN_INVALID, lsn);
-  }
+  writeRecordsToMultiplePartitions(*cluster, *client, 1000);
 
   // Kill nodes 1-2 and clean their DBs. They'll be rebuilding later.
   ld_info("Killing nodes.");
   for (node_index_t node = 1; node <= 2; ++node) {
     cluster->getNode(node).kill();
-    for (shard_index_t shard = 0; shard < 3; ++shard) {
-      auto shard_path = path_for_node_shard(*cluster, node, shard);
+    for (shard_index_t shard = 0; shard < NUM_DB_SHARDS; ++shard) {
+      auto shard_path = cluster->getNode(node).getShardPath(shard);
       for (fs::directory_iterator end_dir_it, it(shard_path); it != end_dir_it;
            ++it) {
         fs::remove_all(it->path());
@@ -734,11 +842,9 @@ TEST_P(RebuildingTest, RebuildingWithNoAmends) {
       LSN_INVALID, requestShardRebuilding(*client, node_index_t{3}, 0, flags));
   ASSERT_NE(
       LSN_INVALID, requestShardRebuilding(*client, node_index_t{3}, 1, flags));
-  ASSERT_NE(
-      LSN_INVALID, requestShardRebuilding(*client, node_index_t{3}, 2, flags));
 
   for (node_index_t node = 1; node <= 2; ++node) {
-    for (shard_index_t shard = 0; shard < 3; ++shard) {
+    for (shard_index_t shard = 0; shard < NUM_DB_SHARDS; ++shard) {
       ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node, shard));
       ASSERT_NE(LSN_INVALID, markShardUnrecoverable(*client, node, shard));
     }
@@ -777,24 +883,20 @@ TEST_P(RebuildingTest, RecoveryWhenManyNodesAreRebuilding) {
                      .setNumLogs(42)
                      .create(9); // 1 sequencer node + 8 storage nodes
 
-  cluster->waitForRecovery();
+  cluster->waitUntilAllSequencersQuiescent();
 
   auto client = cluster->createClient();
   client->settings().set("gap-grace-period", "10ms");
 
   // Write some records.
-  for (int i = 1; i <= 30; ++i) {
-    std::string data("data" + std::to_string(i));
-    lsn_t lsn = client->appendSync(LOG_ID, Payload(data.data(), data.size()));
-    ASSERT_NE(LSN_INVALID, lsn);
-  }
+  writeRecordsToMultiplePartitions(*cluster, *client, 100);
 
   // Kill nodes 1-3 and clean their DBs. They'll be rebuilding later.
   ld_info("Killing nodes.");
   for (node_index_t node = 1; node <= 3; ++node) {
     cluster->getNode(node).kill();
-    for (shard_index_t shard = 0; shard < 3; ++shard) {
-      auto shard_path = path_for_node_shard(*cluster, node, shard);
+    for (shard_index_t shard = 0; shard < NUM_DB_SHARDS; ++shard) {
+      auto shard_path = cluster->getNode(node).getShardPath(shard);
       for (fs::directory_iterator end_dir_it, it(shard_path); it != end_dir_it;
            ++it) {
         fs::remove_all(it->path());
@@ -803,12 +905,7 @@ TEST_P(RebuildingTest, RecoveryWhenManyNodesAreRebuilding) {
   }
 
   // Should still have write availability. Write some records.
-  ld_info("Writing.");
-  for (int i = 1; i <= 30; ++i) {
-    std::string data("data" + std::to_string(i));
-    lsn_t lsn = client->appendSync(LOG_ID, Payload(data.data(), data.size()));
-    ASSERT_NE(LSN_INVALID, lsn);
-  }
+  writeRecordsToMultiplePartitions(*cluster, *client, 50);
 
   // Restart sequencer node. It should get stuck in recovery.
   ld_info("Restarting sequencer.");
@@ -830,7 +927,7 @@ TEST_P(RebuildingTest, RecoveryWhenManyNodesAreRebuilding) {
                                     std::chrono::seconds(1));
       EXPECT_EQ(-1, rv);
     }
-    for (shard_index_t shard = 0; shard < 3; ++shard) {
+    for (shard_index_t shard = 0; shard < NUM_DB_SHARDS; ++shard) {
       ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node, shard));
       ASSERT_NE(LSN_INVALID, markShardUnrecoverable(*client, node, shard));
     }
@@ -873,33 +970,25 @@ TEST_P(RebuildingTest, RecoveryWhenManyNodesAreRebuilding) {
 // was done as well. Killing a donor node helps ensure that rebuilding does not
 // complete until after we restart it.
 TEST_P(RebuildingTest, ClusterExpandedWhileRebuilding) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30);
 
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .apply(commonSetup())
                      .setLogGroupName("my-test-log")
                      .setLogAttributes(log_attrs)
                      .setEventLogAttributes(log_attrs)
-                     .setNumLogs(1)
+                     .setNumLogs(3)
                      .create(6);
 
   cluster->waitForRecovery();
   auto client = cluster->createClient();
 
   // Write some records..
-  folly::Optional<lsn_t> first;
-  for (int i = 1; i <= 30; ++i) {
-    std::string data("data" + std::to_string(i));
-    lsn_t lsn = client->appendSync(LOG_ID, Payload(data.data(), data.size()));
-    ASSERT_NE(LSN_INVALID, lsn);
-    if (!first.hasValue()) {
-      first = lsn;
-    }
-  }
+  writeRecordsToMultiplePartitions(*cluster, *client, 50);
 
   ld_info("Stopping N3...");
   EXPECT_EQ(0, cluster->getNode(3).shutdown());
@@ -909,14 +998,13 @@ TEST_P(RebuildingTest, ClusterExpandedWhileRebuilding) {
 
   // Trigger rebuilding of all shards of N3...
   ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{3}, 0));
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{3}, 1));
-  const lsn_t sync = requestShardRebuilding(*client, node_index_t{3}, 2);
+  const lsn_t sync = requestShardRebuilding(*client, node_index_t{3}, 1);
   ASSERT_NE(LSN_INVALID, sync);
 
   // Wait until N2, N4 and N5 realize that they need to rebuild N3's shard. In
   // order to do so we just wait until they read the 3 records we just wrote to
   // the event log.
-  wait_until_event_log_synced(*cluster, sync, {2, 4, 5});
+  EXPECT_EQ(0, cluster->waitUntilEventLogSynced(sync, {2, 4, 5}));
 
   // Now, add two more nodes to the cluster.
   int rv = cluster->expand(2);
@@ -947,44 +1035,35 @@ TEST_P(RebuildingTest, ClusterExpandedWhileRebuilding) {
 // config when rebuilding started. The two new nodes however will participate
 // and send such messages, which N3 will ignore.
 TEST_P(RebuildingTest, ClusterExpandedWhileRebuilding2) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30);
 
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .apply(commonSetup())
                      .setLogGroupName("my-test-log")
                      .setLogAttributes(log_attrs)
                      .setEventLogAttributes(log_attrs)
-                     .setNumLogs(1)
+                     .setNumLogs(3)
                      .create(6);
 
   cluster->waitForRecovery();
   auto client = cluster->createClient();
 
   // Write some records..
-  folly::Optional<lsn_t> first;
-  for (int i = 1; i <= 30; ++i) {
-    std::string data("data" + std::to_string(i));
-    lsn_t lsn = client->appendSync(LOG_ID, Payload(data.data(), data.size()));
-    ASSERT_NE(LSN_INVALID, lsn);
-    if (!first.hasValue()) {
-      first = lsn;
-    }
-  }
+  writeRecordsToMultiplePartitions(*cluster, *client, 50);
 
   // Replace N3
   ASSERT_EQ(0, cluster->replace(3));
   // Trigger rebuilding of all shards of N3...
   ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{3}, 0));
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{3}, 1));
-  const lsn_t sync = requestShardRebuilding(*client, node_index_t{3}, 2);
+  const lsn_t sync = requestShardRebuilding(*client, node_index_t{3}, 1);
   ASSERT_NE(LSN_INVALID, sync);
 
   // Wait until N2, N3, N4 and N5 realize that they need to rebuild N3's shard.
-  wait_until_event_log_synced(*cluster, sync, {2, 3, 4, 5});
+  EXPECT_EQ(0, cluster->waitUntilEventLogSynced(sync, {2, 3, 4, 5}));
 
   // Now, add two more nodes to the cluster.
   int rv = cluster->expand(2);
@@ -1008,11 +1087,11 @@ TEST_P(RebuildingTest, ClusterExpandedWhileRebuilding2) {
 // them (N5), which is removed from the config. Verify that adding N5 to the
 // rebuilding set unstalls rebuilding.
 TEST_P(RebuildingTest, DonorNodeRemovedFromConfigDuringRestoreRebuilding) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30);
 
   // Ensure metadata logs are not stored on the node we are about to remove from
   // the cluster.
@@ -1027,7 +1106,7 @@ TEST_P(RebuildingTest, DonorNodeRemovedFromConfigDuringRestoreRebuilding) {
                      .setLogGroupName("my-test-log")
                      .setLogAttributes(log_attrs)
                      .setEventLogAttributes(log_attrs)
-                     .setNumLogs(1)
+                     .setNumLogs(3)
                      .setMetaDataLogsConfig(meta_config)
                      .create(6);
 
@@ -1042,13 +1121,12 @@ TEST_P(RebuildingTest, DonorNodeRemovedFromConfigDuringRestoreRebuilding) {
   ASSERT_EQ(0, cluster->replace(3));
   // Trigger rebuilding of all shards of N3...
   ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{3}, 0));
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{3}, 1));
-  const lsn_t sync = requestShardRebuilding(*client, node_index_t{3}, 2);
+  const lsn_t sync = requestShardRebuilding(*client, node_index_t{3}, 1);
   ASSERT_NE(LSN_INVALID, sync);
 
   // Before shrinking, wait until N3 is made aware that its shards are
   // rebuilding and builds its donor sets that include N5.
-  wait_until_event_log_synced(*cluster, sync, {3});
+  EXPECT_EQ(0, cluster->waitUntilEventLogSynced(sync, {3}));
 
   // Now remove N5 from the cluster.
   const int rv = cluster->shrink(1);
@@ -1057,21 +1135,20 @@ TEST_P(RebuildingTest, DonorNodeRemovedFromConfigDuringRestoreRebuilding) {
   // At this point, rebuilding should stall. Add N5 to the rebuilding set.
   ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 0));
   ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 1));
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 2));
 
   // Wait for N3 to acknowledge rebuilding of all its shards.
   cluster->getNode(3).waitUntilAllShardsFullyAuthoritative(client);
 }
 
 TEST_P(RebuildingTest, NodeComesBackAfterRebuildingIsComplete) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30);
 
-  logsconfig::LogAttributes event_log_attrs = log_attrs;
-  event_log_attrs.set_replicationFactor(4);
+  logsconfig::LogAttributes event_log_attrs =
+      log_attrs.with_replicationFactor(4);
 
   Configuration::MetaDataLogsConfig meta_config =
       createMetaDataLogsConfig({1, 2, 3, 4}, 3, NodeLocationScope::NODE);
@@ -1084,7 +1161,7 @@ TEST_P(RebuildingTest, NodeComesBackAfterRebuildingIsComplete) {
                      .setLogAttributes(log_attrs)
                      .setEventLogAttributes(event_log_attrs)
                      .setParam("--disable-event-log-trimming", "true")
-                     .setNumLogs(1)
+                     .setNumLogs(3)
                      .setMetaDataLogsConfig(meta_config)
                      .create(7);
 
@@ -1096,7 +1173,6 @@ TEST_P(RebuildingTest, NodeComesBackAfterRebuildingIsComplete) {
   // Trigger rebuilding of all shards of N3...
   ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{3}, 0));
   ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{3}, 1));
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{3}, 2));
 
   // Wait until others finish rebuilding the node
   cluster->getNode(3).waitUntilAllShardsAuthoritativeEmpty(client);
@@ -1107,11 +1183,11 @@ TEST_P(RebuildingTest, NodeComesBackAfterRebuildingIsComplete) {
 }
 
 TEST_P(RebuildingTest, ShardAckFromNodeAlreadyRebuilt) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30);
 
   // Ensure metadata logs are not stored on the node we are about to remove from
   // the cluster.
@@ -1125,36 +1201,25 @@ TEST_P(RebuildingTest, ShardAckFromNodeAlreadyRebuilt) {
                      .setLogGroupName("alog")
                      .setLogAttributes(log_attrs)
                      .setEventLogAttributes(log_attrs)
-                     .setNumLogs(1)
+                     .setNumLogs(3)
                      .setMetaDataLogsConfig(meta_config)
                      .create(6);
 
-  cluster->waitForRecovery();
+  cluster->waitUntilAllSequencersQuiescent();
   auto client = cluster->createClient();
 
-  ld_info("Writing.");
-  for (int i = 1; i <= 100; ++i) {
-    std::string data("data" + std::to_string(i));
-    lsn_t lsn = client->appendSync(LOG_ID, Payload(data.data(), data.size()));
-    ASSERT_NE(LSN_INVALID, lsn);
-  }
+  writeRecordsToMultiplePartitions(*cluster, *client, 100);
 
   // Kill N3
   cluster->getNode(3).kill();
   // Trigger rebuilding of all shards of N3...
   ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{3}, 0));
   ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{3}, 1));
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{3}, 2));
 
   // Wait until others finish rebuilding the node
   cluster->getNode(3).waitUntilAllShardsAuthoritativeEmpty(client);
 
-  ld_info("Writing.");
-  for (int i = 1; i <= 1000; ++i) {
-    std::string data("data" + std::to_string(i));
-    lsn_t lsn = client->appendSync(LOG_ID, Payload(data.data(), data.size()));
-    ASSERT_NE(LSN_INVALID, lsn);
-  }
+  writeRecordsToMultiplePartitions(*cluster, *client, 1000);
 
   // Start draining N5
   auto flags =
@@ -1163,8 +1228,6 @@ TEST_P(RebuildingTest, ShardAckFromNodeAlreadyRebuilt) {
       LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 0, flags));
   ASSERT_NE(
       LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 1, flags));
-  ASSERT_NE(
-      LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 2, flags));
 
   // Now start N3
   ld_info("Starting N3");
@@ -1173,19 +1236,18 @@ TEST_P(RebuildingTest, ShardAckFromNodeAlreadyRebuilt) {
   // Once the drain completes, the node's authoritative status is changed to
   // AUTHORITATIVE_EMPTY.
   ld_info("Waiting for N5 to be AUTHORITATIVE_EMPTY");
-  waitUntilShardsHaveEventLogState(
-      client,
-      {ShardID(5, 0), ShardID(5, 1), ShardID(5, 2)},
-      AuthoritativeStatus::AUTHORITATIVE_EMPTY,
-      true);
+  waitUntilShardsHaveEventLogState(client,
+                                   {ShardID(5, 0), ShardID(5, 1)},
+                                   AuthoritativeStatus::AUTHORITATIVE_EMPTY,
+                                   true);
 }
 
 TEST_P(RebuildingTest, NodeDrain) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30);
 
   // Ensure metadata logs are not stored on the node we are about to remove from
   // the cluster.
@@ -1199,7 +1261,7 @@ TEST_P(RebuildingTest, NodeDrain) {
                      .setLogGroupName("alog")
                      .setLogAttributes(log_attrs)
                      .setEventLogAttributes(log_attrs)
-                     .setNumLogs(1)
+                     .setNumLogs(3)
                      .setMetaDataLogsConfig(meta_config)
                      .create(6);
 
@@ -1213,26 +1275,23 @@ TEST_P(RebuildingTest, NodeDrain) {
       LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 0, flags));
   ASSERT_NE(
       LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 1, flags));
-  ASSERT_NE(
-      LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 2, flags));
 
   // Once the drain completes, the node's authoritative status is changed to
   // AUTHORITATIVE_EMPTY.
 
-  waitUntilShardsHaveEventLogState(
-      client,
-      {ShardID(5, 0), ShardID(5, 1), ShardID(5, 2)},
-      AuthoritativeStatus::AUTHORITATIVE_EMPTY,
-      true);
+  waitUntilShardsHaveEventLogState(client,
+                                   {ShardID(5, 0), ShardID(5, 1)},
+                                   AuthoritativeStatus::AUTHORITATIVE_EMPTY,
+                                   true);
 }
 
 // Verify that writing SHARD_UNDRAIN to the event log cancels any ongoing drain.
 TEST_P(RebuildingTest, NodeDrainCanceled) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30);
 
   // Ensure metadata logs are not stored on the node we are about to remove from
   // the cluster.
@@ -1246,7 +1305,7 @@ TEST_P(RebuildingTest, NodeDrainCanceled) {
                      .setLogGroupName("alog")
                      .setLogAttributes(log_attrs)
                      .setEventLogAttributes(log_attrs)
-                     .setNumLogs(1)
+                     .setNumLogs(3)
                      .setMetaDataLogsConfig(meta_config)
                      .create(6);
 
@@ -1256,47 +1315,42 @@ TEST_P(RebuildingTest, NodeDrainCanceled) {
   // Stop N3 so that rebuilding stalls.
   cluster->getNode(3).shutdown();
 
-  // Start draining N5
-  auto flags =
-      SHARD_NEEDS_REBUILD_Header::RELOCATE | SHARD_NEEDS_REBUILD_Header::DRAIN;
+  // Start draining in RESTORE mode N5
+  auto flags = SHARD_NEEDS_REBUILD_Header::FORCE_RESTORE |
+      SHARD_NEEDS_REBUILD_Header::DRAIN;
   ASSERT_NE(
       LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 0, flags));
   ASSERT_NE(
       LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 1, flags));
-  ASSERT_NE(
-      LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 2, flags));
 
   // N5 should remaing fully authoritative because it's a drain.
 
   bool rebuilding_complete = false; // because N3 cannot participate.
-  waitUntilShardsHaveEventLogState(
-      client,
-      {ShardID(5, 0), ShardID(5, 1), ShardID(5, 2)},
-      AuthoritativeStatus::FULLY_AUTHORITATIVE,
-      rebuilding_complete);
+  waitUntilShardsHaveEventLogState(client,
+                                   {ShardID(5, 0), ShardID(5, 1)},
+                                   AuthoritativeStatus::FULLY_AUTHORITATIVE,
+                                   rebuilding_complete);
 
   // Request we abort draining N5
   ASSERT_NE(LSN_INVALID, markShardUndrained(*client, node_index_t{5}, 0));
   ASSERT_NE(LSN_INVALID, markShardUndrained(*client, node_index_t{5}, 1));
-  ASSERT_NE(LSN_INVALID, markShardUndrained(*client, node_index_t{5}, 2));
 
   // Rebuilding should be aborted.
 
   rebuilding_complete = true; // because rebuilding was aborted.
-  waitUntilShardsHaveEventLogState(
-      client,
-      {ShardID(5, 0), ShardID(5, 1), ShardID(5, 2)},
-      AuthoritativeStatus::FULLY_AUTHORITATIVE,
-      rebuilding_complete);
+  waitUntilShardsHaveEventLogState(client,
+                                   {ShardID(5, 0), ShardID(5, 1)},
+                                   AuthoritativeStatus::FULLY_AUTHORITATIVE,
+                                   rebuilding_complete);
   cluster->getNode(5).waitUntilAllShardsFullyAuthoritative(client);
 }
 
 TEST_P(RebuildingTest, NodeDiesAfterDrain) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30);
 
   // Ensure metadata logs are not stored on the node we are about to remove from
   // the cluster.
@@ -1310,22 +1364,20 @@ TEST_P(RebuildingTest, NodeDiesAfterDrain) {
                      .setLogGroupName("alog")
                      .setLogAttributes(log_attrs)
                      .setEventLogAttributes(log_attrs)
-                     .setNumLogs(1)
+                     .setNumLogs(3)
                      .setMetaDataLogsConfig(meta_config)
                      .create(6);
 
   cluster->waitForRecovery();
   auto client = cluster->createClient();
 
-  // Start draining N5
-  auto flags =
-      SHARD_NEEDS_REBUILD_Header::RELOCATE | SHARD_NEEDS_REBUILD_Header::DRAIN;
+  // Start draining N5 in RESTORE mode.
+  auto flags = SHARD_NEEDS_REBUILD_Header::FORCE_RESTORE |
+      SHARD_NEEDS_REBUILD_Header::DRAIN;
   ASSERT_NE(
       LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 0, flags));
   ASSERT_NE(
       LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 1, flags));
-  ASSERT_NE(
-      LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 2, flags));
 
   cluster->getNode(5).waitUntilAllShardsAuthoritativeEmpty(client);
 
@@ -1337,8 +1389,6 @@ TEST_P(RebuildingTest, NodeDiesAfterDrain) {
       LSN_INVALID, requestShardRebuilding(*client, node_index_t{3}, 0, 0));
   ASSERT_NE(
       LSN_INVALID, requestShardRebuilding(*client, node_index_t{3}, 1, 0));
-  ASSERT_NE(
-      LSN_INVALID, requestShardRebuilding(*client, node_index_t{3}, 2, 0));
 
   // N5 should not be considered as donor and N3's rebuilding
   // should complete
@@ -1348,11 +1398,11 @@ TEST_P(RebuildingTest, NodeDiesAfterDrain) {
 // N5 is being drained, but it is removed from the config before the drain
 // completes. We then restart rebuilding of N5 in RELOCATE mode this time.
 TEST_P(RebuildingTest, NodeRebuildingInRelocateModeRemovedFromConfig) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30);
 
   // Ensure metadata logs are not stored on the node we are about to remove from
   // the cluster.
@@ -1366,7 +1416,7 @@ TEST_P(RebuildingTest, NodeRebuildingInRelocateModeRemovedFromConfig) {
                      .setLogGroupName("blog")
                      .setLogAttributes(log_attrs)
                      .setEventLogAttributes(log_attrs)
-                     .setNumLogs(1)
+                     .setNumLogs(3)
                      .setMetaDataLogsConfig(meta_config)
                      .create(6);
 
@@ -1380,14 +1430,12 @@ TEST_P(RebuildingTest, NodeRebuildingInRelocateModeRemovedFromConfig) {
   auto flags = SHARD_NEEDS_REBUILD_Header::RELOCATE;
   ASSERT_NE(
       LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 0, flags));
-  ASSERT_NE(
-      LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 1, flags));
-  const lsn_t sync = requestShardRebuilding(*client, node_index_t{5}, 2, flags);
+  const lsn_t sync = requestShardRebuilding(*client, node_index_t{5}, 1, flags);
   ASSERT_NE(LSN_INVALID, sync);
 
   // Before shrinking, wait until N4 is made aware that N5's shards are
   // rebuilding in RELOCATE mode.
-  wait_until_event_log_synced(*cluster, sync, {4});
+  EXPECT_EQ(0, cluster->waitUntilEventLogSynced(sync, {4}));
 
   // Now remove N5 from the cluster.
   cluster->getNode(5).shutdown();
@@ -1402,7 +1450,6 @@ TEST_P(RebuildingTest, NodeRebuildingInRelocateModeRemovedFromConfig) {
   // RESTORE mode this time to unstall rebuilding.
   ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 0));
   ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 1));
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 2));
 
   // We expect the shards to become fully authoritative because
   // EventLogStateMachine trims the event log when it sees a shard that's
@@ -1421,7 +1468,7 @@ TEST_P(RebuildingTest, NodeRebuildingInRelocateModeRemovedFromConfig) {
     if (rv != 0) {
       return false;
     }
-    for (shard_index_t s = 0; s < 3; ++s) {
+    for (shard_index_t s = 0; s < NUM_DB_SHARDS; ++s) {
       if (m.getShardStatus(ShardID(5, s)) !=
           AuthoritativeStatus::FULLY_AUTHORITATIVE) {
         return false;
@@ -1434,11 +1481,11 @@ TEST_P(RebuildingTest, NodeRebuildingInRelocateModeRemovedFromConfig) {
 // A node is removed from the config while it is rebuilding.
 // RebuildingCoordinator on donor nodes should abort rebuilding.
 TEST_P(RebuildingTest, RebuildingNodeRemovedFromConfig) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30);
 
   // Ensure metadata logs are not stored on the node we are about to remove from
   // the cluster.
@@ -1452,7 +1499,7 @@ TEST_P(RebuildingTest, RebuildingNodeRemovedFromConfig) {
                      .setLogGroupName("my-test-log")
                      .setLogAttributes(log_attrs)
                      .setEventLogAttributes(log_attrs)
-                     .setNumLogs(1)
+                     .setNumLogs(3)
                      .setMetaDataLogsConfig(meta_config)
                      .create(6);
 
@@ -1468,7 +1515,6 @@ TEST_P(RebuildingTest, RebuildingNodeRemovedFromConfig) {
   // Trigger rebuilding of all shards of N5...
   ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 0));
   ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 1));
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 2));
 
   // Now remove N5 from the cluster.
   int rv = cluster->shrink(1);
@@ -1480,11 +1526,11 @@ TEST_P(RebuildingTest, RebuildingNodeRemovedFromConfig) {
 // Same as RebuildingNodeRemovedFromConfig but the rebuilding node is not the
 // only node in the rebuilding set.
 TEST_P(RebuildingTest, RebuildingNodeRemovedFromConfigButNotAlone) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30);
 
   // Ensure metadata logs are not stored on the node we are about to remove from
   // the cluster.
@@ -1498,7 +1544,7 @@ TEST_P(RebuildingTest, RebuildingNodeRemovedFromConfigButNotAlone) {
                      .setLogGroupName("my-test-log")
                      .setLogAttributes(log_attrs)
                      .setEventLogAttributes(log_attrs)
-                     .setNumLogs(1)
+                     .setNumLogs(3)
                      .setMetaDataLogsConfig(meta_config)
                      .create(7);
 
@@ -1514,7 +1560,6 @@ TEST_P(RebuildingTest, RebuildingNodeRemovedFromConfigButNotAlone) {
   // Trigger rebuilding of all shards of N6...
   ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{6}, 0));
   ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{6}, 1));
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{6}, 2));
 
   // Replace N5
   cluster->getNode(5).kill();
@@ -1522,7 +1567,6 @@ TEST_P(RebuildingTest, RebuildingNodeRemovedFromConfigButNotAlone) {
   // Trigger rebuilding of all shards of N5...
   ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 0));
   ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 1));
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node_index_t{5}, 2));
 
   // Now remove N6 from the cluster.
   int rv = cluster->shrink(1);
@@ -1540,41 +1584,59 @@ TEST_P(RebuildingTest, RebuildingNodeRemovedFromConfigButNotAlone) {
 // under-replicated. In this test we want to verify that this situation does not
 // cause rebuilding to stall.
 TEST_P(RebuildingTest, FMajorityInRebuildingSet) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
-  log_attrs.set_backlogDuration(std::chrono::seconds{6 * 3600});
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30)
+                       .with_backlogDuration(std::chrono::seconds{6 * 3600});
 
-  logsconfig::LogAttributes event_log_attrs;
-  event_log_attrs.set_replicationFactor(3);
-  event_log_attrs.set_extraCopies(0);
-  event_log_attrs.set_syncedCopies(0);
-  event_log_attrs.set_maxWritesInFlight(30);
+  auto event_log_attrs = logsconfig::LogAttributes()
+                             .with_replicationFactor(3)
+                             .with_extraCopies(0)
+                             .with_syncedCopies(0)
+                             .with_maxWritesInFlight(30);
 
   auto cluster = IntegrationTestUtils::ClusterFactory()
                      .apply(commonSetup())
                      .setLogGroupName("my-test-log")
                      .setLogAttributes(log_attrs)
                      .setEventLogAttributes(event_log_attrs)
-                     .setNumLogs(42)
+                     .setNumLogs(4)
+                     .setNumDBShards(2)
                      .create(6);
 
-  // Write some records
-  auto client = cluster->createClient();
-  for (int i = 1; i <= 100; ++i) {
-    std::string data("data" + std::to_string(i));
-    lsn_t lsn = client->appendSync(LOG_ID, Payload(data.data(), data.size()));
-    ASSERT_NE(LSN_INVALID, lsn);
-  }
+  // We need to wipe/rebuild a lot of nodes, while keeping event log readable
+  // and writable. The very hacky way we do this is by making sure data log and
+  // internal logs go to different shards, and only wiping/rebuilding the shards
+  // with data logs. In particular, it relies on the following facts:
+  //  (a) we're using 2 DB shards,
+  //  (b) logs are assigned to shard log_id % num_shards,
+  //  (c) event log deltas log has ID 4611686018427387903 (odd - shard 1),
+  //  (d) event log's metadata log is 13835058055282163711 (also odd),
+  //  (e) event log snapshots log is disabled,
+  //  (f) we're writing to data log 2 (even - shard 0),
+  //  (g) the test doesn't depend on any other internal logs, and no other
+  //      internal machinery needs shard 0 to be available.
+  //
+  // TODO: This is not a very good solution. Many of these assumptions are
+  // likely to break in future. This problem comes up in integration tests
+  // a lot, and many tests use similar crappy ad-hoc workarounds. Would be nice
+  // to replace them all with some good mechanism to avoid this problem. Maybe
+  // support segregating internal logs to a separate set of nodes, similar to
+  // how IntegrationTestUtils by default places sequencers on a separate node?
+  const shard_index_t SHARD = 0;
 
-  cluster->waitForMetaDataLogWrites();
-  cluster->waitForRecovery();
+  // Write some records
+  cluster->waitUntilAllSequencersQuiescent();
+  auto client = cluster->createClient();
+  writeRecordsToMultiplePartitions(*cluster, *client, 100);
+
+  cluster->waitUntilAllSequencersQuiescent();
 
   for (node_index_t node = 1; node <= 4; ++node) {
     EXPECT_EQ(0, cluster->getNode(node).shutdown());
-    auto shard_path = path_for_node_shard(*cluster, node, 1);
+    auto shard_path = cluster->getNode(node).getShardPath(SHARD);
     for (fs::directory_iterator end_dir_it, it(shard_path); it != end_dir_it;
          ++it) {
       fs::remove_all(it->path());
@@ -1586,144 +1648,19 @@ TEST_P(RebuildingTest, FMajorityInRebuildingSet) {
 
   // 4 nodes in the rebuilding set is too much, it's impossible to rebuild the
   // records that have a replication factor of 3 since there are 6-4=2 nodes not
-  // in the set. LogRebuilding should skip the epochs and rebuilding should not
-  // stall.
+  // in the set. Rebuilding should skip the epochs and not stall.
   for (node_index_t node = 1; node <= 4; ++node) {
-    ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node, 1));
+    ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, node, SHARD));
   }
 
   IntegrationTestUtils::waitUntilShardsHaveEventLogState(
       client,
-      {ShardID(1, 1), ShardID(2, 1), ShardID(3, 1), ShardID(4, 1)},
+      {ShardID(1, SHARD),
+       ShardID(2, SHARD),
+       ShardID(3, SHARD),
+       ShardID(4, SHARD)},
       AuthoritativeStatus::FULLY_AUTHORITATIVE,
       true);
-}
-
-// Rebuild using a local window of 5ms
-// Note that in this test, some logs have a backlog and some logs don't have one
-// (event log). Logs that have a backlog are put in the wakeupQueue with an
-// estimate of their `nextTimestamp` equal to `now() - backlog` while logs that
-// don't have a backlog are put on the wakeupQueue with a `nextTimestamp` equal
-// to -inf. This mechanism increases the chances that the first time we read a
-// batch of records for a log that has a backlog duration configured, we
-// actually read some data instead of reading nothing and just updating
-// `nextTimestamp`.
-// In order to exercise conditions where both logs with a backlog duration and
-// logs without one are scheduled for rebuilding, we rebuild shard 0 which
-// includes the event log.
-TEST_P(RebuildingTest, LocalWindow) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
-  log_attrs.set_backlogDuration(std::chrono::seconds{6 * 3600});
-
-  logsconfig::LogAttributes event_log_attrs;
-  event_log_attrs.set_replicationFactor(3);
-  event_log_attrs.set_extraCopies(0);
-  event_log_attrs.set_syncedCopies(0);
-  event_log_attrs.set_maxWritesInFlight(30);
-
-  auto cluster = IntegrationTestUtils::ClusterFactory()
-                     .apply(commonSetup())
-                     .setLogGroupName("test-log-group")
-                     .setLogAttributes(log_attrs)
-                     .setEventLogAttributes(event_log_attrs)
-                     .setNumLogs(42)
-                     .create(5);
-
-  // Write some records
-  auto client = cluster->createClient();
-  for (int i = 1; i <= 100; ++i) {
-    std::string data("data" + std::to_string(i));
-    lsn_t lsn = client->appendSync(LOG_ID, Payload(data.data(), data.size()));
-    /* sleep override */
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    ASSERT_NE(LSN_INVALID, lsn);
-  }
-
-  cluster->waitForRecovery();
-
-  EXPECT_EQ(0, cluster->getNode(1).shutdown());
-  auto shard_path = path_for_node_shard(*cluster, node_index_t(1), 0);
-  for (fs::directory_iterator end_dir_it, it(shard_path); it != end_dir_it;
-       ++it) {
-    fs::remove_all(it->path());
-  }
-  ASSERT_EQ(0, cluster->bumpGeneration(1));
-  cluster->getNode(1).start();
-  cluster->getNode(1).waitUntilStarted();
-
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, 1, 0));
-
-  cluster->getNode(1).waitUntilAllShardsFullyAuthoritative(client);
-  cluster->waitForMetaDataLogWrites();
-  // there is a known issue where purging deletes records that gets surfaced in
-  // tests with sequencer-written metadata, which is why we skip checking
-  // replication for bridge records that this may impact. See t13850978
-  IntegrationTestUtils::Cluster::argv_t check_args = {
-      "--dont-count-bridge-records",
-  };
-  // Verify that everything is correctly replicated.
-  ASSERT_EQ(0, cluster->checkConsistency(check_args));
-}
-
-// Same as `LocalWindow` but there is also a 30ms global window.
-TEST_P(RebuildingTest, LocalAndGlobalWindow) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
-  log_attrs.set_backlogDuration(std::chrono::seconds{6 * 3600});
-
-  logsconfig::LogAttributes event_log_attrs;
-  event_log_attrs.set_replicationFactor(3);
-  event_log_attrs.set_extraCopies(0);
-  event_log_attrs.set_syncedCopies(0);
-  event_log_attrs.set_maxWritesInFlight(30);
-
-  auto cluster = IntegrationTestUtils::ClusterFactory()
-                     .apply(commonSetup())
-                     .setLogGroupName("test-log")
-                     .setLogAttributes(log_attrs)
-                     .setEventLogAttributes(event_log_attrs)
-                     .setParam("--rebuilding-local-window", "5ms")
-                     .setParam("--rebuilding-global-window", "30ms")
-                     .setNumLogs(42)
-                     .create(5);
-
-  // Write some records
-  auto client = cluster->createClient();
-  for (int i = 1; i <= 100; ++i) {
-    std::string data("data" + std::to_string(i));
-    lsn_t lsn = client->appendSync(LOG_ID, Payload(data.data(), data.size()));
-    /* sleep override */
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    ASSERT_NE(LSN_INVALID, lsn);
-  }
-
-  cluster->waitForRecovery();
-
-  EXPECT_EQ(0, cluster->getNode(1).shutdown());
-  cluster->getNode(1).wipeShard(0);
-  ASSERT_EQ(0, cluster->bumpGeneration(1));
-  cluster->getNode(1).start();
-  cluster->getNode(1).waitUntilStarted();
-
-  ASSERT_NE(LSN_INVALID, requestShardRebuilding(*client, 1, 0));
-
-  cluster->getNode(1).waitUntilAllShardsFullyAuthoritative(client);
-  cluster->waitForMetaDataLogWrites();
-  // there is a known issue where purging deletes records that gets surfaced in
-  // tests with sequencer-written metadata, which is why we skip checking
-  // replication for bridge records that this may impact. See t13850978
-  IntegrationTestUtils::Cluster::argv_t check_args = {
-      "--dont-count-bridge-records",
-  };
-  // Verify that everything is correctly replicated.
-  ASSERT_EQ(0, cluster->checkConsistency(check_args));
 }
 
 // Kill/Restart each storage node one by one. No extras.
@@ -1762,10 +1699,6 @@ TEST_P(RebuildingTest, RollingMiniRebuilding) {
       // amount of wall clock delay required for this test to create adjacent
       // partitions with non-overlapping time ranges.
       .setParam("--rocksdb-partition-timestamp-granularity", "100ms")
-      // To ensure that all nodes receive at least some data when we dirty
-      // them, adjust the copyset block size so we get a copyset shuffle
-      // every ~6 records.
-      .setParam("--sticky-copysets-block-size", "128")
       // Use only a single shard so that partition creation/flushing commands
       // can be unambiguously targeted.
       .setNumDBShards(1);
@@ -1776,11 +1709,11 @@ TEST_P(RebuildingTest, RollingMiniRebuilding) {
 // Verify that Mini-Rebuildings do not prevent a rebuild from being
 // considered authoritative.
 TEST_P(RebuildingTest, MiniRebuildingIsAuthoritative) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30);
 
   NodeSetIndices node_set(5);
   std::iota(node_set.begin(), node_set.end(), 0);
@@ -1799,10 +1732,6 @@ TEST_P(RebuildingTest, MiniRebuildingIsAuthoritative) {
           // amount of wall clock delay required for this test to create
           // adjacent partitions with non-overlapping time ranges.
           .setParam("--rocksdb-partition-timestamp-granularity", "100ms")
-          // To ensure that all nodes receive at least some data when we dirty
-          // them, adjust the copyset block size so we get a copyset shuffle
-          // every ~6 records.
-          .setParam("--sticky-copysets-block-size", "128")
           // Use only a single shard so that partition creation/flushing
           // commands can be unambiguously targeted.
           .setNumDBShards(1)
@@ -1813,8 +1742,7 @@ TEST_P(RebuildingTest, MiniRebuildingIsAuthoritative) {
   auto client = cluster->createClient();
 
   // Write some records..
-  folly::Optional<lsn_t> batch_start;
-  dirtyNodes(*cluster, *client, node_set, /*shard*/ 0, batch_start);
+  dirtyNodes(*cluster, *client, node_set, /*shard*/ 0);
 
   EventLogRebuildingSet base_set;
   ASSERT_EQ(EventLogUtils::getRebuildingSet(*client, base_set), 0);
@@ -1903,15 +1831,14 @@ TEST_P(RebuildingTest, MiniRebuildingAlwaysNonRecoverable) {
   // The remainder get a crash restart.
   NodeSetIndices dirty_node_set(full_node_set.begin() + 3, full_node_set.end());
 
-  folly::Optional<lsn_t> batch_start;
-  dirtyNodes(*cluster, *client, full_node_set, /*shard*/ 0, batch_start);
+  dirtyNodes(*cluster, *client, full_node_set, /*shard*/ 0);
 
   // Kill unrecoverable_nodes and clean their DBs. They'll be be marked
   // unrecoverable later.
   ld_info("Killing and removing data from nodes.");
   for (node_index_t node : unrecoverable_node_set) {
     cluster->getNode(node).kill();
-    auto shard_path = path_for_node_shard(*cluster, node, /*shard*/ 0);
+    auto shard_path = cluster->getNode(node).getShardPath(0);
     for (fs::directory_iterator end_dir_it, it(shard_path); it != end_dir_it;
          ++it) {
       fs::remove_all(it->path());
@@ -1940,12 +1867,7 @@ TEST_P(RebuildingTest, MiniRebuildingAlwaysNonRecoverable) {
       });
 
   // Should still have write availability. Write some records.
-  ld_info("Writing.");
-  for (int i = 1; i <= 30; ++i) {
-    std::string data("data" + std::to_string(i));
-    lsn_t lsn = client->appendSync(LOG_ID, Payload(data.data(), data.size()));
-    ASSERT_NE(LSN_INVALID, lsn);
-  }
+  writeRecordsToMultiplePartitions(*cluster, *client, 30);
 
   // Restart sequencer node. It should get stuck in recovery.
   ld_info("Restarting sequencer.");
@@ -2021,18 +1943,18 @@ TEST_P(RebuildingTest, MiniRebuildingAlwaysNonRecoverable) {
 }
 
 TEST_P(RebuildingTest, RebuildingWithDifferentDurabilities) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(4);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
-  log_attrs.set_backlogDuration(std::chrono::seconds{6 * 3600});
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(4)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30)
+                       .with_backlogDuration(std::chrono::seconds{6 * 3600});
 
-  logsconfig::LogAttributes event_log_attrs;
-  event_log_attrs.set_replicationFactor(3);
-  event_log_attrs.set_extraCopies(0);
-  event_log_attrs.set_syncedCopies(0);
-  event_log_attrs.set_maxWritesInFlight(30);
+  auto event_log_attrs = logsconfig::LogAttributes()
+                             .with_replicationFactor(3)
+                             .with_extraCopies(0)
+                             .with_syncedCopies(0)
+                             .with_maxWritesInFlight(30);
 
   ld_info("Creating cluster");
   auto cluster = IntegrationTestUtils::ClusterFactory()
@@ -2047,14 +1969,15 @@ TEST_P(RebuildingTest, RebuildingWithDifferentDurabilities) {
   // Write some records
   ld_info("Creating client");
   auto client = cluster->createClient();
-  ld_info("Writing records");
-  for (int i = 1; i <= 1000; ++i) {
-    std::string data("data" + std::to_string(i));
-    lsn_t lsn = client->appendSync(LOG_ID, Payload(data.data(), data.size()));
-    /* sleep override */
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    ASSERT_NE(LSN_INVALID, lsn);
-  }
+  // Write to shard 1 only.
+  // Note: I'm not sure why there's a 1ms sleep between records here.
+  // This may just be a bad copypasta.
+  writeRecordsToMultiplePartitions(*cluster,
+                                   *client,
+                                   1000,
+                                   nullptr,
+                                   {logid_t(1), logid_t(3)},
+                                   std::chrono::milliseconds(1));
 
   ld_info("Waiting for recovery");
   cluster->waitForRecovery();
@@ -2066,7 +1989,7 @@ TEST_P(RebuildingTest, RebuildingWithDifferentDurabilities) {
   ld_info("Shutting down N1");
   EXPECT_EQ(0, cluster->getNode(1).shutdown());
   ld_info("Wiping N1");
-  auto shard_path = path_for_node_shard(*cluster, node_index_t(1), 0);
+  auto shard_path = cluster->getNode(1).getShardPath(0);
   for (fs::directory_iterator end_dir_it, it(shard_path); it != end_dir_it;
        ++it) {
     fs::remove_all(it->path());
@@ -2099,10 +2022,10 @@ TEST_P(RebuildingTest, RebuildingWithDifferentDurabilities) {
 // check that their metadata is still intact
 TEST_P(RebuildingTest, RebuildMetaDataLogsOfDeletedLogs) {
   int nnodes = 5;
-  auto cf = rollingRebuildingClusterFactory(nnodes, 3, 0, true).setNumLogs(2);
+  auto cf = rollingRebuildingClusterFactory(nnodes, 3, 0, true).setNumLogs(4);
   auto cluster = cf.create(nnodes);
   auto get_metadata_record_count = [&](logid_t log_id) {
-    std::shared_ptr<Client> client = cluster->createIndependentClient();
+    std::shared_ptr<Client> client = cluster->createClient();
     lsn_t until_lsn =
         client->getTailLSNSync(MetaDataLog::metaDataLogID(log_id));
     ld_info("Reading metadata log for %lu until lsn %s",
@@ -2130,10 +2053,11 @@ TEST_P(RebuildingTest, RebuildMetaDataLogsOfDeletedLogs) {
         rec_count += count;
       }
     } while (count != 0);
+
     return rec_count;
   };
 
-  ASSERT_EQ(1, get_metadata_record_count(logid_t(2)));
+  ASSERT_EQ(1, get_metadata_record_count(logid_t(4)));
 
   auto change_logs_config = [&](logid_range_t expected_range,
                                 logid_range_t new_range) {
@@ -2156,8 +2080,8 @@ TEST_P(RebuildingTest, RebuildMetaDataLogsOfDeletedLogs) {
   };
 
   ld_info("Changing config with removed log_id");
-  change_logs_config(logid_range_t(logid_t(1), logid_t(2)),
-                     logid_range_t(logid_t(1), logid_t(1)));
+  change_logs_config(logid_range_t(logid_t(1), logid_t(4)),
+                     logid_range_t(logid_t(1), logid_t(3)));
 
   // TODO: T23153817, T13850978
   // Remove this once we have a fool-proof
@@ -2169,21 +2093,21 @@ TEST_P(RebuildingTest, RebuildMetaDataLogsOfDeletedLogs) {
       *cluster, 1, nnodes - 1, NodeFailureMode::REPLACE, check_args);
 
   ld_info("Changing config with re-added log_id");
-  change_logs_config(logid_range_t(logid_t(1), logid_t(1)),
-                     logid_range_t(logid_t(1), logid_t(2)));
+  change_logs_config(logid_range_t(logid_t(1), logid_t(3)),
+                     logid_range_t(logid_t(1), logid_t(4)));
 
-  ASSERT_EQ(1, get_metadata_record_count(logid_t(2)));
+  ASSERT_EQ(1, get_metadata_record_count(logid_t(4)));
 }
 
 // Create under-replicated regions of the log store on a node and
 // verify that a reader can successfully read without seeing
 // spurious dataloss gaps.
 TEST_P(RebuildingTest, UnderReplicatedRegions) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30);
 
   NodeSetIndices node_set(5);
   std::iota(node_set.begin(), node_set.end(), 0);
@@ -2202,10 +2126,6 @@ TEST_P(RebuildingTest, UnderReplicatedRegions) {
           // amount of wall clock delay required for this test to create
           // adjacent partitions with non-overlapping time ranges.
           .setParam("--rocksdb-partition-timestamp-granularity", "100ms")
-          // To ensure that all nodes receive at least some data when we dirty
-          // them, adjust the copyset block size so we get a copyset shuffle
-          // every ~6 records.
-          .setParam("--sticky-copysets-block-size", "128")
           // Don't request rebuilding of dirty shards so that they stay dirty
           // while clients read data.
           .setParam("--rebuild-dirty-shards", "false")
@@ -2220,9 +2140,8 @@ TEST_P(RebuildingTest, UnderReplicatedRegions) {
   client->settings().set("gap-grace-period", "0ms");
 
   // Write some records..
-  folly::Optional<lsn_t> batch_start;
-  size_t nrecords = 0;
-  nrecords = dirtyNodes(*cluster, *client, node_set, /*shard*/ 0, batch_start);
+  std::vector<RecordsInfo> info_per_log;
+  dirtyNodes(*cluster, *client, node_set, /*shard*/ 0, &info_per_log);
 
   // Kill node and restart node 2
   cluster->getNode(2).kill();
@@ -2232,18 +2151,23 @@ TEST_P(RebuildingTest, UnderReplicatedRegions) {
   cluster->waitForRecovery();
 
   // Write more records.
-  nrecords += dirtyNodes(*cluster, *client, node_set, /*shard*/ 0, batch_start);
+  dirtyNodes(*cluster, *client, node_set, /*shard*/ 0, &info_per_log);
 
-  auto reader = client->createReader(1);
-  int rv = reader->startReading(LOG_ID, LSN_OLDEST);
-  ASSERT_EQ(rv, 0);
+  auto reader = client->createReader(LOG_IDS.size());
+  size_t total_records = 0;
+  for (size_t i = 0; i < LOG_IDS.size(); ++i) {
+    int rv =
+        reader->startReading(LOG_IDS[i], LSN_OLDEST, info_per_log[i].max_lsn);
+    ASSERT_EQ(rv, 0);
+    total_records += info_per_log[i].num_records;
+  }
 
   size_t total_read = 0;
   std::vector<std::unique_ptr<DataRecord>> data;
   reader->setTimeout(std::chrono::seconds(1));
-  while (1) {
+  while (reader->isReadingAny()) {
     GapRecord gap;
-    int nread = reader->read(nrecords - total_read, &data, &gap);
+    int nread = reader->read(1, &data, &gap);
     if (nread < 0) {
       EXPECT_EQ(err, E::GAP);
       EXPECT_EQ(gap.type, GapType::BRIDGE);
@@ -2253,11 +2177,8 @@ TEST_P(RebuildingTest, UnderReplicatedRegions) {
       break;
     }
     total_read += nread;
-    if (total_read >= nrecords) {
-      break;
-    }
   }
-  EXPECT_EQ(total_read, nrecords);
+  EXPECT_EQ(total_read, total_records);
 
   cluster->shutdownNodes(node_set);
 }
@@ -2266,17 +2187,17 @@ TEST_P(RebuildingTest, UnderReplicatedRegions) {
 // advance. Check that it skips all the records using csi and does so using
 // near-minimum number of seeks/nexts of csi iterator.
 TEST_P(RebuildingTest, SkipEverything) {
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(2);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(1000);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(2)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(1000);
 
-  logsconfig::LogAttributes event_log_attrs;
-  event_log_attrs.set_replicationFactor(2);
-  event_log_attrs.set_extraCopies(0);
-  event_log_attrs.set_syncedCopies(0);
-  event_log_attrs.set_maxWritesInFlight(30);
+  auto event_log_attrs = logsconfig::LogAttributes()
+                             .with_replicationFactor(2)
+                             .with_extraCopies(0)
+                             .with_syncedCopies(0)
+                             .with_maxWritesInFlight(30);
 
   Configuration::MetaDataLogsConfig meta_config = createMetaDataLogsConfig(
       /*nodeset=*/{0, 1},
@@ -2290,10 +2211,16 @@ TEST_P(RebuildingTest, SkipEverything) {
     nodes[i].addSequencerRole();
     nodes[i].addStorageRole(/*num_shards*/ 1);
     nodes[i].generation = 1;
-    nodes[i].storage_attributes->state = i == 2
-        ? configuration::StorageState::READ_ONLY
-        : configuration::StorageState::READ_WRITE;
   }
+
+  auto nodes_configuration =
+      NodesConfigurationTestUtil::provisionNodes(std::move(nodes));
+  nodes_configuration = nodes_configuration->applyUpdate(
+      NodesConfigurationTestUtil::setStorageMembershipUpdate(
+          *nodes_configuration,
+          {ShardID(2, -1)},
+          membership::StorageState::READ_ONLY,
+          folly::none));
 
   ld_info("Creating cluster");
   auto cluster = IntegrationTestUtils::ClusterFactory()
@@ -2302,25 +2229,17 @@ TEST_P(RebuildingTest, SkipEverything) {
                      .setLogAttributes(log_attrs)
                      .setEventLogAttributes(event_log_attrs)
                      .setMetaDataLogsConfig(meta_config)
-                     .setNodes(nodes)
+                     .setNodes(std::move(nodes_configuration))
                      .setNumDBShards(1)
                      .useHashBasedSequencerAssignment()
-                     .setParam("--rocksdb-new-partition-timestamp-margin", "0s")
                      .create(3);
 
-  cluster->waitForRecovery();
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
 
   ld_info("Creating client");
   auto client = cluster->createClient();
   ld_info("Writing records");
-  for (int i = 0; i < 20; ++i) {
-    writeRecords(*client, 20);
-    createPartition(*cluster, {0, 1}, 0);
-    // Make sure that all partitions have different timestamps (they have
-    // millisecond granularity).
-    /* sleep override */
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  }
+  writeRecordsToMultiplePartitions(*cluster, *client, 400);
 
   ld_info("Requesting drain of N2");
   ASSERT_NE(
@@ -2342,6 +2261,8 @@ TEST_P(RebuildingTest, SkipEverything) {
       EXPECT_GE(val, min);
       EXPECT_LE(val, max);
     };
+    // Each node has at least 400 records in the data log, and rebuilding should
+    // read a CSI entry for each record at least once.
     check_stat("read_streams_rocksdb_locallogstore_csi_next_reads", 300, 600);
     check_stat("read_streams_rocksdb_locallogstore_csi_seek_reads", 1, 200);
     check_stat("read_streams_rocksdb_locallogstore_record_next_reads", 0, 200);
@@ -2386,11 +2307,11 @@ TEST_P(RebuildingTest, DerivedStats) {
   ASSERT_NE(LSN_INVALID, event_lsn);
 
   ld_info("Waiting for event to propagate to N1");
-  wait_until_event_log_synced(*cluster, event_lsn, /* nodes */ {1});
+  EXPECT_EQ(0, cluster->waitUntilEventLogSynced(event_lsn, {1}));
 
   // Rebuilding should be stuck because N2 is down.
   // The event propagation inside the server is asynchronous, even after the
-  // wait_until_event_log_synced() (RebuildingCoordinator uses a zero-delay
+  // waitUntilEventLogSynced() (RebuildingCoordinator uses a zero-delay
   // timer and a storage task for restarting and acking rebuilding
   // correspondingly).
   wait_until("shards_waiting_for_non_started_restore", [&cluster, &stats] {
@@ -2459,11 +2380,11 @@ TEST_P(RebuildingTest, DerivedStats) {
 
   // Should still be authoritative empty and not need restore rebuilding.
   ld_info("Waiting for N3 to catch up in event log");
-  wait_until_event_log_synced(*cluster, event_lsn, /* nodes */ {3});
+  EXPECT_EQ(0, cluster->waitUntilEventLogSynced(event_lsn, {3}));
 
   stats = cluster->getNode(3).stats();
   // RebuildingCoordinator does things asynchronously even after
-  // wait_until_event_log_synced(). Wait for it to apply the event log update.
+  // waitUntilEventLogSynced(). Wait for it to apply the event log update.
   wait_until("shards_waiting_for_non_started_restore", [&cluster, &stats] {
     stats = cluster->getNode(1).stats();
     return 0 == stats["shards_waiting_for_non_started_restore"];
@@ -2497,6 +2418,7 @@ TEST_P(RebuildingTest, ReplicationCheckerDuringRebuilding) {
                      .setInternalLogsReplicationFactor(2)
                      .setParam("--test-stall-rebuilding", "true")
                      .create(3);
+  cluster->waitUntilAllStartedAndPropagatedInGossip();
 
   // Append a record, making sure that N2 is in the copyset.
   ld_info("Updating setting");
@@ -2508,7 +2430,7 @@ TEST_P(RebuildingTest, ReplicationCheckerDuringRebuilding) {
   auto client = cluster->createClient();
   ld_info("Appending record");
   std::string data("hello");
-  lsn_t lsn = client->appendSync(LOG_ID, Payload(data.data(), data.size()));
+  lsn_t lsn = client->appendSync(LOG_IDS[0], Payload(data.data(), data.size()));
   ASSERT_NE(LSN_INVALID, lsn);
 
   ld_info("Un-updating setting");
@@ -2530,7 +2452,7 @@ TEST_P(RebuildingTest, ReplicationCheckerDuringRebuilding) {
   // Read the record back to make sure it's released.
   ld_info("Reading");
   auto reader = client->createReader(1);
-  ASSERT_EQ(0, reader->startReading(LOG_ID, lsn));
+  ASSERT_EQ(0, reader->startReading(LOG_IDS[0], lsn));
   std::vector<std::unique_ptr<DataRecord>> data_out;
   GapRecord gap_out;
   ASSERT_EQ(1, reader->read(1, &data_out, &gap_out));
@@ -2551,7 +2473,7 @@ TEST_P(RebuildingTest, ReplicationCheckerDuringRebuilding) {
   event_lsn = cluster->getNode(2).waitUntilAllShardsFullyAuthoritative(client);
 
   ld_info("Waiting for nodes to catch up in event log");
-  wait_until_event_log_synced(*cluster, event_lsn, /* nodes */ {0, 1, 2});
+  EXPECT_EQ(0, cluster->waitUntilEventLogSynced(event_lsn, {0, 1, 2}));
 
   // Make a new client to discard any stale authoritative status.
   ld_info("Re-creating client");
@@ -2579,23 +2501,23 @@ TEST_P(RebuildingTest, ReplicationCheckerDuringRebuilding) {
 // Case: shards come back wiped.
 TEST_P(RebuildingTest, DisableDataLogRebuildShardsWiped) {
   // FIXME: Need to add a mix of retentions.
-  // Shorter than test duration.
+  // Shorter than half of the test duration.
   std::chrono::seconds maxBacklogDuration(20);
 
   ld_info("Creating cluster");
 
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
-  log_attrs.set_backlogDuration(maxBacklogDuration);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30)
+                       .with_backlogDuration(maxBacklogDuration);
 
-  logsconfig::LogAttributes event_log_attrs;
-  event_log_attrs.set_replicationFactor(3);
-  event_log_attrs.set_extraCopies(0);
-  event_log_attrs.set_syncedCopies(0);
-  event_log_attrs.set_maxWritesInFlight(30);
+  auto event_log_attrs = logsconfig::LogAttributes()
+                             .with_replicationFactor(3)
+                             .with_extraCopies(0)
+                             .with_syncedCopies(0)
+                             .with_maxWritesInFlight(30);
 
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
@@ -2698,18 +2620,18 @@ TEST_P(RebuildingTest, DisableDataLogRebuildShardsAborted) {
   // Longer than test duration.
   std::chrono::seconds maxBacklogDuration(300);
 
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
-  log_attrs.set_backlogDuration(maxBacklogDuration);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30)
+                       .with_backlogDuration(maxBacklogDuration);
 
-  logsconfig::LogAttributes event_log_attrs;
-  event_log_attrs.set_replicationFactor(3);
-  event_log_attrs.set_extraCopies(0);
-  event_log_attrs.set_syncedCopies(0);
-  event_log_attrs.set_maxWritesInFlight(60);
+  auto event_log_attrs = logsconfig::LogAttributes()
+                             .with_replicationFactor(3)
+                             .with_extraCopies(0)
+                             .with_syncedCopies(0)
+                             .with_maxWritesInFlight(60);
 
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
@@ -2731,16 +2653,14 @@ TEST_P(RebuildingTest, DisableDataLogRebuildShardsAborted) {
   int id = 1;
   int maxIters = 2;
   for (int iter = 0; iter < maxIters; iter++) {
-    int numRecords = 1000;
     // Write some records
     auto client = cluster->createClient();
-    while (numRecords--) {
-      std::string data("data" + std::to_string(id++));
-      lsn_t lsn = client->appendSync(LOG_ID, Payload(data.data(), data.size()));
-      /* sleep override */
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      ASSERT_NE(LSN_INVALID, lsn);
-    }
+    writeRecordsToMultiplePartitions(*cluster,
+                                     *client,
+                                     1000,
+                                     nullptr,
+                                     LOG_IDS,
+                                     std::chrono::milliseconds(1));
 
     cluster->waitForRecovery();
 
@@ -2782,21 +2702,21 @@ TEST_P(RebuildingTest, DisableDataLogRebuildShardsAborted) {
 
 // Case: shards never come back.
 TEST_P(RebuildingTest, DisableDataLogRebuildNodeFailed) {
-  // Shorter than test duration.
-  std::chrono::seconds maxBacklogDuration(30);
+  // Shorter than half of the test duration.
+  std::chrono::seconds maxBacklogDuration(15);
 
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
-  log_attrs.set_backlogDuration(maxBacklogDuration);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30)
+                       .with_backlogDuration(maxBacklogDuration);
 
-  logsconfig::LogAttributes event_log_attrs;
-  event_log_attrs.set_replicationFactor(3);
-  event_log_attrs.set_extraCopies(0);
-  event_log_attrs.set_syncedCopies(0);
-  event_log_attrs.set_maxWritesInFlight(30);
+  auto event_log_attrs = logsconfig::LogAttributes()
+                             .with_replicationFactor(3)
+                             .with_extraCopies(0)
+                             .with_syncedCopies(0)
+                             .with_maxWritesInFlight(30);
 
   auto cluster =
       IntegrationTestUtils::ClusterFactory()
@@ -2818,16 +2738,14 @@ TEST_P(RebuildingTest, DisableDataLogRebuildNodeFailed) {
   int id = 1;
   int maxIters = 2;
   for (int iter = 0; iter < maxIters; iter++) {
-    int numRecords = 1000;
     // Write some records
     auto client = cluster->createClient();
-    while (numRecords--) {
-      std::string data("data" + std::to_string(id++));
-      lsn_t lsn = client->appendSync(LOG_ID, Payload(data.data(), data.size()));
-      /* sleep override */
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      ASSERT_NE(LSN_INVALID, lsn);
-    }
+    writeRecordsToMultiplePartitions(*cluster,
+                                     *client,
+                                     1000,
+                                     nullptr,
+                                     LOG_IDS,
+                                     std::chrono::milliseconds(1));
 
     cluster->waitForRecovery();
 
@@ -2866,18 +2784,18 @@ TEST_P(RebuildingTest, DirtyRangeAdminCommands) {
   // Longer than test duration.
   std::chrono::seconds maxBacklogDuration(300);
 
-  logsconfig::LogAttributes log_attrs;
-  log_attrs.set_replicationFactor(3);
-  log_attrs.set_extraCopies(0);
-  log_attrs.set_syncedCopies(0);
-  log_attrs.set_maxWritesInFlight(30);
-  log_attrs.set_backlogDuration(maxBacklogDuration);
+  auto log_attrs = logsconfig::LogAttributes()
+                       .with_replicationFactor(3)
+                       .with_extraCopies(0)
+                       .with_syncedCopies(0)
+                       .with_maxWritesInFlight(30)
+                       .with_backlogDuration(maxBacklogDuration);
 
-  logsconfig::LogAttributes event_log_attrs;
-  event_log_attrs.set_replicationFactor(3);
-  event_log_attrs.set_extraCopies(0);
-  event_log_attrs.set_syncedCopies(0);
-  event_log_attrs.set_maxWritesInFlight(30);
+  auto event_log_attrs = logsconfig::LogAttributes()
+                             .with_replicationFactor(3)
+                             .with_extraCopies(0)
+                             .with_syncedCopies(0)
+                             .with_maxWritesInFlight(30);
 
   NodeSetIndices node_set(5);
   std::iota(node_set.begin(), node_set.end(), 0);
@@ -2890,6 +2808,9 @@ TEST_P(RebuildingTest, DirtyRangeAdminCommands) {
           .setParam("--append-store-durability", "memory")
           // Set min flush trigger intervals and partition duration high
           // so that only the test is creating/retiring partitions.
+          .setParam("--rocksdb-partition-idle-flush-trigger", "900s")
+          .setParam("--rocksdb-partition-data-age-flush-trigger", "900s")
+          .setParam("--rocksdb-partition-flush-check-period", "900s")
           .setParam("--rocksdb-min-manual-flush-interval", "900s")
           .setParam("--rocksdb-partition-duration", "900s")
           // Decrease the timestamp granularity so that we can minimize the
@@ -2898,10 +2819,6 @@ TEST_P(RebuildingTest, DirtyRangeAdminCommands) {
           .setParam("--rocksdb-partition-timestamp-granularity", "100ms")
           // Print all flush events to server's log, for debugging.
           .setParam("--rocksdb-print-details", "true")
-          // To ensure that all nodes receive at least some data when we dirty
-          // them, adjust the copyset block size so we get a copyset shuffle
-          // every ~6 records.
-          .setParam("--sticky-copysets-block-size", "128")
           // Disable rebuilding so dirty time ranges are only retired if
           // they expire by retention, or are explicitly cleared by this
           // test.
@@ -2910,6 +2827,7 @@ TEST_P(RebuildingTest, DirtyRangeAdminCommands) {
           // Use only a single shard so that partition creation/flushing
           // commands can be unambiguously targeted.
           .setNumDBShards(1)
+          .useHashBasedSequencerAssignment()
           .create(5);
 
   cluster->waitForRecovery();
@@ -2917,10 +2835,9 @@ TEST_P(RebuildingTest, DirtyRangeAdminCommands) {
   auto client = cluster->createClient();
 
   // Write records and generate partitions...
-  folly::Optional<lsn_t> batch_start;
-  dirtyNodes(*cluster, *client, node_set, /*shard*/ 0, batch_start);
+  dirtyNodes(*cluster, *client, node_set, /*shard*/ 0);
   // And a few more partitions to ensure we have enough to work with.
-  dirtyNodes(*cluster, *client, node_set, /*shard*/ 0, batch_start);
+  dirtyNodes(*cluster, *client, node_set, /*shard*/ 0);
 
   auto& node1 = cluster->getNode(1);
 
@@ -3060,7 +2977,7 @@ TEST_P(RebuildingTest, DirtyRangeAdminCommands) {
     auto& partition0 = partitions.front();
     auto min = min_time(partition0);
 
-    send_cmd("dirty", min - 6000ms, min - 1000ms);
+    send_cmd("dirty", min - 30s, min - 20s);
 
     EXPECT_EQ(base_dirty_pariritions, count_dirty_partitions());
     EXPECT_NE(toString(node1.dirtyShardInfo()), toString(base_dirty_info));
@@ -3128,6 +3045,7 @@ TEST_P(RebuildingTest, DirtyRangeAdminCommands) {
 
     auto base_dirty_info = node1.dirtyShardInfo();
     auto partition = find_partition(/*dirty*/ true);
+    EXPECT_EQ(partition["Under Replicated"], "1");
 
     send_cmd("clean", min_time(partition), max_time(partition));
 
@@ -3271,13 +3189,13 @@ TEST_P(RebuildingTest, UndrainDeadNode) {
 }
 
 std::vector<TestMode> test_params{
-    {DurabilityMode::V1_WITH_WAL, FlushMode::ROCKSDB, FilterMode::DEFAULT},
-    {DurabilityMode::V1_WITH_WAL, FlushMode::LD, FilterMode::DEFAULT},
-    {DurabilityMode::V1_WITHOUT_WAL, FlushMode::ROCKSDB, FilterMode::DEFAULT},
-    {DurabilityMode::V1_WITHOUT_WAL, FlushMode::LD, FilterMode::DEFAULT},
-    {DurabilityMode::V2_WITH_WAL, FlushMode::ROCKSDB, FilterMode::DEFAULT},
-    {DurabilityMode::V2_WITH_WAL, FlushMode::LD, FilterMode::DEFAULT},
-    {DurabilityMode::V2_WITH_WAL, FlushMode::LD, FilterMode::FILTER_RELOCATE}};
+    {FlushMode::LD, FilterMode::DEFAULT, RebuildingDirection::OLD_TO_NEW},
+    {FlushMode::LD,
+     FilterMode::FILTER_RELOCATE,
+     RebuildingDirection::OLD_TO_NEW},
+    {FlushMode::LD,
+     FilterMode::FILTER_RELOCATE,
+     RebuildingDirection::NEW_TO_OLD}};
 INSTANTIATE_TEST_CASE_P(RebuildingTest,
                         RebuildingTest,
                         ::testing::ValuesIn(test_params));

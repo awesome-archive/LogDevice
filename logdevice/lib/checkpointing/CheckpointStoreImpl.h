@@ -7,7 +7,10 @@
  */
 #pragma once
 
+#include <folly/io/async/HHWheelTimer.h>
+
 #include "logdevice/common/VersionedConfigStore.h"
+#include "logdevice/common/WeakRefHolder.h"
 #include "logdevice/include/CheckpointStore.h"
 #include "logdevice/include/Err.h"
 #include "logdevice/lib/checkpointing/if/gen-cpp2/Checkpoint_types.h"
@@ -19,7 +22,12 @@ namespace facebook { namespace logdevice {
  */
 class CheckpointStoreImpl : public CheckpointStore {
  public:
-  explicit CheckpointStoreImpl(std::unique_ptr<VersionedConfigStore> vcs);
+  /**
+   * @param prefix: the string which will be added at the beginning of every
+   *   key.
+   */
+  explicit CheckpointStoreImpl(std::unique_ptr<VersionedConfigStore> vcs,
+                               const std::string& prefix = "");
 
   void getLSN(const std::string& customer_id,
               logid_t log_id,
@@ -39,27 +47,44 @@ class CheckpointStoreImpl : public CheckpointStore {
   void updateLSN(const std::string& customer_id,
                  logid_t log_id,
                  lsn_t lsn,
-                 UpdateCallback cb) override;
+                 StatusCallback cb) override;
 
   void updateLSN(const std::string& customer_id,
                  const std::map<logid_t, lsn_t>& checkpoints,
-                 UpdateCallback cb) override;
+                 StatusCallback cb) override;
 
   void removeCheckpoints(const std::string& customer_id,
                          const std::vector<logid_t>& checkpoints,
-                         UpdateCallback cb) override;
+                         StatusCallback cb) override;
 
   void removeAllCheckpoints(const std::string& customer_id,
-                            UpdateCallback cb) override;
+                            StatusCallback cb) override;
+
+  Status
+  removeCheckpointsSync(const std::string& customer_id,
+                        const std::vector<logid_t>& checkpoints) override;
+
+  Status removeAllCheckpointsSync(const std::string& customer_id) override;
+
+  static folly::Optional<CheckpointStore::Version>
+      extractVersion(folly::StringPiece);
 
  private:
-  void
-  updateCheckpoints(const std::string& customer_id,
-                    folly::Function<void(checkpointing::thrift::Checkpoint&)>
-                        modify_checkpoint,
-                    UpdateCallback cb);
+  static constexpr auto kRetryDuration = std::chrono::seconds(1);
+
+  void updateCheckpoints(
+      const std::string& customer_id,
+      folly::Function<void(checkpointing::thrift::Checkpoint&) const>
+          modify_checkpoint,
+      StatusCallback cb);
+
+  std::string createKey(const std::string& customer_id) const;
 
   std::unique_ptr<VersionedConfigStore> vcs_;
+  std::string prefix_;
+  folly::EventBase* event_base_;
+  folly::HHWheelTimer::UniquePtr timer_;
+  WeakRefHolder<CheckpointStoreImpl> holder_;
 };
 
 }} // namespace facebook::logdevice

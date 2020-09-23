@@ -54,10 +54,16 @@ class RSMWriteSnapShot : public AdminCommand {
     if (snapshot_type_.empty()) {
       out_.printf("snapshot type is not provided\r\n");
     } else if (snapshot_type_ == "eventlog") {
-      auto event_log_owner = EventLogStateMachine::getWorkerIdx(
-          server_->getProcessor()->getWorkerCount(WorkerType::GENERAL));
+      if (!server_->getEventLogStateMachine()) {
+        out_.printf(
+            "This node is not running with an event log state machine\r\n");
+        return;
+      }
       auto rc = run_on_worker(
-          server_->getProcessor(), event_log_owner, WorkerType::GENERAL, [&]() {
+          server_->getProcessor(),
+          server_->getEventLogStateMachine()->getWorkerId().val_,
+          server_->getEventLogStateMachine()->getWorkerType(),
+          [&]() {
             Worker* w = Worker::onThisThread();
             if (w->event_log_) {
               auto cb = [&](Status st) { this->onSnapShotCreated(st); };
@@ -75,6 +81,8 @@ class RSMWriteSnapShot : public AdminCommand {
         semaphore_.wait();
         if (st_ == E::OK) {
           out_.printf("Successfully created eventlog snapshot\r\n");
+        } else if (st_ == E::UPTODATE) {
+          out_.printf("Eventlog snapshot is already uptodate.\r\n");
         } else {
           out_.printf(
               "Could not create eventlog snapshot:%s\r\n", error_name(st_));
@@ -108,13 +116,16 @@ class RSMWriteSnapShot : public AdminCommand {
         semaphore_.wait();
         if (st_ == E::OK) {
           out_.printf("Successfully created logsconfig snapshot\r\n");
+        } else if (st_ == E::UPTODATE) {
+          out_.printf("Logsconfig snapshot is already uptodate.\r\n");
         } else {
           out_.printf(
               "Could not create logsconfig snapshot:%s\r\n", error_name(st_));
         }
       }
     } else {
-      out_.printf("Snapshot type not supported\r\n");
+      out_.printf(
+          "Snapshot type '%s' not supported\r\n", snapshot_type_.c_str());
     }
   }
 };

@@ -65,7 +65,6 @@ void SequencerBackgroundActivator::schedule(std::vector<logid_t> log_ids,
     queue_.push(log_id);
     ++num_scheduled;
   }
-  bumpScheduledStat(num_scheduled);
   maybeProcessQueue();
 }
 
@@ -164,10 +163,6 @@ SequencerBackgroundActivator::postponeSequencerReactivation(logid_t logid) {
   queue_.pop();
   state.token.release();
   state.in_queue = false;
-  // Switch off this flag so that the next enqueue doesn't go through
-  // immediately.
-  state.queued_by_alarm_callback = false;
-  bumpCompletedStat();
 
   // If we already have an active alarm for this log
   // then we can piggy-back on it if we have non-urgent
@@ -182,10 +177,10 @@ SequencerBackgroundActivator::postponeSequencerReactivation(logid_t logid) {
   auto max = Worker::settings().sequencer_reactivation_delay_secs.hi.count();
   std::chrono::seconds delay_secs(folly::Random::rand32(min, max));
   auto cb = [self = this, log_id = logid]() {
-    WORKER_STAT_INCR(sequencer_reactivations_delay_completed);
     LogState& cur_state = self->logs_[log_id];
     cur_state.reactivation_delay_timer.cancel();
     self->schedule({log_id}, true /* queued_by_alarm_callback */);
+    WORKER_STAT_INCR(sequencer_reactivations_delay_completed);
   };
   RecordTimestamp delayTS = RecordTimestamp::now() + delay_secs;
   RATELIMIT_INFO(std::chrono::seconds(10),
@@ -286,8 +281,7 @@ ReactivationDecision SequencerBackgroundActivator::processMetadataChanges(
 
   const auto& nodes_configuration =
       Worker::onThisThread()->getNodesConfiguration();
-  const std::shared_ptr<LogsConfig::LogGroupNode> logcfg =
-      config->getLogGroupByIDShared(logid);
+  const auto logcfg = config->getLogGroupByIDShared(logid);
 
   LogState& state = logs_[logid];
 
@@ -299,15 +293,15 @@ ReactivationDecision SequencerBackgroundActivator::processMetadataChanges(
     // Revert nodeset size to its unadjusted value.
     target_nodeset_size =
         logcfg->attrs().nodeSetSize().value().value_or(NODESET_SIZE_MAX);
-    nodeset_seed.clear();
-  } else if (state.pending_adjustment.hasValue()) {
+    nodeset_seed.reset();
+  } else if (state.pending_adjustment.has_value()) {
     if (state.pending_adjustment->epoch == current_metadata->h.epoch) {
       // An adjustment is pending. Try to apply it.
       target_nodeset_size = state.pending_adjustment->new_size;
       nodeset_seed = state.pending_adjustment->new_seed;
     } else {
       // A scheduled adjustment is outdated.
-      state.pending_adjustment.clear();
+      state.pending_adjustment.reset();
     }
   }
   bool use_new_storage_set_format =
@@ -457,8 +451,7 @@ SequencerBackgroundActivator::reprovisionOrReactivateIfNeeded(
 
   auto config = Worker::onThisThread()->getConfig();
 
-  const std::shared_ptr<LogsConfig::LogGroupNode> logcfg =
-      config->getLogGroupByIDShared(logid);
+  const auto logcfg = config->getLogGroupByIDShared(logid);
   if (!logcfg) {
     // logid no longer in config
     err = E::NOTFOUND;
@@ -485,7 +478,7 @@ SequencerBackgroundActivator::reprovisionOrReactivateIfNeeded(
 
   folly::Optional<EpochSequencerImmutableOptions> current_options =
       seq->getEpochSequencerOptions();
-  if (!current_options.hasValue()) {
+  if (!current_options.has_value()) {
     err = E::NOSEQUENCER;
     return ProcessLogDecision::FAILED;
   }
@@ -556,6 +549,9 @@ SequencerBackgroundActivator::reprovisionOrReactivateIfNeeded(
       // that can be delayed but it has already been delayed once.
       ProcessLogDecision dec = ProcessLogDecision::SUCCESS;
       WORKER_STAT_INCR(sequencer_reactivations_for_metadata_update);
+      // Switch off this flag so that the next enqueue doesn't go through
+      // immediately.
+      state.queued_by_alarm_callback = false;
       auto& all_seq = Worker::onThisThread()->processor_->allSequencers();
       int rv = all_seq.activateSequencer(
           logid,
@@ -574,6 +570,9 @@ SequencerBackgroundActivator::reprovisionOrReactivateIfNeeded(
                       E::SYSLIMIT,
                       E::ISOLATED}));
 
+        ld_debug("Sequencer activation for log %lu was rejected: %s",
+                 logid.val(),
+                 error_name(err));
         dec = ProcessLogDecision::FAILED;
       }
       return dec;
@@ -594,7 +593,6 @@ void SequencerBackgroundActivator::notifyCompletion(logid_t logid,
 
   // If the operation that just completed was triggered by us, reclaim the
   // in-flight slot we assigned to it.
-  bool had_token = state.token.valid();
   state.token.release();
 
   // Schedule a re-check for the log, in case config was updated while sequencer
@@ -605,33 +603,28 @@ void SequencerBackgroundActivator::notifyCompletion(logid_t logid,
     queue_.push(logid);
   }
 
-  if (had_token && !inserted) {
-    bumpCompletedStat();
-  }
-  if (!had_token && inserted) {
-    bumpScheduledStat();
-  }
-
   maybeProcessQueue();
 }
 
 void SequencerBackgroundActivator::maybeProcessQueue() {
+  SCOPE_EXIT {
+    updateActivityStat();
+  };
+
   checkWorkerAsserts();
   deactivateQueueProcessingTimer();
   size_t limit =
       Worker::settings().max_sequencer_background_activations_in_flight;
-  if (!budget_) {
-    budget_ = std::make_unique<ResourceBudget>(limit);
-  } else if (budget_->getLimit() != limit) {
+  if (budget_.getLimit() != limit) {
     // in case the setting changed after initialization
-    budget_->setLimit(limit);
+    budget_.setLimit(limit);
   }
 
   std::chrono::steady_clock::time_point start_time =
       std::chrono::steady_clock::now();
   bool made_progress = false;
 
-  while (!queue_.empty() && budget_->available() > 0) {
+  while (!queue_.empty() && budget_.available() > 0) {
     // Limiting this loop to 2ms
     if (made_progress && usec_since(start_time) > 2000) {
       // This is taking a while, let's yield for a few milliseconds.
@@ -645,7 +638,7 @@ void SequencerBackgroundActivator::maybeProcessQueue() {
     LogState& state = logs_.at(log_id); // LogState must exist
     ld_check(state.in_queue);
 
-    auto token = budget_->acquireToken();
+    auto token = budget_.acquireToken();
     ld_check(token.valid());
     ProcessLogDecision decision = processOneLog(log_id, state, token);
     if (decision != ProcessLogDecision::POSTPONED) {
@@ -663,13 +656,9 @@ void SequencerBackgroundActivator::maybeProcessQueue() {
       case ProcessLogDecision::SUCCESS:
         state.in_queue = false;
 
-        if (token) {
-          // The token hasn't been moved into the LogState, presumably because
-          // nothing needs to be done for this log.
-          token.release();
-          // Since we're releasing the token, we have to bump the stat.
-          bumpCompletedStat();
-        }
+        // The token hasn't been moved into the LogState, presumably because
+        // nothing needs to be done for this log.
+        token.release();
         break;
       case ProcessLogDecision::POSTPONED:
         break;
@@ -685,6 +674,20 @@ void SequencerBackgroundActivator::maybeProcessQueue() {
   }
 }
 
+void SequencerBackgroundActivator::updateActivityStat() {
+  bool active = !queue_.empty() || budget_.used() != 0;
+  if (active == has_work_in_flight_) {
+    return;
+  }
+
+  ld_spew("[sequencer_activity_in_progress%s] SequencerBackgroundActivator now "
+          "has %s work in flight",
+          active ? "++" : "--",
+          active ? "some" : "no");
+  WORKER_STAT_ADD(sequencer_activity_in_progress, active ? +1 : -1);
+  has_work_in_flight_ = active;
+}
+
 void SequencerBackgroundActivator::activateQueueProcessingTimer(
     folly::Optional<std::chrono::microseconds> timeout) {
   Worker* w = Worker::onThisThread();
@@ -692,7 +695,7 @@ void SequencerBackgroundActivator::activateQueueProcessingTimer(
   if (!retry_timer_.isAssigned()) {
     retry_timer_.assign([this] { maybeProcessQueue(); });
   }
-  if (!timeout.hasValue()) {
+  if (!timeout.has_value()) {
     timeout = Worker::settings().sequencer_background_activation_retry_interval;
   }
   retry_timer_.activate(timeout.value());
@@ -702,24 +705,32 @@ void SequencerBackgroundActivator::deactivateQueueProcessingTimer() {
   retry_timer_.cancel();
 }
 
-void SequencerBackgroundActivator::bumpScheduledStat(uint64_t val) {
-  WORKER_STAT_ADD(background_sequencer_reactivation_checks_scheduled, val);
-}
-
-void SequencerBackgroundActivator::bumpCompletedStat(uint64_t val) {
-  WORKER_STAT_ADD(background_sequencer_reactivation_checks_completed, val);
-}
-
 namespace {
 
 class SequencerBackgroundActivatorRequest : public Request {
  public:
   explicit SequencerBackgroundActivatorRequest(
       Processor* processor,
-      std::function<void(SequencerBackgroundActivator&)> func)
+      std::function<void(SequencerBackgroundActivator&)> func,
+      bool bump_activity_stat = true)
       : Request(RequestType::SEQUENCER_BACKGROUND_ACTIVATOR),
         workerType_(SequencerBackgroundActivator::getWorkerType(processor)),
-        func_(func) {}
+        func_(func),
+        stats_(processor->stats_),
+        bumpActivityStat_(bump_activity_stat) {
+    if (bumpActivityStat_) {
+      ld_spew("[sequencer_activity_in_progress++] Created a "
+              "SequencerBackgroundActivatorRequest");
+      STAT_INCR(stats_, sequencer_activity_in_progress);
+    }
+  }
+  ~SequencerBackgroundActivatorRequest() override {
+    if (bumpActivityStat_) {
+      ld_spew("[sequencer_activity_in_progress--] Destroyed a "
+              "SequencerBackgroundActivatorRequest");
+      STAT_DECR(stats_, sequencer_activity_in_progress);
+    }
+  }
 
   WorkerType getWorkerTypeAffinity() override {
     return workerType_;
@@ -739,6 +750,8 @@ class SequencerBackgroundActivatorRequest : public Request {
 
   WorkerType workerType_;
   std::function<void(SequencerBackgroundActivator&)> func_;
+  StatsHolder* stats_;
+  bool bumpActivityStat_;
 };
 
 } // namespace
@@ -801,7 +814,7 @@ void SequencerBackgroundActivator::onSettingsUpdated() {
       if (nodeset_adjustment_period_.count() <= 0) {
         // Nodeset adjusting was disabled.
         // May need to revert nodeset size back to its unadjusted value.
-        kv.second.pending_adjustment.clear();
+        kv.second.pending_adjustment.reset();
         schedule({kv.first});
         scheduled = true;
       } else {
@@ -831,8 +844,7 @@ void SequencerBackgroundActivator::maybeAdjustNodesetSize(logid_t log_id,
   }
 
   std::shared_ptr<Configuration> config = Worker::onThisThread()->getConfig();
-  const std::shared_ptr<LogsConfig::LogGroupNode> logcfg =
-      config->getLogGroupByIDShared(log_id);
+  const auto logcfg = config->getLogGroupByIDShared(log_id);
   if (!logcfg) {
     // Log no longer in config.
     return;
@@ -852,7 +864,7 @@ void SequencerBackgroundActivator::maybeAdjustNodesetSize(logid_t log_id,
 
     folly::Optional<std::chrono::seconds> backlog =
         logcfg->attrs().backlogDuration().value();
-    if (!backlog.hasValue()) {
+    if (!backlog.has_value()) {
       // The log has infinite retention, don't resize its nodeset.
       break;
     }
@@ -908,7 +920,7 @@ void SequencerBackgroundActivator::maybeAdjustNodesetSize(logid_t log_id,
     }
   } while (false);
 
-  if (adj.new_size.hasValue()) {
+  if (adj.new_size.has_value()) {
     // Instead of applying the adjustment right here, put it in the LogState
     // and enqueue, to make sure it goes through the ResourceBudget.
     state.pending_adjustment = adj;
@@ -933,8 +945,7 @@ void SequencerBackgroundActivator::randomizeNodeset(logid_t log_id,
   }
 
   std::shared_ptr<Configuration> config = Worker::onThisThread()->getConfig();
-  const std::shared_ptr<LogsConfig::LogGroupNode> logcfg =
-      config->getLogGroupByIDShared(log_id);
+  const auto logcfg = config->getLogGroupByIDShared(log_id);
   if (!logcfg) {
     // Log no longer in config.
     return;
@@ -943,7 +954,7 @@ void SequencerBackgroundActivator::randomizeNodeset(logid_t log_id,
   epoch_t epoch = epoch_metadata->h.epoch;
   uint64_t new_seed = folly::Random::rand64();
 
-  if (state.pending_adjustment.hasValue() &&
+  if (state.pending_adjustment.has_value() &&
       state.pending_adjustment->epoch >= epoch) {
     state.pending_adjustment->new_seed = new_seed;
   } else {
@@ -997,15 +1008,14 @@ void SequencerBackgroundActivator::recalculateNodesetRandomizationTime(
     }
 
     auto config = Worker::onThisThread()->getConfig();
-    const std::shared_ptr<LogsConfig::LogGroupNode> logcfg =
-        config->getLogGroupByIDShared(logid);
+    const auto logcfg = config->getLogGroupByIDShared(logid);
     if (!logcfg) {
       // logid no longer in config
       break;
     }
     folly::Optional<std::chrono::seconds> backlog =
         logcfg->attrs().backlogDuration().value();
-    if (!backlog.hasValue()) {
+    if (!backlog.has_value()) {
       // The log has infinite retention.
       break;
     }
@@ -1148,9 +1158,11 @@ SequencerBackgroundActivator::requestGetLogsDebugInfo(
   std::vector<LogDebugInfo> out;
   std::unique_ptr<Request> rq =
       std::make_unique<SequencerBackgroundActivatorRequest>(
-          processor, [&logs, &out](SequencerBackgroundActivator& act) {
+          processor,
+          [&logs, &out](SequencerBackgroundActivator& act) {
             out = act.getLogsDebugInfo(logs);
-          });
+          },
+          /* bump_activity_stat */ false);
   int rv = processor->blockingRequestImportant(rq);
   ld_check(rv == 0 || err == E::SHUTDOWN);
   return out;
